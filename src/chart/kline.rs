@@ -6323,8 +6323,11 @@ fn draw_clusters(
             let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
             let outline_color = layout.pal.warning.strong.color;
             let outline = (1.5_f32 / scaling).max(cell_border);
-            // Imbalances on thin levels are noise: the winning side must trade at least
-            // the bar's average per-side volume per level to be outlined.
+            // Ratio-only imbalances fire on almost every thin level, so the winning side
+            // must also trade at least twice the bar's average level volume.
+            const MIN_IMBALANCE_LEVEL_MULT: f64 = 2.0;
+            // Below this on-screen row height the outline swallows the cell.
+            const MIN_OUTLINE_ROW_PX: f32 = 12.0;
             let min_imbalance_qty = if footprint.trades.is_empty() {
                 0.0
             } else {
@@ -6333,8 +6336,9 @@ fn draw_clusters(
                     .values()
                     .map(|group| group.total_qty().to_f64())
                     .sum();
-                bar_total / (2.0 * footprint.trades.len() as f64)
+                MIN_IMBALANCE_LEVEL_MULT * bar_total / footprint.trades.len() as f64
             };
+            let rows_readable = layout.cell_h * scaling >= MIN_OUTLINE_ROW_PX;
 
             for (price, group) in &footprint.trades {
                 let delta = group.delta_qty().to_f64();
@@ -6358,8 +6362,8 @@ fn draw_clusters(
                 );
 
                 // A level is outlined when either side wins its diagonal imbalance.
-                // Only when zoomed in: on thin rows the outline would cover the whole cell.
                 let is_imbalanced = show_text
+                    && rows_readable
                     && imbalance.is_some_and(|(threshold, color_scale, ignore_zeros)| {
                         [
                             (ImbalanceSide::Buy, group.buy_qty.to_f64()),
