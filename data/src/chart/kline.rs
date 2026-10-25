@@ -381,7 +381,9 @@ impl GroupedTrades {
     pub fn max_cluster_qty(&self, cluster_kind: ClusterKind) -> Qty {
         match cluster_kind {
             ClusterKind::BidAsk | ClusterKind::Table => self.buy_qty.max(self.sell_qty),
-            ClusterKind::DeltaProfile => self.buy_qty.abs_diff(self.sell_qty),
+            ClusterKind::DeltaProfile | ClusterKind::DeltaTable => {
+                self.buy_qty.abs_diff(self.sell_qty)
+            }
             ClusterKind::VolumeProfile => self.total_qty(),
         }
     }
@@ -752,7 +754,8 @@ impl KlineChartKind {
 
     pub fn default_cell_width(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 80.0,
+            // Wide enough for cluster text in every ClusterKind (see min_footprint_width).
+            KlineChartKind::Footprint { .. } => 140.0,
             KlineChartKind::Candles => 4.0,
         }
     }
@@ -765,14 +768,17 @@ pub enum ClusterKind {
     VolumeProfile,
     DeltaProfile,
     Table,
+    /// Single-column table: one delta cell per price level, colored by sign and magnitude.
+    DeltaTable,
 }
 
 impl ClusterKind {
-    pub const ALL: [ClusterKind; 4] = [
+    pub const ALL: [ClusterKind; 5] = [
         ClusterKind::BidAsk,
         ClusterKind::VolumeProfile,
         ClusterKind::DeltaProfile,
         ClusterKind::Table,
+        ClusterKind::DeltaTable,
     ];
 
     /// Minimum footprint cell width (in unscaled pixels) for the cluster rendering mode.
@@ -781,6 +787,7 @@ impl ClusterKind {
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 80.0,
             ClusterKind::BidAsk => 120.0,
             ClusterKind::Table => 100.0,
+            ClusterKind::DeltaTable => 70.0,
         }
     }
 }
@@ -792,6 +799,7 @@ impl std::fmt::Display for ClusterKind {
             ClusterKind::VolumeProfile => write!(f, "Volume Profile"),
             ClusterKind::DeltaProfile => write!(f, "Delta Profile"),
             ClusterKind::Table => write!(f, "Table"),
+            ClusterKind::DeltaTable => write!(f, "Delta Table"),
         }
     }
 }

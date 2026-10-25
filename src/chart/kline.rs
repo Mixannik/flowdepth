@@ -396,10 +396,7 @@ impl KlineChart {
                     .unwrap_or(1)
                     .max(1) as f32;
 
-                let cell_width = match &kind {
-                    KlineChartKind::Footprint { .. } => 80.0,
-                    KlineChartKind::Candles => 4.0,
-                };
+                let cell_width = kind.default_cell_width();
                 let cell_height = match &kind {
                     KlineChartKind::Footprint { .. } => 800.0 / y_ticks,
                     KlineChartKind::Candles => 200.0 / y_ticks,
@@ -481,10 +478,7 @@ impl KlineChart {
                 }
             }
             Basis::Tick(interval) => {
-                let cell_width = match &kind {
-                    KlineChartKind::Footprint { .. } => 80.0,
-                    KlineChartKind::Candles => 4.0,
-                };
+                let cell_width = kind.default_cell_width();
                 let cell_height = match &kind {
                     KlineChartKind::Footprint { .. } => 90.0,
                     KlineChartKind::Candles => 8.0,
@@ -5907,12 +5901,14 @@ fn draw_all_npocs(
 
     let candle_lane_factor: f32 = match layout.cluster {
         ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => 0.25,
-        ClusterKind::BidAsk | ClusterKind::Table => 1.0,
+        ClusterKind::BidAsk | ClusterKind::Table | ClusterKind::DeltaTable => 1.0,
     };
 
     let start_x_for = |cell_center_x: f32| -> f32 {
         match layout.cluster {
-            ClusterKind::Table => cell_center_x + (layout.cell_w / 2.0) - inset,
+            ClusterKind::Table | ClusterKind::DeltaTable => {
+                cell_center_x + (layout.cell_w / 2.0) - inset
+            }
             ClusterKind::BidAsk => {
                 cell_center_x + (layout.candle_w / 2.0) + layout.gaps.candle_to_cluster
             }
@@ -5933,7 +5929,7 @@ fn draw_all_npocs(
 
     let wick_x_for = |cell_center_x: f32| -> f32 {
         match layout.cluster {
-            ClusterKind::BidAsk | ClusterKind::Table => cell_center_x,
+            ClusterKind::BidAsk | ClusterKind::Table | ClusterKind::DeltaTable => cell_center_x,
             ClusterKind::VolumeProfile | ClusterKind::DeltaProfile => {
                 let content_left = (cell_center_x - (layout.cell_w / 2.0)) + inset;
                 let candle_lane_left = content_left
@@ -5950,7 +5946,7 @@ fn draw_all_npocs(
 
     let end_x_for = |cell_center_x: f32| -> f32 {
         match layout.cluster {
-            ClusterKind::Table => {
+            ClusterKind::Table | ClusterKind::DeltaTable => {
                 let content_left = cell_center_x - (layout.cell_w / 2.0) + inset;
                 let content_right = cell_center_x + (layout.cell_w / 2.0) - inset;
                 let table_layout = TableLayout::new(
@@ -6312,6 +6308,115 @@ fn draw_clusters(
                 }
             }
         }
+        ClusterKind::DeltaTable => {
+            let tl = TableLayout::new(
+                content_left,
+                content_right,
+                layout.candle_w,
+                layout.gaps,
+                imbalance.is_some(),
+            );
+            let area = TableArea::new(frame, &price_to_y, &tl, layout.candle_w, kline, layout.pal);
+            table_layout = Some(tl);
+            let table_width = area.width();
+            let cell_border = 1.0;
+            let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
+            let outline_color = layout.pal.warning.strong.color;
+            let outline = (1.5_f32 / scaling).max(cell_border);
+            // Imbalances on thin levels are noise: the winning side must trade at least
+            // the bar's average per-side volume per level to be outlined.
+            let min_imbalance_qty = if footprint.trades.is_empty() {
+                0.0
+            } else {
+                let bar_total: f64 = footprint
+                    .trades
+                    .values()
+                    .map(|group| group.total_qty().to_f64())
+                    .sum();
+                bar_total / (2.0 * footprint.trades.len() as f64)
+            };
+
+            for (price, group) in &footprint.trades {
+                let delta = group.delta_qty().to_f64();
+                let side = if delta >= 0.0 {
+                    ImbalanceSide::Buy
+                } else {
+                    ImbalanceSide::Sell
+                };
+                let y = price_to_y(*price);
+                let row_top = y - (layout.cell_h / 2.0);
+
+                frame.fill_rectangle(
+                    Point::new(area.table_left, row_top),
+                    Size::new(table_width, layout.cell_h),
+                    side.volume_bg_color(delta.abs(), max_cluster_qty, layout.pal),
+                );
+                frame.fill_rectangle(
+                    Point::new(area.table_left, row_top),
+                    Size::new(table_width, cell_border),
+                    grid_color,
+                );
+
+                // A level is outlined when either side wins its diagonal imbalance.
+                // Only when zoomed in: on thin rows the outline would cover the whole cell.
+                let is_imbalanced = show_text
+                    && imbalance.is_some_and(|(threshold, color_scale, ignore_zeros)| {
+                        [
+                            (ImbalanceSide::Buy, group.buy_qty.to_f64()),
+                            (ImbalanceSide::Sell, group.sell_qty.to_f64()),
+                        ]
+                        .into_iter()
+                        .any(|(imb_side, qty)| {
+                            qty >= min_imbalance_qty
+                                && imb_side
+                                    .color_alpha(
+                                        footprint,
+                                        *price,
+                                        qty,
+                                        step,
+                                        threshold,
+                                        color_scale,
+                                        ignore_zeros,
+                                    )
+                                    .is_some()
+                        })
+                    });
+
+                if is_imbalanced {
+                    let (x, w, h) = (area.table_left, table_width, layout.cell_h);
+                    for (origin, size) in [
+                        (Point::new(x, row_top), Size::new(w, outline)),
+                        (Point::new(x, row_top + h - outline), Size::new(w, outline)),
+                        (Point::new(x, row_top), Size::new(outline, h)),
+                        (Point::new(x + w - outline, row_top), Size::new(outline, h)),
+                    ] {
+                        frame.fill_rectangle(origin, size, outline_color);
+                    }
+                }
+
+                if show_text {
+                    let delta_text = if delta > 0.0 {
+                        format!("+{}", abbr_large_numbers(delta))
+                    } else {
+                        abbr_large_numbers(delta)
+                    };
+                    draw_cluster_text(
+                        frame,
+                        &delta_text,
+                        Point::new(area.table_left + table_width / 2.0, y),
+                        text_size,
+                        side.volume_text_color(
+                            delta.abs(),
+                            max_cluster_qty,
+                            text_color,
+                            layout.pal,
+                        ),
+                        Alignment::Center,
+                        Alignment::Center,
+                    );
+                }
+            }
+        }
         ClusterKind::BidAsk => {
             let area = BidAskArea::new(
                 x_position,
@@ -6435,10 +6540,10 @@ fn draw_clusters(
         let summary_layout = FootprintSummaryLayout::new(layout.cell_h, scaling);
 
         let summary_x = match layout.cluster {
-            ClusterKind::Table => {
+            ClusterKind::Table | ClusterKind::DeltaTable => {
                 let tl = table_layout
                     .as_ref()
-                    .expect("TableLayout must be set for Table cluster");
+                    .expect("TableLayout must be set for table clusters");
                 (tl.table_left + tl.table_right) / 2.0
             }
             _ => x_position,
