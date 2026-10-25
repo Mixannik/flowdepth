@@ -6319,41 +6319,60 @@ fn draw_clusters(
             let area = TableArea::new(frame, &price_to_y, &tl, layout.candle_w, kline, layout.pal);
             table_layout = Some(tl);
             let table_width = area.width();
+            // Coloring follows Coinglass: the cell takes the dominant side's color, gray when
+            // both sides are within 10% of each other; brightness is the level's share of
+            // the bar's biggest level. The bar's POC gets the gold outline, imbalances are
+            // shown as bold, colored numbers.
+            const BALANCED_RATIO: f64 = 0.10;
             let cell_border = 1.0;
             let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
-            let outline_color = layout.pal.warning.strong.color;
-            let outline = (1.5_f32 / scaling).max(cell_border);
-            // Ratio-only imbalances fire on almost every thin level, so the winning side
-            // must also trade at least twice the bar's average level volume.
-            const MIN_IMBALANCE_LEVEL_MULT: f64 = 2.0;
-            // Below this on-screen row height the outline swallows the cell.
-            const MIN_OUTLINE_ROW_PX: f32 = 12.0;
-            let min_imbalance_qty = if footprint.trades.is_empty() {
-                0.0
-            } else {
-                let bar_total: f64 = footprint
-                    .trades
-                    .values()
-                    .map(|group| group.total_qty().to_f64())
-                    .sum();
-                MIN_IMBALANCE_LEVEL_MULT * bar_total / footprint.trades.len() as f64
-            };
-            let rows_readable = layout.cell_h * scaling >= MIN_OUTLINE_ROW_PX;
+            let poc_color = layout.pal.warning.strong.color;
+            let poc_outline = (1.5_f32 / scaling).max(cell_border);
+
+            let bar_max_level_qty = footprint
+                .trades
+                .values()
+                .map(|group| group.total_qty().to_f64())
+                .fold(0.0, f64::max);
+            let poc_price = footprint
+                .trades
+                .iter()
+                .max_by(|(_, a), (_, b)| a.total_qty().cmp(&b.total_qty()))
+                .map(|(price, _)| *price);
 
             for (price, group) in &footprint.trades {
-                let delta = group.delta_qty().to_f64();
+                let buy_qty = group.buy_qty.to_f64();
+                let sell_qty = group.sell_qty.to_f64();
+                let delta = buy_qty - sell_qty;
+                let level_qty = buy_qty + sell_qty;
                 let side = if delta >= 0.0 {
                     ImbalanceSide::Buy
                 } else {
                     ImbalanceSide::Sell
                 };
+                let is_balanced = delta.abs() <= BALANCED_RATIO * buy_qty.max(sell_qty);
                 let y = price_to_y(*price);
                 let row_top = y - (layout.cell_h / 2.0);
 
+                let cell_color = if is_balanced {
+                    let intensity = if bar_max_level_qty > 0.0 {
+                        (level_qty / bar_max_level_qty).clamp(0.0, 1.0) as f32
+                    } else {
+                        0.0
+                    };
+                    layout
+                        .pal
+                        .background
+                        .weakest
+                        .text
+                        .scale_alpha(0.04 + intensity * 0.36)
+                } else {
+                    side.volume_bg_color(level_qty, bar_max_level_qty, layout.pal)
+                };
                 frame.fill_rectangle(
                     Point::new(area.table_left, row_top),
                     Size::new(table_width, layout.cell_h),
-                    side.volume_bg_color(delta.abs(), max_cluster_qty, layout.pal),
+                    cell_color,
                 );
                 frame.fill_rectangle(
                     Point::new(area.table_left, row_top),
@@ -6361,63 +6380,94 @@ fn draw_clusters(
                     grid_color,
                 );
 
-                // A level is outlined when either side wins its diagonal imbalance.
-                let is_imbalanced = show_text
-                    && rows_readable
-                    && imbalance.is_some_and(|(threshold, color_scale, ignore_zeros)| {
-                        [
-                            (ImbalanceSide::Buy, group.buy_qty.to_f64()),
-                            (ImbalanceSide::Sell, group.sell_qty.to_f64()),
-                        ]
-                        .into_iter()
-                        .any(|(imb_side, qty)| {
-                            qty >= min_imbalance_qty
-                                && imb_side
+                if show_text && poc_price == Some(*price) {
+                    let (x, w, h) = (area.table_left, table_width, layout.cell_h);
+                    for (origin, size) in [
+                        (Point::new(x, row_top), Size::new(w, poc_outline)),
+                        (
+                            Point::new(x, row_top + h - poc_outline),
+                            Size::new(w, poc_outline),
+                        ),
+                        (Point::new(x, row_top), Size::new(poc_outline, h)),
+                        (
+                            Point::new(x + w - poc_outline, row_top),
+                            Size::new(poc_outline, h),
+                        ),
+                    ] {
+                        frame.fill_rectangle(origin, size, poc_color);
+                    }
+                }
+
+                if show_text {
+                    let imbalance_side =
+                        imbalance.and_then(|(threshold, color_scale, ignore_zeros)| {
+                            [
+                                (ImbalanceSide::Buy, buy_qty),
+                                (ImbalanceSide::Sell, sell_qty),
+                            ]
+                            .into_iter()
+                            .filter(|(imb_side, qty)| {
+                                imb_side
                                     .color_alpha(
                                         footprint,
                                         *price,
-                                        qty,
+                                        *qty,
                                         step,
                                         threshold,
                                         color_scale,
                                         ignore_zeros,
                                     )
                                     .is_some()
-                        })
-                    });
+                            })
+                            .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                            .map(|(imb_side, _)| imb_side)
+                        });
 
-                if is_imbalanced {
-                    let (x, w, h) = (area.table_left, table_width, layout.cell_h);
-                    for (origin, size) in [
-                        (Point::new(x, row_top), Size::new(w, outline)),
-                        (Point::new(x, row_top + h - outline), Size::new(w, outline)),
-                        (Point::new(x, row_top), Size::new(outline, h)),
-                        (Point::new(x + w - outline, row_top), Size::new(outline, h)),
-                    ] {
-                        frame.fill_rectangle(origin, size, outline_color);
-                    }
-                }
-
-                if show_text {
                     let delta_text = if delta > 0.0 {
                         format!("+{}", abbr_large_numbers(delta))
                     } else {
                         abbr_large_numbers(delta)
                     };
-                    draw_cluster_text(
-                        frame,
-                        &delta_text,
-                        Point::new(area.table_left + table_width / 2.0, y),
-                        text_size,
-                        side.volume_text_color(
-                            delta.abs(),
-                            max_cluster_qty,
-                            text_color,
-                            layout.pal,
-                        ),
-                        Alignment::Center,
-                        Alignment::Center,
-                    );
+                    let position = Point::new(area.table_left + table_width / 2.0, y);
+
+                    match imbalance_side {
+                        Some(imb_side) => {
+                            let color = imb_side.imbalance_text_color(layout.pal);
+                            // Faux bold: the bundled mono font has no bold face.
+                            for dx in [0.0, 0.6 / scaling] {
+                                draw_cluster_text(
+                                    frame,
+                                    &delta_text,
+                                    Point::new(position.x + dx, position.y),
+                                    text_size,
+                                    color,
+                                    Alignment::Center,
+                                    Alignment::Center,
+                                );
+                            }
+                        }
+                        None => {
+                            let color = if is_balanced {
+                                text_color
+                            } else {
+                                side.volume_text_color(
+                                    level_qty,
+                                    bar_max_level_qty,
+                                    text_color,
+                                    layout.pal,
+                                )
+                            };
+                            draw_cluster_text(
+                                frame,
+                                &delta_text,
+                                position,
+                                text_size,
+                                color,
+                                Alignment::Center,
+                                Alignment::Center,
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -6861,6 +6911,17 @@ impl ImbalanceSide {
         } else {
             default_color
         }
+    }
+
+    /// Text color for an imbalanced number: the side's color lifted toward white so it
+    /// stays readable on a same-hued cell.
+    fn imbalance_text_color(self, palette: &Palette) -> Color {
+        let base = match self {
+            ImbalanceSide::Buy => palette.success.strong.color,
+            ImbalanceSide::Sell => palette.danger.strong.color,
+        };
+        let lift = |c: f32| c + (1.0 - c) * 0.45;
+        Color::from_rgb(lift(base.r), lift(base.g), lift(base.b))
     }
 
     fn marker_bg_color(self, palette: &Palette, alpha: f32) -> Color {

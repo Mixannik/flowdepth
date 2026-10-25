@@ -381,10 +381,8 @@ impl GroupedTrades {
     pub fn max_cluster_qty(&self, cluster_kind: ClusterKind) -> Qty {
         match cluster_kind {
             ClusterKind::BidAsk | ClusterKind::Table => self.buy_qty.max(self.sell_qty),
-            ClusterKind::DeltaProfile | ClusterKind::DeltaTable => {
-                self.buy_qty.abs_diff(self.sell_qty)
-            }
-            ClusterKind::VolumeProfile => self.total_qty(),
+            ClusterKind::DeltaProfile => self.buy_qty.abs_diff(self.sell_qty),
+            ClusterKind::VolumeProfile | ClusterKind::DeltaTable => self.total_qty(),
         }
     }
 }
