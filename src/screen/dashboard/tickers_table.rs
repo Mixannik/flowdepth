@@ -131,8 +131,14 @@ pub struct TickersTable {
     row_index: FxHashMap<Ticker, usize>,
     metadata_fetch_state: MetadataFetchState,
     stats_fetch_state: StatsFetchState,
+    metadata_retry_attempts: FxHashMap<Venue, u32>,
     handles: AdapterHandles,
 }
+
+/// A failed metadata fetch with no cached fallback leaves every pane of that venue
+/// unresolved, so it is retried on its own before the error is surfaced.
+const METADATA_AUTO_RETRIES: u32 = 5;
+const METADATA_RETRY_BASE_DELAY: Duration = Duration::from_secs(3);
 
 impl TickersTable {
     pub fn new(handles: AdapterHandles, metadata: MarketMetadata) -> (Self, Task<Message>) {
@@ -173,6 +179,7 @@ impl TickersTable {
                 row_index: FxHashMap::default(),
                 metadata_fetch_state: MetadataFetchState::default(),
                 stats_fetch_state: StatsFetchState::default(),
+                metadata_retry_attempts: FxHashMap::default(),
                 handles,
             },
             Task::batch(fetch_metadata),
@@ -326,6 +333,9 @@ impl TickersTable {
             }
             Message::UpdateMetadata(venue, info, source) => {
                 self.metadata.ingest(venue, &info, source);
+                if matches!(source, MetadataSource::Fresh) {
+                    self.metadata_retry_attempts.remove(&venue);
+                }
 
                 if !matches!(
                     source,
@@ -350,6 +360,19 @@ impl TickersTable {
                 if self.metadata.usable_entries_for(venue).is_empty() {
                     self.unavailable_exchanges.insert(venue);
                     self.stats_fetch_state.on_exchange_disabled(venue);
+
+                    let attempts = self.metadata_retry_attempts.entry(venue).or_default();
+                    if *attempts < METADATA_AUTO_RETRIES {
+                        *attempts += 1;
+                        let delay = METADATA_RETRY_BASE_DELAY * *attempts;
+                        log::warn!(
+                            "Ticker metadata unavailable for {venue:?}, auto-retry {attempts}/{METADATA_AUTO_RETRIES} in {delay:?}: {err}"
+                        );
+                        return Some(Action::Fetch(Task::perform(
+                            tokio::time::sleep(delay),
+                            move |()| Message::RetryMetadataFetch(venue),
+                        )));
+                    }
                     return Some(Action::ErrorOccurred(err));
                 }
 
