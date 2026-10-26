@@ -734,7 +734,9 @@ impl KlineChartKind {
 
     pub fn min_cell_width(&self) -> f32 {
         match self {
-            KlineChartKind::Footprint { .. } => 80.0,
+            // Zoomed far out footprints become colored strips (text hides itself), so the
+            // session around a level fits on screen.
+            KlineChartKind::Footprint { .. } => 10.0,
             KlineChartKind::Candles => 1.0,
         }
     }

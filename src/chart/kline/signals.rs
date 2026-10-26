@@ -317,6 +317,8 @@ pub(super) fn draw(
     let px = |p: f32| p / scaling;
     let label_size = px(11.0);
     let stroke_width = px(2.0);
+    // Zoomed out, bars are too narrow for text: keep the marks, drop the labels.
+    let labels = cell_width * scaling >= super::MIN_TEXT_BAR_PX;
 
     for signal in detect(&plain, enabled) {
         let time = times[signal.bar];
@@ -358,15 +360,17 @@ pub(super) fn draw(
                 } else {
                     price_y(anchor) - px(4.0) - label_size
                 };
-                draw_label(
-                    frame,
-                    "Absorption",
-                    center_x,
-                    label_y,
-                    label_size,
-                    color,
-                    palette,
-                );
+                labels.then(|| {
+                    draw_label(
+                        frame,
+                        "Absorption",
+                        center_x,
+                        label_y,
+                        label_size,
+                        color,
+                        palette,
+                    )
+                });
             }
             SignalKind::TrappedLongs {
                 zone_low,
@@ -407,15 +411,17 @@ pub(super) fn draw(
                 } else {
                     below_bar(zone_low).max(top + height + px(4.0))
                 };
-                draw_label(
-                    frame,
-                    text,
-                    left + width / 2.0,
-                    label_y,
-                    label_size,
-                    color,
-                    palette,
-                );
+                labels.then(|| {
+                    draw_label(
+                        frame,
+                        text,
+                        left + width / 2.0,
+                        label_y,
+                        label_size,
+                        color,
+                        palette,
+                    )
+                });
             }
             SignalKind::BuyerExhaustion | SignalKind::SellerExhaustion => {
                 let buyers = signal.kind == SignalKind::BuyerExhaustion;
@@ -440,15 +446,17 @@ pub(super) fn draw(
                 } else {
                     tip_y + size * 1.4 + px(4.0)
                 };
-                draw_label(
-                    frame,
-                    "Exhaustion",
-                    center_x,
-                    label_y,
-                    label_size,
-                    color,
-                    palette,
-                );
+                labels.then(|| {
+                    draw_label(
+                        frame,
+                        "Exhaustion",
+                        center_x,
+                        label_y,
+                        label_size,
+                        color,
+                        palette,
+                    )
+                });
             }
         }
     }

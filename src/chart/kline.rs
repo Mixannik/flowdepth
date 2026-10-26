@@ -42,6 +42,9 @@ mod signals;
 mod tpo;
 mod zones;
 
+/// On-screen bar width below which footprint text (summary, signal labels) is hidden.
+const MIN_TEXT_BAR_PX: f32 = 44.0;
+
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned by exchange timestamp when this cap is exceeded.
 /// 50k trades ≈ 1.5-3 MB depending on Trade size.
@@ -2748,6 +2751,9 @@ impl canvas::Program<Message> for KlineChart {
 
                     let text_size = cell_layout.text_size(chart.scaling);
                     let show_text = cell_layout.should_show_text(chart.scaling);
+                    // "V: 3.92k" needs about this much width; narrower bars would overlap.
+                    let show_summary = self.visual_config.show_footprint_summary
+                        && chart.cell_width * chart.scaling >= MIN_TEXT_BAR_PX;
 
                     draw_all_npocs(
                         &self.data_source,
@@ -2795,7 +2801,7 @@ impl canvas::Program<Message> for KlineChart {
                                 text_size,
                                 self.tick_size(),
                                 show_text,
-                                self.visual_config.show_footprint_summary,
+                                show_summary,
                                 imbalance,
                                 kline,
                                 trades,
@@ -2846,7 +2852,7 @@ impl canvas::Program<Message> for KlineChart {
                     }
                     if let Some((enabled, _)) = signals {
                         // Mirrors the summary block placement in `draw_clusters`.
-                        let below_offset = if self.visual_config.show_footprint_summary {
+                        let below_offset = if show_summary {
                             let summary =
                                 FootprintSummaryLayout::new(chart.cell_height, chart.scaling);
                             chart.cell_height / 2.0
