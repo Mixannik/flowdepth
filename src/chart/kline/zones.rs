@@ -9,7 +9,7 @@
 //!   a coarse row at the high almost always holds both sides. Ends once price trades beyond.
 
 use data::chart::{PlotData, kline::KlineDataPoint};
-use exchange::unit::{Price, PriceStep};
+use exchange::unit::Price;
 use iced::{
     Point, Size,
     theme::Palette,
@@ -195,42 +195,137 @@ fn extreme_tick(dp: &KlineDataPoint, highest: bool) -> Option<(f64, bool)> {
     Some((extreme.to_f64(), buy && sell))
 }
 
-fn collect_bars(
-    source: &PlotData<KlineDataPoint>,
-    from: u64,
-    step: PriceStep,
-    with_ticks: bool,
-) -> Vec<(u64, Bar)> {
+/// Rows per typical candle for stack detection. Stacks use this fixed row size, not the
+/// on-screen one: auto row size changes with zoom, and zones must not come and go with it.
+const ROWS_PER_BAR: i64 = 20;
+const NICE_STEPS: [i64; 4] = [10, 20, 25, 50];
+
+/// Row size (price units) giving about [`ROWS_PER_BAR`] rows over the median candle range,
+/// rounded up to 1/2/2.5/5 × 10^k.
+pub(super) fn analysis_step(mut ranges: Vec<i64>) -> i64 {
+    ranges.retain(|r| *r > 0);
+    if ranges.is_empty() {
+        return 1;
+    }
+    ranges.sort_unstable();
+    let target = (ranges[ranges.len() / 2] / ROWS_PER_BAR).max(1);
+    let mut scale = 1;
+    loop {
+        // NICE_STEPS are in tenths so 2.5 stays integral.
+        for nice in NICE_STEPS {
+            let step = nice * scale / 10;
+            if step >= target && step > 0 {
+                return step;
+            }
+        }
+        scale *= 10;
+    }
+}
+
+/// Rows and extreme ticks of one candle, rebuilt from its trades only when they change.
+struct CachedBar {
+    trades: usize,
+    last_units: i64,
+    rows: Vec<Row>,
+    top_tick: Option<(f64, bool)>,
+    bottom_tick: Option<(f64, bool)>,
+}
+
+#[derive(Default)]
+struct SeriesCache {
+    step: i64,
+    bars: rustc_hash::FxHashMap<u64, CachedBar>,
+}
+
+thread_local! {
+    /// Per chart series (keyed by its address); a few panes at most.
+    static CACHE: std::cell::RefCell<rustc_hash::FxHashMap<usize, SeriesCache>> =
+        Default::default();
+}
+
+fn bin_rows(dp: &KlineDataPoint, step: i64) -> Vec<Row> {
+    let mut by_index: rustc_hash::FxHashMap<i64, (f64, f64)> = Default::default();
+    for trade in &dp.trade_sequence {
+        // Nearest row, ties up, like the footprint's own binning.
+        let index = (trade.price.units + step / 2).div_euclid(step);
+        let entry = by_index.entry(index).or_default();
+        if trade.is_sell {
+            entry.1 += trade.qty.to_f64();
+        } else {
+            entry.0 += trade.qty.to_f64();
+        }
+    }
+    let mut rows: Vec<Row> = by_index
+        .into_iter()
+        .map(|(index, (buy, sell))| Row { index, buy, sell })
+        .collect();
+    rows.sort_by_key(|r| r.index);
+    rows
+}
+
+/// All loaded candles, oldest first, with rows at the returned fixed step (price units).
+fn collect_bars(source: &PlotData<KlineDataPoint>, with_ticks: bool) -> (i64, Vec<(u64, Bar)>) {
     let PlotData::TimeBased(series) = source else {
-        return Vec::new();
+        return (1, Vec::new());
     };
-    series
-        .datapoints
-        .range(exchange::UnixMs::new(from)..)
-        .map(|(time, dp)| {
-            let mut rows: Vec<Row> = dp
-                .footprint
-                .trades
-                .iter()
-                .map(|(price, group)| Row {
-                    index: price.units.div_euclid(step.units.max(1)),
-                    buy: group.buy_qty.to_f64(),
-                    sell: group.sell_qty.to_f64(),
-                })
-                .collect();
-            rows.sort_by_key(|r| r.index);
-            (
-                time.as_u64(),
-                Bar {
-                    high: dp.kline.high.to_f64(),
-                    low: dp.kline.low.to_f64(),
-                    rows,
-                    top_tick: with_ticks.then(|| extreme_tick(dp, true)).flatten(),
-                    bottom_tick: with_ticks.then(|| extreme_tick(dp, false)).flatten(),
-                },
-            )
-        })
-        .collect()
+    let step = analysis_step(
+        series
+            .datapoints
+            .values()
+            .rev()
+            .take(300)
+            .map(|dp| dp.kline.high.units - dp.kline.low.units)
+            .collect(),
+    );
+    let key = std::ptr::from_ref(series) as usize;
+
+    let bars = CACHE.with_borrow_mut(|cache| {
+        if cache.len() > 16 && !cache.contains_key(&key) {
+            cache.clear();
+        }
+        let entry = cache.entry(key).or_default();
+        if entry.step != step {
+            *entry = SeriesCache {
+                step,
+                ..Default::default()
+            };
+        }
+        series
+            .datapoints
+            .iter()
+            .map(|(time, dp)| {
+                let last_units = dp.trade_sequence.last().map_or(0, |t| t.price.units);
+                let cached = entry
+                    .bars
+                    .entry(time.as_u64())
+                    .or_insert_with(|| CachedBar {
+                        trades: usize::MAX,
+                        last_units: 0,
+                        rows: Vec::new(),
+                        top_tick: None,
+                        bottom_tick: None,
+                    });
+                if cached.trades != dp.trade_sequence.len() || cached.last_units != last_units {
+                    cached.trades = dp.trade_sequence.len();
+                    cached.last_units = last_units;
+                    cached.rows = bin_rows(dp, step);
+                    cached.top_tick = extreme_tick(dp, true);
+                    cached.bottom_tick = extreme_tick(dp, false);
+                }
+                (
+                    time.as_u64(),
+                    Bar {
+                        high: dp.kline.high.to_f64(),
+                        low: dp.kline.low.to_f64(),
+                        rows: cached.rows.clone(),
+                        top_tick: if with_ticks { cached.top_tick } else { None },
+                        bottom_tick: if with_ticks { cached.bottom_tick } else { None },
+                    },
+                )
+            })
+            .collect()
+    });
+    (step, bars)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,16 +350,11 @@ pub(super) fn draw(
     scaling: f32,
     palette: &Palette,
 ) {
-    let PlotData::TimeBased(series) = source else {
-        return;
-    };
     if !enabled.stacked && !enabled.unfinished {
         return;
     }
-    // Footprint rows are binned at the series' step.
-    let step = series.tick_size;
     // All loaded history: a zone born far left of the view must not vanish while panning.
-    let bars = collect_bars(source, 0, step, enabled.unfinished);
+    let (step, bars) = collect_bars(source, enabled.unfinished);
     let (times, plain): (Vec<u64>, Vec<Bar>) = bars.into_iter().unzip();
     let px = |p: f32| p / scaling;
     let price_y = |price: f64| y(Price::from_f64(price));
@@ -276,7 +366,7 @@ pub(super) fn draw(
     };
 
     if enabled.stacked {
-        let step_f = step.to_f64_lossy();
+        let step_f = Price::from_units(step).to_f64();
         for stack in stacked_imbalances(&plain, step_f, rule) {
             if !visible(stack.bar, stack.end) {
                 continue;
@@ -482,6 +572,18 @@ mod tests {
             tick_bar(100.0, 110.0, false, false),
         ];
         assert!(unfinished_auctions(&bars).is_empty());
+    }
+
+    #[test]
+    fn analysis_step_targets_twenty_rows_on_nice_sizes() {
+        // Median range 300 → 15 per row → next nice size 20.
+        assert_eq!(analysis_step(vec![100, 300, 500]), 20);
+        // 1000 → 50; 4000 → 200; 600 → 30 → 50 (2.5 × 10 = 25 < 30).
+        assert_eq!(analysis_step(vec![1000]), 50);
+        assert_eq!(analysis_step(vec![4000]), 200);
+        assert_eq!(analysis_step(vec![600]), 50);
+        assert_eq!(analysis_step(vec![450]), 25);
+        assert_eq!(analysis_step(Vec::new()), 1);
     }
 
     #[test]
