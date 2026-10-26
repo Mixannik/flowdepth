@@ -341,15 +341,22 @@ pub(super) fn draw(
                 let anchor = if bullish { bar.low } else { bar.high };
                 // Ring the bar's edge rows, not half the bar: a big ring hides the numbers.
                 let radius = (cell_height * 1.5).clamp(px(6.0), (cell_width * 0.3).max(px(6.0)));
-                let circle = Path::circle(Point::new(center_x, price_y(anchor)), radius);
+                // Sit the ring inside the bar, touching the extreme, so it never covers the
+                // summary text below the low.
+                let center_y = if bullish {
+                    price_y(anchor) - radius
+                } else {
+                    price_y(anchor) + radius
+                };
+                let circle = Path::circle(Point::new(center_x, center_y), radius);
                 frame.stroke(
                     &circle,
                     Stroke::default().with_color(color).with_width(stroke_width),
                 );
                 let label_y = if bullish {
-                    below_bar(anchor).max(price_y(anchor) + radius + px(4.0))
+                    below_bar(anchor)
                 } else {
-                    price_y(anchor) - radius - px(4.0) - label_size
+                    price_y(anchor) - px(4.0) - label_size
                 };
                 draw_label(
                     frame,
