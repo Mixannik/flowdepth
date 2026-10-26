@@ -40,6 +40,7 @@ mod drawing;
 mod naked_levels;
 mod signals;
 mod tpo;
+mod zones;
 
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned by exchange timestamp when this cap is exceeded.
@@ -2807,14 +2808,43 @@ impl canvas::Program<Message> for KlineChart {
                             absorption,
                             trapped,
                             exhaustion,
-                        } => Some(signals::Enabled {
-                            absorption: *absorption,
-                            trapped: *trapped,
-                            exhaustion: *exhaustion,
-                        }),
+                            stacked,
+                            unfinished,
+                        } => Some((
+                            signals::Enabled {
+                                absorption: *absorption,
+                                trapped: *trapped,
+                                exhaustion: *exhaustion,
+                            },
+                            zones::Enabled {
+                                stacked: *stacked,
+                                unfinished: *unfinished,
+                            },
+                        )),
                         _ => None,
                     });
-                    if let Some(enabled) = signals {
+                    if let Some((_, zones_enabled)) = signals {
+                        // Stacks follow the Imbalance study's ratio when it is on.
+                        let (threshold, _, ignore_zeros) = imbalance.unwrap_or((200, None, true));
+                        zones::draw(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            region.x + region.width,
+                            chart.cell_width,
+                            zones::ImbalanceRule {
+                                threshold,
+                                ignore_zeros,
+                            },
+                            zones_enabled,
+                            chart.scaling,
+                            palette,
+                        );
+                    }
+                    if let Some((enabled, _)) = signals {
                         // Mirrors the summary block placement in `draw_clusters`.
                         let below_offset = if self.visual_config.show_footprint_summary {
                             let summary =

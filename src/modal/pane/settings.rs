@@ -1416,39 +1416,35 @@ pub mod study {
                     absorption,
                     trapped,
                     exhaustion,
+                    stacked,
+                    unfinished,
                 } => {
-                    let absorption_cb =
-                        checkbox(absorption)
-                            .label("Absorption")
+                    let flags = [absorption, trapped, exhaustion, stacked, unfinished];
+                    let labels = [
+                        "Absorption",
+                        "Trapped traders",
+                        "Exhaustion",
+                        "Stacked imbalances",
+                        "Unfinished auctions",
+                    ];
+                    let toggles = labels.into_iter().enumerate().map(|(i, label)| {
+                        checkbox(flags[i])
+                            .label(label)
                             .on_toggle(move |value| {
+                                let mut f = flags;
+                                f[i] = value;
                                 on_change(FootprintStudy::Signals {
-                                    absorption: value,
-                                    trapped,
-                                    exhaustion,
+                                    absorption: f[0],
+                                    trapped: f[1],
+                                    exhaustion: f[2],
+                                    stacked: f[3],
+                                    unfinished: f[4],
                                 })
-                            });
-                    let trapped_cb =
-                        checkbox(trapped)
-                            .label("Trapped traders")
-                            .on_toggle(move |value| {
-                                on_change(FootprintStudy::Signals {
-                                    absorption,
-                                    trapped: value,
-                                    exhaustion,
-                                })
-                            });
-                    let exhaustion_cb =
-                        checkbox(exhaustion)
-                            .label("Exhaustion")
-                            .on_toggle(move |value| {
-                                on_change(FootprintStudy::Signals {
-                                    absorption,
-                                    trapped,
-                                    exhaustion: value,
-                                })
-                            });
+                            })
+                            .into()
+                    });
 
-                    column![absorption_cb, trapped_cb, exhaustion_cb]
+                    iced::widget::Column::with_children(toggles)
                         .padding(8)
                         .spacing(8)
                         .into()

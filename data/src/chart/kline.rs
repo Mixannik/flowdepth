@@ -1749,7 +1749,17 @@ pub enum FootprintStudy {
         absorption: bool,
         trapped: bool,
         exhaustion: bool,
+        /// 3+ adjacent imbalances on one side, zone extended until traded through.
+        #[serde(default = "enabled_by_default")]
+        stacked: bool,
+        /// Both sides traded at the bar's extreme tick, line extended until revisited.
+        #[serde(default = "enabled_by_default")]
+        unfinished: bool,
     },
+}
+
+fn enabled_by_default() -> bool {
+    true
 }
 
 impl FootprintStudy {
@@ -1770,6 +1780,8 @@ impl FootprintStudy {
             absorption: true,
             trapped: true,
             exhaustion: true,
+            stacked: true,
+            unfinished: true,
         },
     ];
 }
