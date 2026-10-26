@@ -698,6 +698,32 @@ mod tests {
     }
 
     #[test]
+    fn cache_aggregates_keep_volume_extremes_and_dedupe() {
+        use crate::chart::kline::{aggregate_trades_for_cache, is_aggregate_trade};
+        let trades: Vec<Trade> = (0..600u64)
+            .map(|i| Trade {
+                id: Some(i + 1),
+                time: UnixMs::new(i * 100),
+                is_sell: i % 3 == 0,
+                price: Price::from_f64(80_000.0 + (i % 50) as f64 * 0.1),
+                qty: Qty::from_f64(0.5),
+            })
+            .collect();
+        let out = aggregate_trades_for_cache(&trades, UnixMs::new(u64::MAX));
+        assert!(out.len() < trades.len() / 5);
+        assert!(out.iter().all(is_aggregate_trade));
+        let total = |t: &[Trade]| t.iter().fold(Qty::ZERO, |s, t| s + t.qty);
+        assert_eq!(total(&out), total(&trades));
+        let hi = |t: &[Trade]| t.iter().map(|t| t.price).max();
+        assert_eq!(hi(&out), hi(&trades));
+        // Aggregating again (a re-store) changes nothing, ids are stable.
+        let ids = |t: &[Trade]| t.iter().map(|t| t.id).collect::<Vec<_>>();
+        let again = aggregate_trades_for_cache(&out, UnixMs::new(u64::MAX));
+        assert_eq!(ids(&again), ids(&out));
+        assert_eq!(total(&again), total(&out));
+    }
+
+    #[test]
     fn old_candles_are_compacted_without_changing_coarse_footprint() {
         let hour = 60 * 60_000;
         let old_time = UnixMs::new(10 * hour);

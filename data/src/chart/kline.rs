@@ -218,6 +218,86 @@ pub struct KlineDataPoint {
     pub compacted_ids: Option<(u64, u64)>,
 }
 
+/// Ids of per-price aggregates written to the trade cache carry this bit; exchange ids never
+/// reach it.
+pub const AGGREGATE_ID_BIT: u64 = 1 << 63;
+
+pub fn is_aggregate_trade(trade: &Trade) -> bool {
+    trade.id.is_some_and(|id| id & AGGREGATE_ID_BIT != 0)
+}
+
+/// Minute buckets of the trade cache older than this are stored as aggregates.
+pub const CACHE_AGGREGATE_AFTER_MS: u64 = 2 * 24 * 60 * 60 * 1000;
+
+/// Folds trades older than `cutoff` into one record per (minute, price row, side) for the
+/// on-disk cache, about 20× smaller for BTC. Rows are a power of ten near 2e-5 of the price
+/// (BTC: 1 USD), finer than any footprint row; each minute's exact high and low ticks are
+/// kept so candle extremes and unfinished auctions survive. Newer trades pass unchanged.
+pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade> {
+    let mut out: Vec<Trade> = trades
+        .iter()
+        .filter(|t| t.time >= cutoff)
+        .copied()
+        .collect();
+    let mut minutes: std::collections::BTreeMap<u64, Vec<&Trade>> = Default::default();
+    for trade in trades.iter().filter(|t| t.time < cutoff) {
+        minutes
+            .entry(trade.time.as_u64() / 60_000)
+            .or_default()
+            .push(trade);
+    }
+    for (minute, group) in minutes {
+        // Already aggregated (re-store of a cached range): keep as is.
+        if group.iter().all(|t| is_aggregate_trade(t)) {
+            out.extend(group.into_iter().copied());
+            continue;
+        }
+        let (Some(high), Some(low)) = (
+            group.iter().map(|t| t.price).max(),
+            group.iter().map(|t| t.price).min(),
+        ) else {
+            continue;
+        };
+        let target = (high.units as f64 * 2e-5).max(1.0) as i64;
+        let mut step = 1;
+        while step * 10 <= target {
+            step *= 10;
+        }
+        let mut bins: std::collections::BTreeMap<(i64, bool), Trade> = Default::default();
+        for trade in group {
+            // kind: 0 = row center, 1 = exact high, 2 = exact low.
+            let (units, kind) = if trade.price == high {
+                (trade.price.units, 1)
+            } else if trade.price == low {
+                (trade.price.units, 2)
+            } else {
+                let center = trade.price.units.div_euclid(step) * step + step / 2;
+                (center.clamp(low.units + 1, high.units - 1), 0)
+            };
+            bins.entry((units, trade.is_sell))
+                .and_modify(|agg| {
+                    agg.qty += trade.qty;
+                    agg.time = agg.time.max(trade.time);
+                })
+                .or_insert(Trade {
+                    // Deterministic, so re-storing the same minute deduplicates.
+                    id: Some(
+                        AGGREGATE_ID_BIT
+                            | (minute << 24)
+                            | (((units / step).unsigned_abs() & 0x1F_FFFF) << 3)
+                            | (kind << 1)
+                            | u64::from(trade.is_sell),
+                    ),
+                    price: Price::from_units(units),
+                    ..*trade
+                });
+        }
+        out.extend(bins.into_values());
+    }
+    out.sort_by_key(|t| t.time);
+    out
+}
+
 /// Largest power of ten (in price units) still giving at least `COMPACT_ROWS` rows over
 /// `range`, so a candle keeps 60..600 rows.
 fn compact_step(range_units: i64) -> i64 {
@@ -265,6 +345,10 @@ impl KlineDataPoint {
             if !self.trade_ids.insert(id) {
                 return;
             }
+            // Cached aggregates: mark the candle so bubbles skip it; (MAX, 0) covers no id.
+            if id & AGGREGATE_ID_BIT != 0 && self.compacted_ids.is_none() {
+                self.compacted_ids = Some((u64::MAX, 0));
+            }
         }
         self.footprint.add_trade_to_nearest_bin(trade, step);
         self.trade_sequence.push(*trade);
@@ -308,7 +392,7 @@ impl KlineDataPoint {
         let mut last_id = self.compacted_ids.map(|(_, last)| last);
         let mut bins: FxHashMap<(i64, bool), Trade> = FxHashMap::default();
         for trade in &self.trade_sequence {
-            if let Some(id) = trade.id {
+            if let Some(id) = trade.id.filter(|id| id & AGGREGATE_ID_BIT == 0) {
                 first_id = Some(first_id.map_or(id, |f| f.min(id)));
                 last_id = Some(last_id.map_or(id, |l| l.max(id)));
             }
@@ -1576,6 +1660,8 @@ pub fn cluster_volume_bubble_trades(
                 && trade.time < candle_end
                 && trade.qty.units > 0
                 && trade.price.units > 0
+                // Per-price aggregates would look like whale prints.
+                && !is_aggregate_trade(trade)
         })
         .collect::<Vec<_>>();
     ordered.sort_by_key(|trade| (trade.time, trade.id));

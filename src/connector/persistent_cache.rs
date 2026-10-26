@@ -36,6 +36,9 @@ const TRADE_BUCKET_MS: u64 = 60 * 1_000;
 const MAX_BLOB_BYTES: usize = 512 * 1024 * 1024;
 const MAX_RECORDS_PER_BUCKET: usize = 5_000_000;
 const SCHEMA_KEY: &str = "market-data-cache-schema";
+const RAW_TRADES_DROPPED_KEY: &str = "raw-trade-cache-dropped";
+/// Trade dataset holding per-minute aggregates for anything older than two days.
+const TRADE_DATASET: &str = "trade_aggregated_v1";
 
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_meta_v1");
 const COVERAGE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_coverage_v1");
@@ -433,7 +436,12 @@ impl MarketDataCache {
         }
 
         match open_initialized_database(&path) {
-            Ok(db) => Ok(Self { db, path }),
+            Ok(mut db) => {
+                if let Err(error) = Self::drop_raw_trade_cache(&mut db) {
+                    log::error!("CACHE RawTradesDrop Error | error={error}");
+                }
+                Ok(Self { db, path })
+            }
             Err(first_error) => {
                 if path.exists() {
                     quarantine_database(&path, &first_error)?;
@@ -526,10 +534,13 @@ impl MarketDataCache {
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<Trade> {
-        let key = dataset_key(ticker_info, "trade");
+        let key = dataset_key(ticker_info, TRADE_DATASET);
         self.read_records(CacheKind::Trade, &key, from, to_exclusive, from)
     }
 
+    /// Trades older than two days are stored as per-minute price aggregates (see
+    /// [`data::chart::kline::aggregate_trades_for_cache`]): the footprint is unchanged, the
+    /// cache about 20× smaller. Recent ones stay raw for REST continuation and bubbles.
     pub fn store_trades(
         &self,
         ticker_info: TickerInfo,
@@ -537,8 +548,48 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[Trade],
     ) {
-        let key = dataset_key(ticker_info, "trade");
-        self.store_records(CacheKind::Trade, &key, from, to_exclusive, records);
+        let key = dataset_key(ticker_info, TRADE_DATASET);
+        let cutoff = UnixMs::now().saturating_sub(data::chart::kline::CACHE_AGGREGATE_AFTER_MS);
+        let records = data::chart::kline::aggregate_trades_for_cache(records, cutoff);
+        self.store_records(CacheKind::Trade, &key, from, to_exclusive, &records);
+    }
+
+    /// One-time cleanup of the raw trade cache written before aggregation (gigabytes for a
+    /// few weeks of BTC). The trades are re-downloaded from archives on demand.
+    fn drop_raw_trade_cache(db: &mut Database) -> Result<(), String> {
+        let write = db.begin_write().map_err(|error| error.to_string())?;
+        {
+            let mut meta = write
+                .open_table(META_TABLE)
+                .map_err(|error| error.to_string())?;
+            if meta
+                .get(RAW_TRADES_DROPPED_KEY)
+                .map_err(|error| error.to_string())?
+                .is_some()
+            {
+                return Ok(());
+            }
+            meta.insert(RAW_TRADES_DROPPED_KEY, &1)
+                .map_err(|error| error.to_string())?;
+        }
+        {
+            let mut trades = write
+                .open_table(TRADE_TABLE)
+                .map_err(|error| error.to_string())?;
+            trades
+                .retain(|key, _| key.contains(&format!("|{TRADE_DATASET}|")))
+                .map_err(|error| error.to_string())?;
+            let mut coverage = write
+                .open_table(COVERAGE_TABLE)
+                .map_err(|error| error.to_string())?;
+            coverage
+                .retain(|key, _| !key.ends_with("|trade"))
+                .map_err(|error| error.to_string())?;
+        }
+        write.commit().map_err(|error| error.to_string())?;
+        let compacted = db.compact().map_err(|error| error.to_string())?;
+        log::warn!("CACHE RawTradesDropped | file_compacted={compacted}");
+        Ok(())
     }
 
     pub fn read_open_interest(
