@@ -2688,16 +2688,18 @@ impl Dashboard {
         Subscription::batch(subscriptions)
     }
 
-    pub fn market_subscriptions(&self, handles: &AdapterHandles) -> Subscription<exchange::Event> {
-        let pane_count = self.panes.iter().count()
-            + self
-                .popout
-                .values()
-                .map(|(state, _)| state.iter().count())
-                .sum::<usize>();
-        log::debug!("STREAM RebuildSubscriptions | panes={pane_count}");
-        let unique_streams = self
-            .streams
+    /// Whether this dashboard has a resolved pane subscribed to `stream`.
+    pub fn has_stream(&self, stream: &StreamKind) -> bool {
+        self.streams.contains(stream)
+    }
+
+    /// Builds market subscriptions for the union of streams of every layout, so each
+    /// stream gets exactly one socket no matter how many layouts use it.
+    pub fn market_subscriptions(
+        streams: &UniqueStreams,
+        handles: &AdapterHandles,
+    ) -> Subscription<exchange::Event> {
+        let unique_streams = streams
             .combined_used()
             .flat_map(|(exchange, specs)| {
                 let mut subs = vec![];
@@ -2819,12 +2821,6 @@ impl Dashboard {
                 subs
             })
             .collect::<Vec<Subscription<exchange::Event>>>();
-
-        if unique_streams.is_empty() && pane_count > 0 {
-            // Log at debug level to avoid spamming every frame.
-            // This is a normal transient state during startup / stream resolution.
-            log::debug!("STREAM EmptySubscriptions | panes={pane_count} reason=no_unique_streams");
-        }
 
         Subscription::batch(unique_streams)
     }

@@ -169,6 +169,14 @@ impl UniqueStreams {
         self.update_specs_for_exchange(exchange);
     }
 
+    pub fn contains(&self, stream: &StreamKind) -> bool {
+        let ticker_info = stream.ticker_info();
+        self.streams[ticker_info.exchange()]
+            .as_ref()
+            .and_then(|tickers| tickers.get(&ticker_info))
+            .is_some_and(|streams| streams.contains(stream))
+    }
+
     pub fn extend<'a>(&mut self, streams: impl IntoIterator<Item = &'a StreamKind>) {
         for stream in streams {
             self.add(*stream);

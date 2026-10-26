@@ -558,12 +558,26 @@ impl Flowsurface {
                 let data_sources = Arc::clone(&self.data_sources);
                 let main_window_id = self.main_window.id;
                 let reconnect_time = exchange::UnixMs::now();
-                self.active_dashboard_mut()
-                    .execute_reconnect_backfill(&data_sources, main_window_id, reconnect_time)
-                    .map(move |msg| Message::Dashboard {
-                        layout_id: None,
-                        event: msg,
+                let tasks = self
+                    .layout_manager
+                    .layouts
+                    .iter_mut()
+                    .map(|layout| {
+                        let layout_id = layout.id.unique;
+                        layout
+                            .dashboard
+                            .execute_reconnect_backfill(
+                                &data_sources,
+                                main_window_id,
+                                reconnect_time,
+                            )
+                            .map(move |msg| Message::Dashboard {
+                                layout_id: Some(layout_id),
+                                event: msg,
+                            })
                     })
+                    .collect::<Vec<_>>();
+                Task::batch(tasks)
             }
         }
     }
@@ -605,8 +619,9 @@ impl Flowsurface {
                     // Accumulate every independently disconnected WS group.
                     // Backfill starts only when the aggregate connection state
                     // reports that all required streams have recovered.
-                    self.active_dashboard_mut()
-                        .record_pending_disconnect_gaps(streams, now);
+                    for dashboard in self.layout_manager.iter_dashboards_mut() {
+                        dashboard.record_pending_disconnect_gaps(streams, now);
+                    }
                     let transition = self.market_connectivity.record_disconnected(
                         streams,
                         reason.clone(),
@@ -649,8 +664,6 @@ impl Flowsurface {
                     return Task::none();
                 }
 
-                let dashboard = self.active_dashboard_mut();
-
                 match event {
                     exchange::Event::Connected(..)
                     | exchange::Event::Disconnected(..)
@@ -664,14 +677,9 @@ impl Flowsurface {
                             crate::connector::fetcher::format_stream(&stream),
                             crate::connector::fetcher::format_time_short(update_t)
                         );
-                        let task = dashboard
-                            .ingest_depth(&stream, update_t, &depth, main_window_id)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
-
-                        return task;
+                        return self.route_to_layouts(&stream, |dashboard| {
+                            dashboard.ingest_depth(&stream, update_t, &depth, main_window_id)
+                        });
                     }
                     exchange::Event::TradesReceived(stream, update_t, buffer) => {
                         let now = exchange::UnixMs::now();
@@ -686,12 +694,9 @@ impl Flowsurface {
                             crate::connector::fetcher::format_optional_time(last_trade_t),
                             now.saturating_diff(last_trade_t.unwrap_or(update_t))
                         );
-                        let task = dashboard
-                            .ingest_trades(&stream, &buffer, update_t, main_window_id)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
+                        let task = self.route_to_layouts(&stream, |dashboard| {
+                            dashboard.ingest_trades(&stream, &buffer, update_t, main_window_id)
+                        });
 
                         if let Some(msg) = self.audio_stream.try_play_sound(&stream, &buffer) {
                             self.notifications.push(Toast::error(msg));
@@ -705,8 +710,10 @@ impl Flowsurface {
                             crate::connector::fetcher::format_stream(&stream),
                             liquidations.len()
                         );
-                        dashboard.ingest_liquidations(&stream, &liquidations, main_window_id);
-                        return Task::none();
+                        return self.route_to_layouts(&stream, |dashboard| {
+                            dashboard.ingest_liquidations(&stream, &liquidations, main_window_id);
+                            Task::none()
+                        });
                     }
                     exchange::Event::KlineReceived(stream, kline) => {
                         // This is the chart's receive-time watermark for a live
@@ -723,12 +730,14 @@ impl Flowsurface {
                             kline.volume,
                             received_at.saturating_diff(kline.time)
                         );
-                        return dashboard
-                            .update_latest_klines(&stream, &kline, received_at, main_window_id)
-                            .map(move |msg| Message::Dashboard {
-                                layout_id: None,
-                                event: msg,
-                            });
+                        return self.route_to_layouts(&stream, |dashboard| {
+                            dashboard.update_latest_klines(
+                                &stream,
+                                &kline,
+                                received_at,
+                                main_window_id,
+                            )
+                        });
                     }
                 }
             }
@@ -753,7 +762,7 @@ impl Flowsurface {
                     }
                 }
 
-                let expected_streams = self.active_dashboard().configured_market_streams();
+                let expected_streams = self.all_market_streams();
                 let sync_transition = self
                     .market_connectivity
                     .sync_expected(&expected_streams, now);
@@ -897,13 +906,24 @@ impl Flowsurface {
                 let main_window_id = self.main_window.id;
                 let data_sources = Arc::clone(&self.data_sources);
 
-                let chart_tick = self
-                    .active_dashboard_mut()
-                    .tick(now, &data_sources, main_window_id)
-                    .map(move |msg| Message::Dashboard {
-                        layout_id: None,
-                        event: msg,
-                    });
+                // Inactive layouts tick too: their panes resolve streams, roll candles and
+                // schedule fetches in the background, so a tab switch shows current data.
+                let chart_tick = Task::batch(
+                    self.layout_manager
+                        .layouts
+                        .iter_mut()
+                        .map(|layout| {
+                            let layout_id = layout.id.unique;
+                            layout
+                                .dashboard
+                                .tick(now, &data_sources, main_window_id)
+                                .map(move |msg| Message::Dashboard {
+                                    layout_id: Some(layout_id),
+                                    event: msg,
+                                })
+                        })
+                        .collect::<Vec<_>>(),
+                );
 
                 return Task::batch(
                     [connectivity_task, chart_tick, startup_task]
@@ -1138,7 +1158,7 @@ impl Flowsurface {
                                         dashboard
                                             .resolve_streams(main_window.id, pane_id, resolved)
                                             .map(move |msg| Message::Dashboard {
-                                                layout_id: None,
+                                                layout_id: Some(layout_id),
                                                 event: msg,
                                             })
                                     }
@@ -1927,17 +1947,21 @@ impl Flowsurface {
                 )
                 .map(Message::Sidebar);
 
-            let dashboard_view = dashboard
-                .view(
-                    &self.main_window,
-                    tickers_table,
-                    self.timezone,
-                    self.windowing_mode.allows_native_popout(),
-                )
-                .map(move |msg| Message::Dashboard {
-                    layout_id: None,
-                    event: msg,
-                });
+            let dashboard_view = column![
+                self.layout_tabs(),
+                dashboard
+                    .view(
+                        &self.main_window,
+                        tickers_table,
+                        self.timezone,
+                        self.windowing_mode.allows_native_popout(),
+                    )
+                    .map(move |msg| Message::Dashboard {
+                        layout_id: None,
+                        event: msg,
+                    })
+            ]
+            .spacing(4);
 
             let header_title = {
                 #[cfg(target_os = "macos")]
@@ -2165,10 +2189,14 @@ impl Flowsurface {
         let window_events = window::events().map(Message::WindowEvent);
         let sidebar = self.sidebar.subscription().map(Message::Sidebar);
 
-        let exchange_streams = self
-            .active_dashboard()
-            .market_subscriptions(&self.data_sources.exchange)
-            .map(Message::MarketWsEvent);
+        // Every layout stays live (like terminal tabs): subscribe to the union of all
+        // layouts' streams so switching tabs never reconnects or refetches.
+        let all_streams = self.all_market_streams();
+        let exchange_streams = Dashboard::market_subscriptions(
+            &exchange::adapter::UniqueStreams::from(all_streams.iter()),
+            &self.data_sources.exchange,
+        )
+        .map(Message::MarketWsEvent);
 
         let layout_id = self.layout_manager.active_layout_id().map(|id| id.unique);
         let news = self
@@ -2235,6 +2263,80 @@ impl Flowsurface {
         } else {
             "unknown"
         }
+    }
+
+    /// One tab per layout above the panes; every layout stays live in the background,
+    /// so switching is instant.
+    fn layout_tabs(&self) -> Element<'_, Message> {
+        let active = self.layout_manager.active_layout_id().map(|id| id.unique);
+        let tabs = self
+            .layout_manager
+            .layouts
+            .iter()
+            .fold(row![].spacing(2), |tabs, layout| {
+                let is_active = Some(layout.id.unique) == active;
+                let tab = iced::widget::button(
+                    text(layout.id.name.clone()).size(crate::style::text_size::BODY),
+                )
+                .padding([2, 10])
+                .style(move |theme, status| style::button::toolbar(theme, status, is_active));
+                tabs.push(if is_active {
+                    tab
+                } else {
+                    tab.on_press(Message::Layouts(
+                        modal::layout_manager::Message::SelectActive(layout.id.unique),
+                    ))
+                })
+            });
+
+        iced::widget::scrollable(tabs)
+            .direction(iced::widget::scrollable::Direction::Horizontal(
+                iced::widget::scrollable::Scrollbar::new()
+                    .width(2)
+                    .scroller_width(2),
+            ))
+            .width(Length::Fill)
+            .into()
+    }
+
+    /// Delivers a live market event to the active layout and to every inactive layout
+    /// that subscribes to the stream. Inactive layouts are skipped when they lack the
+    /// stream, so their "no matching pane" self-healing never fires spuriously.
+    fn route_to_layouts(
+        &mut self,
+        stream: &exchange::adapter::StreamKind,
+        mut ingest: impl FnMut(&mut Dashboard) -> Task<dashboard::Message>,
+    ) -> Task<Message> {
+        let active = self.layout_manager.active_layout_id().map(|id| id.unique);
+        let tasks = self
+            .layout_manager
+            .layouts
+            .iter_mut()
+            .filter(|layout| {
+                Some(layout.id.unique) == active || layout.dashboard.has_stream(stream)
+            })
+            .map(|layout| {
+                let layout_id = layout.id.unique;
+                ingest(&mut layout.dashboard).map(move |event| Message::Dashboard {
+                    layout_id: Some(layout_id),
+                    event,
+                })
+            })
+            .collect::<Vec<_>>();
+        Task::batch(tasks)
+    }
+
+    /// Union of the market streams every layout needs.
+    fn all_market_streams(&self) -> Vec<exchange::adapter::StreamKind> {
+        let mut all = Vec::new();
+        for dashboard in self.layout_manager.iter_dashboards() {
+            for stream in dashboard.configured_market_streams() {
+                if !all.contains(&stream) {
+                    all.push(stream);
+                }
+            }
+        }
+        all
     }
 
     fn active_dashboard(&self) -> &Dashboard {
