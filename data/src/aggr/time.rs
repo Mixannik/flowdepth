@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use crate::chart::heatmap::HeatmapDataPoint;
 use crate::chart::kline::{
-    BubbleVolumeSummary, ClusterKind, KlineDataPoint, KlineTrades, NPoc, TradeCoverage,
+    BubbleVolumeSummary, COMPACT_AFTER_MS, ClusterKind, KlineDataPoint, KlineTrades, NPoc,
+    TradeCoverage,
 };
 
 use exchange::unit::{Price, PriceStep, Qty};
@@ -261,6 +262,7 @@ impl TimeSeries<KlineDataPoint> {
                     trade_coverage: TradeCoverage::Unknown,
                     trade_sequence: Vec::new(),
                     trade_ids: Default::default(),
+                    compacted_ids: None,
                 });
 
             entry.kline = *kline;
@@ -299,16 +301,18 @@ impl TimeSeries<KlineDataPoint> {
                     trade_coverage: TradeCoverage::Unknown,
                     trade_sequence: Vec::new(),
                     trade_ids: Default::default(),
+                    compacted_ids: None,
                 });
 
             entry.add_trade(trade, self.tick_size);
         });
 
-        for time in updated_times {
-            if let Some(data_point) = self.datapoints.get_mut(&time) {
+        for time in &updated_times {
+            if let Some(data_point) = self.datapoints.get_mut(time) {
                 data_point.calculate_poc();
             }
         }
+        self.compact_old_trades(&updated_times);
     }
 
     pub fn insert_trades_existing_buckets(&mut self, buffer: &[Trade]) {
@@ -328,11 +332,12 @@ impl TimeSeries<KlineDataPoint> {
             }
         }
 
-        for time in updated_times {
-            if let Some(data_point) = self.datapoints.get_mut(&time) {
+        for time in &updated_times {
+            if let Some(data_point) = self.datapoints.get_mut(time) {
                 data_point.calculate_poc();
             }
         }
+        self.compact_old_trades(&updated_times);
     }
 
     /// Mark all kline buckets in a time range as having complete raw-trade coverage.
@@ -355,6 +360,20 @@ impl TimeSeries<KlineDataPoint> {
         }
     }
 
+    /// Compacts candles among `times` that are older than [`COMPACT_AFTER_MS`] behind the
+    /// newest candle, so long footprint history fits in memory.
+    fn compact_old_trades(&mut self, times: &[UnixMs]) {
+        let Some(latest) = self.datapoints.keys().next_back().copied() else {
+            return;
+        };
+        let cutoff = latest.as_u64().saturating_sub(COMPACT_AFTER_MS);
+        for time in times.iter().filter(|t| t.as_u64() < cutoff) {
+            if let Some(data_point) = self.datapoints.get_mut(time) {
+                data_point.compact_trades();
+            }
+        }
+    }
+
     pub fn change_tick_size(&mut self, tick_size: PriceStep) {
         self.tick_size = tick_size;
 
@@ -363,11 +382,13 @@ impl TimeSeries<KlineDataPoint> {
         for data_point in self.datapoints.values_mut() {
             let trades = std::mem::take(&mut data_point.trade_sequence);
             let coverage = data_point.trade_coverage;
+            let compacted = data_point.compacted_ids;
             data_point.clear_trades();
             for trade in &trades {
                 data_point.add_trade(trade, tick_size);
             }
             data_point.trade_coverage = coverage;
+            data_point.compacted_ids = compacted;
             data_point.calculate_poc();
         }
         self.update_poc_status();
@@ -667,5 +688,65 @@ mod tests {
             .values()
             .fold(Qty::ZERO, |sum, group| sum + group.total_qty());
         assert_eq!(total, Qty::from_f64(5.0));
+    }
+
+    #[test]
+    fn old_candles_are_compacted_without_changing_coarse_footprint() {
+        let hour = 60 * 60_000;
+        let old_time = UnixMs::new(10 * hour);
+        let new_time = UnixMs::new(10 * hour + COMPACT_AFTER_MS + hour);
+        let kline = |time| Kline {
+            time,
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(110.0),
+            low: Price::from_f64(100.0),
+            close: Price::from_f64(105.0),
+            volume: Volume::empty_buy_sell(),
+        };
+        // 1000 trades on 100.00..=110.00 in 0.01 steps, alternating sides.
+        let trades: Vec<Trade> = (0..=1000u64)
+            .map(|i| Trade {
+                id: Some(i + 1),
+                time: UnixMs::new(old_time.as_u64() + i),
+                is_sell: i % 2 == 1,
+                price: Price::from_f64(100.0 + i as f64 * 0.01),
+                qty: Qty::from_f64(1.0),
+            })
+            .collect();
+        let coarse = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let mut series = TimeSeries::<KlineDataPoint>::new(
+            Timeframe::H1,
+            coarse,
+            &[kline(old_time), kline(new_time)],
+        );
+        series.insert_trades_existing_buckets(&trades);
+        let raw_rows = series.datapoints[&old_time].footprint.trades.clone();
+
+        let dp = &series.datapoints[&old_time];
+        assert!(dp.compacted_ids.is_some());
+        assert!(dp.trade_sequence.len() < trades.len() / 2);
+        // Exact extremes and their sides survive.
+        let prices: Vec<Price> = dp.trade_sequence.iter().map(|t| t.price).collect();
+        assert_eq!(prices.iter().max(), Some(&Price::from_f64(110.0)));
+        assert_eq!(prices.iter().min(), Some(&Price::from_f64(100.0)));
+
+        // Rebinning at a coarse row gives the same total per side, and refetched
+        // trades are not counted twice.
+        series.change_tick_size(PriceStep {
+            units: Price::from_f64(2.0).units,
+        });
+        series.change_tick_size(coarse);
+        series.insert_trades_existing_buckets(&trades[..10]);
+        let rows = &series.datapoints[&old_time].footprint.trades;
+        let sum = |rows: &rustc_hash::FxHashMap<Price, crate::chart::kline::GroupedTrades>,
+                   sell: bool| {
+            rows.values().fold(Qty::ZERO, |s, g| {
+                s + if sell { g.sell_qty } else { g.buy_qty }
+            })
+        };
+        assert_eq!(sum(rows, true), sum(&raw_rows, true));
+        assert_eq!(sum(rows, false), sum(&raw_rows, false));
     }
 }

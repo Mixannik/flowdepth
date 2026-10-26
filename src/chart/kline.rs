@@ -5289,6 +5289,8 @@ fn build_rendered_volume_bubbles(
             {
                 if config.use_raw_trades_when_available
                     && dp.trade_coverage == data::chart::kline::TradeCoverage::Complete
+                    // Compacted candles hold per-price aggregates, not real trade sizes.
+                    && dp.compacted_ids.is_none()
                     && !dp.trade_sequence.is_empty()
                 {
                     clusters.extend(cluster_volume_bubble_trades(
@@ -7640,6 +7642,7 @@ mod tests {
             trade_coverage: data::chart::kline::TradeCoverage::Unknown,
             trade_sequence: Vec::new(),
             trade_ids: Default::default(),
+            compacted_ids: None,
         };
         candle.add_trade(&previously_aggregated, price_step);
 

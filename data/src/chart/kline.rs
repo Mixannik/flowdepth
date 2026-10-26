@@ -212,7 +212,26 @@ pub struct KlineDataPoint {
     /// Stable exchange IDs already aggregated into this candle. Unlike the
     /// chart-level raw buffer, this lives as long as the candle bucket.
     pub trade_ids: FxHashSet<u64>,
+    /// Set once `trade_sequence` was folded into per-price aggregates (see
+    /// [`KlineDataPoint::compact_trades`]): the id range already counted, so refetched
+    /// executions are not added twice.
+    pub compacted_ids: Option<(u64, u64)>,
 }
+
+/// Largest power of ten (in price units) still giving at least `COMPACT_ROWS` rows over
+/// `range`, so a candle keeps 60..600 rows.
+fn compact_step(range_units: i64) -> i64 {
+    let mut step = 1;
+    while range_units / (step * 10) >= COMPACT_ROWS {
+        step *= 10;
+    }
+    step
+}
+
+/// Candles this far behind the newest one keep aggregates instead of raw executions.
+pub const COMPACT_AFTER_MS: u64 = 48 * 60 * 60 * 1000;
+/// Price rows a compacted candle keeps across its range; finer than any readable footprint.
+const COMPACT_ROWS: i64 = 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TradeCoverage {
@@ -234,10 +253,16 @@ impl KlineDataPoint {
         if trade.price.units <= 0 {
             return;
         }
-        if let Some(id) = trade.id
-            && !self.trade_ids.insert(id)
-        {
-            return;
+        if let Some(id) = trade.id {
+            if self
+                .compacted_ids
+                .is_some_and(|(first, last)| (first..=last).contains(&id))
+            {
+                return;
+            }
+            if !self.trade_ids.insert(id) {
+                return;
+            }
         }
         self.footprint.add_trade_to_nearest_bin(trade, step);
         self.trade_sequence.push(*trade);
@@ -258,6 +283,57 @@ impl KlineDataPoint {
         self.footprint.clear();
         self.trade_sequence.clear();
         self.trade_ids.clear();
+        self.compacted_ids = None;
+    }
+
+    /// Folds raw executions into one aggregate per (price row, side), about
+    /// `COMPACT_ROWS` rows over the candle's range. Footprints rebuilt from the sequence
+    /// stay the same for any row size coarser than that; the exact high and low ticks are
+    /// kept per side so finished/unfinished auctions still read correctly.
+    pub fn compact_trades(&mut self) {
+        let (Some(high), Some(low)) = (
+            self.trade_sequence.iter().map(|t| t.price).max(),
+            self.trade_sequence.iter().map(|t| t.price).min(),
+        ) else {
+            return;
+        };
+        if self.trade_sequence.len() <= 4 * COMPACT_ROWS as usize {
+            return;
+        }
+        let step = compact_step(high.units - low.units);
+
+        let mut first_id = self.compacted_ids.map(|(first, _)| first);
+        let mut last_id = self.compacted_ids.map(|(_, last)| last);
+        let mut bins: FxHashMap<(i64, bool), Trade> = FxHashMap::default();
+        for trade in &self.trade_sequence {
+            if let Some(id) = trade.id {
+                first_id = Some(first_id.map_or(id, |f| f.min(id)));
+                last_id = Some(last_id.map_or(id, |l| l.max(id)));
+            }
+            let units = if trade.price == high || trade.price == low {
+                trade.price.units
+            } else {
+                // Never round onto (or past) an extreme: that would fake a new high/low.
+                let rounded = (trade.price.units as f64 / step as f64).round() as i64 * step;
+                rounded.clamp(low.units + 1, high.units - 1)
+            };
+            bins.entry((units, trade.is_sell))
+                .and_modify(|agg| {
+                    agg.qty += trade.qty;
+                    agg.time = agg.time.max(trade.time);
+                })
+                .or_insert(Trade {
+                    id: None,
+                    price: Price::from_units(units),
+                    ..*trade
+                });
+        }
+
+        let mut compacted: Vec<Trade> = bins.into_values().collect();
+        compacted.sort_by_key(|t| t.time);
+        self.trade_sequence = compacted;
+        self.trade_ids = FxHashSet::default();
+        self.compacted_ids = first_id.zip(last_id);
     }
 
     pub fn set_bubble_summary(&mut self, summary: BubbleVolumeSummary) {
