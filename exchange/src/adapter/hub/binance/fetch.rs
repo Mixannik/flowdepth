@@ -555,7 +555,9 @@ pub(super) async fn fetch_historical_oi(
                 AdapterError::ParseError(format!("System clock before UNIX_EPOCH: {err}"))
             })?
             .as_millis() as u64;
-        let thirty_days_ago = now_ms.saturating_sub(THIRTY_DAYS_MS);
+        // An exact 30-day start is already "invalid" (-1130) once the request reaches Binance
+        // (and on retries); keep an hour of margin.
+        let thirty_days_ago = now_ms.saturating_sub(THIRTY_DAYS_MS) + 60 * 60 * 1000;
 
         if end < thirty_days_ago {
             let err_msg = format!(

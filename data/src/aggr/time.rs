@@ -372,6 +372,13 @@ impl TimeSeries<KlineDataPoint> {
                 data_point.compact_trades();
             }
         }
+        // Live candles age past the cutoff without new trades: catch the few just behind it.
+        let recent = UnixMs::new(cutoff.saturating_sub(COMPACT_AFTER_MS));
+        for (_, data_point) in self.datapoints.range_mut(recent..UnixMs::new(cutoff)) {
+            if data_point.compacted_ids.is_none() {
+                data_point.compact_trades();
+            }
+        }
     }
 
     pub fn change_tick_size(&mut self, tick_size: PriceStep) {

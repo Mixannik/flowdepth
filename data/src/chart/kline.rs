@@ -229,7 +229,9 @@ fn compact_step(range_units: i64) -> i64 {
 }
 
 /// Candles this far behind the newest one keep aggregates instead of raw executions.
-pub const COMPACT_AFTER_MS: u64 = 48 * 60 * 60 * 1000;
+/// Raw executions are what costs memory (tens of thousands per candle); only volume bubbles
+/// and the live candle need them, so keep just the last couple of hours.
+pub const COMPACT_AFTER_MS: u64 = 2 * 60 * 60 * 1000;
 /// Price rows a compacted candle keeps across its range; finer than any readable footprint.
 const COMPACT_ROWS: i64 = 60;
 
@@ -313,9 +315,11 @@ impl KlineDataPoint {
             let units = if trade.price == high || trade.price == low {
                 trade.price.units
             } else {
-                // Never round onto (or past) an extreme: that would fake a new high/low.
-                let rounded = (trade.price.units as f64 / step as f64).round() as i64 * step;
-                rounded.clamp(low.units + 1, high.units - 1)
+                // Bin centers, not edges: a center never sits on a coarser row's rounding
+                // tie, so rebinning puts each bin where its raw trades would have gone.
+                // Never land on (or past) an extreme: that would fake a new high/low.
+                let center = trade.price.units.div_euclid(step) * step + step / 2;
+                center.clamp(low.units + 1, high.units - 1)
             };
             bins.entry((units, trade.is_sell))
                 .and_modify(|agg| {
@@ -812,7 +816,7 @@ impl KlineChartKind {
         match self {
             // Zoomed far out footprints become colored strips (text hides itself), so the
             // session around a level fits on screen.
-            KlineChartKind::Footprint { .. } => 5.0,
+            KlineChartKind::Footprint { .. } => 2.0,
             KlineChartKind::Candles => 1.0,
         }
     }

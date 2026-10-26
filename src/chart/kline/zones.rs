@@ -18,8 +18,6 @@ use iced::{
 
 /// Adjacent imbalanced rows needed for a stack.
 const STACK_MIN: usize = 3;
-/// Bars before the visible range still scanned for zones reaching into view.
-const LOOKBACK_BARS: u64 = 300;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Row {
@@ -94,7 +92,12 @@ pub(super) struct Auction {
 pub(super) fn stacked_imbalances(bars: &[Bar], step: f64, rule: ImbalanceRule) -> Vec<Stack> {
     let mut stacks = Vec::new();
     for (i, bar) in bars.iter().enumerate() {
-        let row_at = |index: i64| bar.rows.iter().find(|r| r.index == index);
+        let row_at = |index: i64| {
+            bar.rows
+                .binary_search_by_key(&index, |r| r.index)
+                .ok()
+                .map(|k| &bar.rows[k])
+        };
         let imbalanced = |row: &Row, side: Side| match side {
             Side::Buy => rule.holds(row.buy, row_at(row.index - 1).map_or(0.0, |d| d.sell)),
             Side::Sell => rule.holds(row.sell, row_at(row.index + 1).map_or(0.0, |d| d.buy)),
@@ -258,15 +261,10 @@ pub(super) fn draw(
     if !enabled.stacked && !enabled.unfinished {
         return;
     }
-    let interval = series.interval.to_milliseconds();
     // Footprint rows are binned at the series' step.
     let step = series.tick_size;
-    let bars = collect_bars(
-        source,
-        earliest.saturating_sub(interval * LOOKBACK_BARS),
-        step,
-        enabled.unfinished,
-    );
+    // All loaded history: a zone born far left of the view must not vanish while panning.
+    let bars = collect_bars(source, 0, step, enabled.unfinished);
     let (times, plain): (Vec<u64>, Vec<Bar>) = bars.into_iter().unzip();
     let px = |p: f32| p / scaling;
     let price_y = |price: f64| y(Price::from_f64(price));
