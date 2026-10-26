@@ -20,8 +20,8 @@ const VALUE_AREA_SHARE: f64 = 0.70;
 /// Profile rows per session: fine enough for a POC, cheap enough to rebuild every frame.
 const ROWS_PER_SESSION: f64 = 200.0;
 /// Most recent completed sessions considered, per session length.
-const MAX_DAILY_SESSIONS: usize = 5;
-const MAX_WEEKLY_SESSIONS: usize = 3;
+const MAX_DAILY_SESSIONS: usize = 3;
+const MAX_WEEKLY_SESSIONS: usize = 2;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum BarVolume {
@@ -232,7 +232,47 @@ fn collect_bars(source: &PlotData<KlineDataPoint>) -> Vec<Bar> {
         .collect()
 }
 
-/// Draws naked levels from their session end to `right_x`.
+/// Light blue for value-area edges: distinct from the gold POC on dark and light themes.
+const VALUE_AREA_COLOR: iced::Color = iced::Color::from_rgb(0.42, 0.72, 1.0);
+
+/// A right-edge label; nearby levels share one so their text never overlaps.
+#[derive(Debug, Clone, PartialEq)]
+struct Label {
+    y: f32,
+    names: Vec<String>,
+    price: f64,
+    is_poc: bool,
+}
+
+/// Merges labels closer than `min_gap` (screen-space y, any order) into the first of each run.
+fn merge_labels(mut labels: Vec<Label>, min_gap: f32) -> Vec<Label> {
+    labels.sort_by(|a, b| a.y.total_cmp(&b.y));
+    let mut merged: Vec<Label> = Vec::with_capacity(labels.len());
+    for label in labels {
+        match merged.last_mut() {
+            Some(prev) if label.y - prev.y < min_gap => {
+                prev.names.extend(label.names);
+                prev.is_poc |= label.is_poc;
+            }
+            _ => merged.push(label),
+        }
+    }
+    merged
+}
+
+fn format_price(price: f64) -> String {
+    if price >= 1000.0 {
+        format!("{price:.0}")
+    } else if price >= 1.0 {
+        format!("{price:.2}")
+    } else {
+        format!("{price:.5}")
+    }
+}
+
+/// Draws naked levels from their session end to `right_x`: weekly POC/VAH/VAL as solid lines,
+/// daily POCs dashed. Daily value-area edges are left out; on higher timeframes they mostly
+/// crowd the price with noise.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn draw(
     source: &PlotData<KlineDataPoint>,
@@ -248,58 +288,69 @@ pub(super) fn draw(
     let px = |p: f32| p / scaling;
     let label_size = px(10.0);
 
-    for (kind, max) in [
-        (SessionKind::Weekly, MAX_WEEKLY_SESSIONS),
-        (SessionKind::Daily, MAX_DAILY_SESSIONS),
-    ] {
-        for level in naked_levels(&bars, kind, max, align) {
-            let left = x(level.from);
-            if left >= right_x {
-                continue;
-            }
-            let line_y = y(Price::from_f64(level.price));
-            let (color, name) = match level.kind {
-                LevelKind::Poc => (palette.warning.strong.color, "nPOC"),
-                LevelKind::Vah => (palette.primary.strong.color, "nVAH"),
-                LevelKind::Val => (palette.primary.strong.color, "nVAL"),
-            };
-            let width = match kind {
-                SessionKind::Weekly => px(1.8),
-                SessionKind::Daily => px(1.1),
-            };
-            let stroke = Stroke {
+    let weekly = naked_levels(&bars, SessionKind::Weekly, MAX_WEEKLY_SESSIONS, align);
+    let daily = naked_levels(&bars, SessionKind::Daily, MAX_DAILY_SESSIONS, align)
+        .into_iter()
+        .filter(|level| level.kind == LevelKind::Poc);
+
+    let mut labels = Vec::new();
+    for level in weekly.into_iter().chain(daily) {
+        let left = x(level.from);
+        if left >= right_x {
+            continue;
+        }
+        let line_y = y(Price::from_f64(level.price));
+        let (color, name) = match level.kind {
+            LevelKind::Poc => (palette.warning.strong.color, "nPOC"),
+            LevelKind::Vah => (VALUE_AREA_COLOR, "nVAH"),
+            LevelKind::Val => (VALUE_AREA_COLOR, "nVAL"),
+        };
+        let base = Stroke::default().with_color(color.scale_alpha(0.9));
+        let stroke = match level.session {
+            SessionKind::Weekly => base.with_width(px(1.6)),
+            SessionKind::Daily => Stroke {
                 line_dash: LineDash {
                     segments: &[6.0, 4.0],
                     offset: 0,
                 },
-                ..Stroke::default()
-                    .with_color(color.scale_alpha(0.85))
-                    .with_width(width)
-            };
-            frame.stroke(
-                &Path::line(Point::new(left, line_y), Point::new(right_x, line_y)),
-                stroke,
-            );
+                ..base.with_width(px(1.1))
+            },
+        };
+        frame.stroke(
+            &Path::line(Point::new(left, line_y), Point::new(right_x, line_y)),
+            stroke,
+        );
+        labels.push(Label {
+            y: line_y,
+            names: vec![format!("{name} {}", level.session.tag())],
+            price: level.price,
+            is_poc: level.kind == LevelKind::Poc,
+        });
+    }
 
-            let text = format!("{name} {}", kind.tag());
-            let text_w = text.len() as f32 * label_size * 0.62 + label_size * 0.6;
-            let text_x = right_x - text_w;
-            frame.fill_rectangle(
-                Point::new(text_x, line_y - label_size * 0.65),
-                Size::new(text_w, label_size * 1.3),
-                palette.background.base.color.scale_alpha(0.85),
-            );
-            frame.fill_text(canvas::Text {
-                content: text,
-                position: Point::new(right_x - label_size * 0.3, line_y),
-                size: iced::Pixels(label_size),
-                color,
-                align_x: Alignment::End.into(),
-                align_y: Alignment::Center.into(),
-                font: crate::style::AZERET_MONO,
-                ..canvas::Text::default()
-            });
-        }
+    for label in merge_labels(labels, label_size * 1.4) {
+        let color = if label.is_poc {
+            palette.warning.strong.color
+        } else {
+            VALUE_AREA_COLOR
+        };
+        let text = format!("{} {}", label.names.join(" · "), format_price(label.price));
+        let text_w = text.chars().count() as f32 * label_size * 0.62 + label_size * 0.6;
+        frame.fill_rectangle(
+            Point::new(right_x - text_w, label.y - label_size * 0.65),
+            Size::new(text_w, label_size * 1.3),
+            palette.background.base.color.scale_alpha(0.9),
+        );
+        frame.fill_text(canvas::Text {
+            content: text,
+            position: Point::new(right_x - label_size * 0.3, label.y),
+            size: iced::Pixels(label_size),
+            color,
+            align_x: Alignment::End.into(),
+            align_y: Alignment::Center.into(),
+            font: crate::style::AZERET_MONO,
+            ..canvas::Text::default()
+        });
     }
 }
 
@@ -388,6 +439,44 @@ mod tests {
         let levels = naked_levels(&bars, SessionKind::Daily, 5, day_align);
         let price = poc(&levels).expect("candle-based POC");
         assert!((100.0..=104.0).contains(&price), "POC at {price}");
+    }
+
+    fn label(y: f32, name: &str, is_poc: bool) -> Label {
+        Label {
+            y,
+            names: vec![name.to_string()],
+            price: f64::from(y),
+            is_poc,
+        }
+    }
+
+    #[test]
+    fn close_labels_merge_and_keep_poc_color() {
+        let merged = merge_labels(
+            vec![
+                label(100.0, "nVAH D", false),
+                label(40.0, "nVAL W", false),
+                label(105.0, "nPOC D", true),
+            ],
+            10.0,
+        );
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].names, vec!["nVAL W"]);
+        assert_eq!(merged[1].names, vec!["nVAH D", "nPOC D"]);
+        assert!(merged[1].is_poc);
+    }
+
+    #[test]
+    fn far_labels_stay_separate() {
+        let merged = merge_labels(vec![label(0.0, "a", false), label(30.0, "b", false)], 10.0);
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn prices_format_by_magnitude() {
+        assert_eq!(format_price(81650.36), "81650");
+        assert_eq!(format_price(2.5), "2.50");
+        assert_eq!(format_price(0.000123), "0.00012");
     }
 
     #[test]
