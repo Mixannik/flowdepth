@@ -2679,9 +2679,11 @@ impl State {
             Content::Kline { chart, .. } => {
                 let chart = chart.as_mut()?;
                 let action = chart.invalidate(Some(now)).map(Action::Chart);
+                // No request-handler reset here, unlike a manual step change: the chart already
+                // re-binned every candle from its retained trades, and a reset would discard the
+                // backfill that `invalidate` may have just queued.
                 if let Some(multiplier) = chart.take_pending_tick_multiplier() {
                     self.settings.tick_multiply = Some(multiplier);
-                    chart.reset_request_handler();
                 }
                 action
             }
