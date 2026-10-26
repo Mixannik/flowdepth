@@ -176,9 +176,9 @@ pub(super) fn draw(
         let width = x(*last) - x(*first) + cell_width * 0.9;
         let (color, strong, label) = match kind {
             OiBarKind::NewLongs => (palette.success.strong.color, true, "New L"),
-            OiBarKind::ShortCovering => (palette.success.strong.color, false, "Cover"),
+            OiBarKind::ShortCovering => (palette.success.strong.color, false, "S close"),
             OiBarKind::NewShorts => (palette.danger.strong.color, true, "New S"),
-            OiBarKind::LongLiquidation => (palette.danger.strong.color, false, "Liq"),
+            OiBarKind::LongLiquidation => (palette.danger.strong.color, false, "L close"),
         };
         frame.fill_rectangle(
             Point::new(left, top),
