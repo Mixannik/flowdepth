@@ -237,6 +237,14 @@ impl BinanceHandle {
         stream::connect_trade_stream(tickers, market_type, self.proxy_cfg)
     }
 
+    pub fn connect_liquidation_stream(
+        self,
+        tickers: Vec<TickerInfo>,
+        market_type: MarketKind,
+    ) -> impl futures::Stream<Item = Event> {
+        stream::connect_liquidation_stream(tickers, market_type, self.proxy_cfg)
+    }
+
     pub fn connect_kline_stream(
         self,
         streams: Vec<(TickerInfo, Timeframe)>,

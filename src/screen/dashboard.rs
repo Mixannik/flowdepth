@@ -2478,6 +2478,22 @@ impl Dashboard {
         }
     }
 
+    pub fn ingest_liquidations(
+        &mut self,
+        stream: &StreamKind,
+        liquidations: &[Trade],
+        main_window: window::Id,
+    ) {
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, pane_state)| {
+                if pane_state.matches_stream(stream)
+                    && let pane::Content::TimeAndSales(Some(panel)) = &mut pane_state.content
+                {
+                    panel.insert_liquidations(liquidations);
+                }
+            });
+    }
+
     pub fn invalidate_all_panes(&mut self, main_window: window::Id) {
         self.iter_all_panes_mut(main_window)
             .for_each(|(_, _, state)| {
@@ -2743,6 +2759,33 @@ impl Dashboard {
 
                     if !trade_subs.is_empty() {
                         subs.push(Subscription::batch(trade_subs));
+                    }
+
+                    // Liquidations ride on the trade streams' tickers through their own socket.
+                    if matches!(
+                        exchange,
+                        ::exchange::adapter::Exchange::BinanceLinear
+                            | ::exchange::adapter::Exchange::BinanceInverse
+                    ) {
+                        let liq_subs = specs
+                            .trade
+                            .chunks(MAX_TRADE_TICKERS_PER_STREAM)
+                            .map(|tickers| {
+                                let config = StreamConfig::new(
+                                    tickers.to_vec(),
+                                    exchange,
+                                    None,
+                                    PushFrequency::ServerDefault,
+                                );
+                                // The marker keeps this subscription's identity distinct from
+                                // the trade subscription built from the same config.
+                                let data = (handles.clone(), config, "liquidations");
+                                Subscription::run_with(data, |data| {
+                                    data.0.liquidation_stream(&data.1)
+                                })
+                            })
+                            .collect::<Vec<_>>();
+                        subs.push(Subscription::batch(liq_subs));
                     }
                 }
 

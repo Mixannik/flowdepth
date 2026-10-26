@@ -525,6 +525,9 @@ pub enum Event {
     DepthReceived(StreamKind, UnixMs, Arc<Depth>),
     TradesReceived(StreamKind, UnixMs, Box<[Trade]>),
     KlineReceived(StreamKind, Kline),
+    /// Forced liquidation orders, keyed by the ticker's trade stream. `is_sell` means a
+    /// long position was liquidated; price is the average fill price.
+    LiquidationsReceived(StreamKind, Box<[Trade]>),
     /// Normalized non-trade events used by order-flow consumers. These do not replace the
     /// legacy depth/trade events.
     OrderFlow(crate::orderflow::OrderFlowEvent),

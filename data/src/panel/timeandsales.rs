@@ -15,6 +15,12 @@ pub struct Config {
     pub trade_retention: Duration,
     #[serde(deserialize_with = "ok_or_default", default)]
     pub stacked_bar: Option<StackedBar>,
+    #[serde(deserialize_with = "ok_or_default", default)]
+    pub feed: TapeFeed,
+    /// Merge fills of one taker order (same side, same millisecond) into one row, so a
+    /// market order sweeping several levels shows its full size.
+    #[serde(default)]
+    pub merge_taker_orders: bool,
 }
 
 impl Default for Config {
@@ -23,8 +29,31 @@ impl Default for Config {
             trade_size_filter: 0.0,
             trade_retention: Duration::from_millis(TRADE_RETENTION_MS),
             stacked_bar: StackedBar::Compact(StackedBarRatio::default()).into(),
+            feed: TapeFeed::default(),
+            merge_taker_orders: false,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, Default, Copy)]
+pub enum TapeFeed {
+    #[default]
+    Trades,
+    /// Forced liquidations (Binance perpetuals); sells are liquidated longs.
+    Liquidations,
+}
+
+impl std::fmt::Display for TapeFeed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TapeFeed::Trades => write!(f, "Trades"),
+            TapeFeed::Liquidations => write!(f, "Liquidations"),
+        }
+    }
+}
+
+impl TapeFeed {
+    pub const ALL: [TapeFeed; 2] = [TapeFeed::Trades, TapeFeed::Liquidations];
 }
 
 fn default_buffer_filter() -> Duration {

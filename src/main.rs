@@ -699,6 +699,15 @@ impl Flowsurface {
 
                         return task;
                     }
+                    exchange::Event::LiquidationsReceived(stream, liquidations) => {
+                        log::debug!(
+                            "WS LiquidationsReceived | stream={} count={}",
+                            crate::connector::fetcher::format_stream(&stream),
+                            liquidations.len()
+                        );
+                        dashboard.ingest_liquidations(&stream, &liquidations, main_window_id);
+                        return Task::none();
+                    }
                     exchange::Event::KlineReceived(stream, kline) => {
                         // This is the chart's receive-time watermark for a live
                         // kline update, captured as the event is handled.

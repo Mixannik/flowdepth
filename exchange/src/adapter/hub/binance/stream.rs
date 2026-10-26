@@ -354,16 +354,39 @@ fn normalized_delta_event(
     }
 }
 
+#[derive(Deserialize, Debug)]
+struct SonicForceOrderWrap {
+    #[serde(rename = "o")]
+    order: SonicForceOrder,
+}
+
+#[derive(Deserialize, Debug)]
+struct SonicForceOrder {
+    #[serde(rename = "s")]
+    symbol: String,
+    /// "SELL" closes a long, "BUY" closes a short.
+    #[serde(rename = "S")]
+    side: String,
+    #[serde(rename = "ap", deserialize_with = "de_string_to_number")]
+    avg_price: f64,
+    #[serde(rename = "z", deserialize_with = "de_string_to_number")]
+    filled_qty: f64,
+    #[serde(rename = "T")]
+    time: u64,
+}
+
 enum StreamData {
     Trade(Ticker, SonicTrade, TradeStreamKind),
     Depth(SonicDepth),
     Kline(Ticker, SonicKline),
+    Liquidation(Ticker, SonicForceOrder),
 }
 
 enum StreamWrapper {
     Trade(TradeStreamKind),
     Depth,
     Kline,
+    Liquidation,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -382,6 +405,7 @@ impl StreamWrapper {
                 "trade" => Some(StreamWrapper::Trade(TradeStreamKind::Raw)),
                 "aggTrade" => Some(StreamWrapper::Trade(TradeStreamKind::Aggregate)),
                 s if s.starts_with("kl") => Some(StreamWrapper::Kline),
+                "forceOrder" => Some(StreamWrapper::Liquidation),
                 _ => None,
             })
     }
@@ -444,6 +468,15 @@ fn feed_de(slice: &[u8], market: MarketKind) -> Result<StreamData, AdapterError>
                     return Ok(StreamData::Kline(
                         Ticker::new(&kline_wrap.symbol, exchange),
                         kline_wrap.kline,
+                    ));
+                }
+                Some(StreamWrapper::Liquidation) => {
+                    let wrap: SonicForceOrderWrap = sonic_rs::from_str(&v.as_raw_faststr())
+                        .map_err(|e| AdapterError::ParseError(e.to_string()))?;
+
+                    return Ok(StreamData::Liquidation(
+                        Ticker::new(&wrap.order.symbol, exchange),
+                        wrap.order,
                     ));
                 }
                 _ => {
@@ -703,6 +736,125 @@ pub fn connect_trade_stream(
     };
 
     WsSession::new(stream_scope).run(adapter)
+}
+
+struct LiquidationAdapter {
+    market: MarketKind,
+    ticker_info_map: HashMap<Ticker, (TickerInfo, QtyNormalization)>,
+    stream: String,
+    proxy_cfg: Option<crate::proxy::Proxy>,
+}
+
+impl WsAdapter for LiquidationAdapter {
+    fn heartbeat_policy(&self) -> HeartbeatPolicy {
+        binance_heartbeat_policy(self.market)
+    }
+
+    async fn connect(&mut self) -> Result<WsTransport, String> {
+        // `@forceOrder` is published only on the futures market endpoint.
+        connect_stream_socket(
+            self.market,
+            WsTrafficKind::Market,
+            &self.stream,
+            self.proxy_cfg.as_ref(),
+        )
+        .await
+    }
+
+    async fn on_connected(&mut self) -> Vec<Event> {
+        Vec::new()
+    }
+
+    async fn on_text(&mut self, payload: &[u8]) -> Result<Vec<Event>, String> {
+        let Ok(StreamData::Liquidation(ticker, order)) = feed_de(payload, self.market) else {
+            return Ok(Vec::new());
+        };
+        let Some((ticker_info, qty_norm)) = self.ticker_info_map.get(&ticker) else {
+            return Ok(Vec::new());
+        };
+
+        let price = Price::from_f64(order.avg_price).round_to_min_tick(ticker_info.min_ticksize);
+        let qty = qty_norm.normalize_qty(order.filled_qty, order.avg_price);
+        if price.units <= 0 || qty.is_zero() {
+            return Ok(Vec::new());
+        }
+
+        let liquidation = Trade {
+            id: None,
+            time: order.time.into(),
+            is_sell: order.side == "SELL",
+            price,
+            qty,
+        };
+
+        Ok(vec![Event::LiquidationsReceived(
+            StreamKind::Trades {
+                ticker_info: *ticker_info,
+            },
+            Box::new([liquidation]),
+        )])
+    }
+
+    async fn on_disconnected(&mut self, _reason: &str) -> Vec<Event> {
+        Vec::new()
+    }
+}
+
+/// Binance pushes at most one liquidation per symbol per second (the latest one), so this
+/// feed undercounts during cascades; it is still the only public real-time source.
+pub fn connect_liquidation_stream(
+    tickers: Vec<TickerInfo>,
+    market: MarketKind,
+    proxy_cfg: Option<crate::proxy::Proxy>,
+) -> impl Stream<Item = Event> {
+    let stream_scope: Arc<[StreamKind]> = Arc::from(
+        tickers
+            .iter()
+            .map(|ticker_info| StreamKind::Trades {
+                ticker_info: *ticker_info,
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+
+    let stream = tickers
+        .iter()
+        .map(|ticker_info| {
+            let symbol = ticker_info
+                .ticker
+                .to_full_symbol_and_type()
+                .0
+                .to_lowercase();
+            format!("{symbol}@forceOrder")
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+
+    let ticker_info_map = tickers
+        .iter()
+        .map(|ticker_info| {
+            (
+                ticker_info.ticker,
+                (
+                    *ticker_info,
+                    QtyNormalization::with_raw_qty_unit(
+                        volume_size_unit() == SizeUnit::Quote,
+                        *ticker_info,
+                        raw_qty_unit_from_market_type(market),
+                    ),
+                ),
+            )
+        })
+        .collect();
+
+    let adapter = LiquidationAdapter {
+        market,
+        ticker_info_map,
+        stream,
+        proxy_cfg,
+    };
+
+    WsSession::new(stream_scope).silent().run(adapter)
 }
 
 struct DepthAdapter {
@@ -1293,6 +1445,43 @@ mod tests {
         assert!(adapter.on_text(marker).await.unwrap().is_empty());
         assert!(adapter.orderflow_trades.is_empty());
         assert!(adapter.on_tick().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn force_order_becomes_liquidation_on_trade_stream() {
+        let ticker_info = ticker_info();
+        let mut adapter = LiquidationAdapter {
+            market: MarketKind::LinearPerps,
+            ticker_info_map: [(
+                ticker_info.ticker,
+                (
+                    ticker_info,
+                    QtyNormalization::with_raw_qty_unit(
+                        false,
+                        ticker_info,
+                        raw_qty_unit_from_market_type(MarketKind::LinearPerps),
+                    ),
+                ),
+            )]
+            .into_iter()
+            .collect(),
+            stream: "btcusdt@forceOrder".to_string(),
+            proxy_cfg: None,
+        };
+        let payload = br#"{"stream":"btcusdt@forceOrder","data":{"e":"forceOrder","E":1720000000100,"o":{"s":"BTCUSDT","S":"SELL","o":"LIMIT","f":"IOC","q":"0.500","p":"64900.0","ap":"64950.3","X":"FILLED","l":"0.100","z":"0.500","T":1720000000090}}}"#;
+
+        let events = adapter.on_text(payload).await.unwrap();
+        let [Event::LiquidationsReceived(StreamKind::Trades { ticker_info: ti }, liqs)] =
+            events.as_slice()
+        else {
+            panic!("expected one liquidation event: {events:?}");
+        };
+        assert_eq!(*ti, ticker_info);
+        assert_eq!(liqs.len(), 1);
+        assert!(liqs[0].is_sell, "SELL force order = liquidated long");
+        assert_eq!(liqs[0].time, 1_720_000_000_090u64.into());
+        assert_eq!(liqs[0].price.to_f64(), 64_950.3);
+        assert_eq!(liqs[0].qty, crate::unit::Qty::from_f64(0.5));
     }
 
     #[test]

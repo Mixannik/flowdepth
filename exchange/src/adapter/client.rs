@@ -223,6 +223,23 @@ impl AdapterHandles {
         }
     }
 
+    /// Liquidation feed for the given trade-stream tickers. Only Binance perpetuals are
+    /// wired; other venues yield an empty stream.
+    pub fn liquidation_stream(
+        &self,
+        config: &StreamConfig<Vec<TickerInfo>>,
+    ) -> BoxStream<'static, Event> {
+        let market_kind = config.exchange.market_type();
+
+        match (config.exchange.venue(), &self.binance) {
+            (Venue::Binance, Some(handle)) if market_kind != MarketKind::Spot => handle
+                .clone()
+                .connect_liquidation_stream(config.id.clone(), market_kind)
+                .boxed(),
+            _ => stream::empty().boxed(),
+        }
+    }
+
     pub fn depth_stream(&self, config: &StreamConfig<TickerInfo>) -> BoxStream<'static, Event> {
         let stream_scope = Self::depth_scope(config);
         let ticker_info = config.id;

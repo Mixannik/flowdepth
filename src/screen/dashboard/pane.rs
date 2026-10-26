@@ -3221,7 +3221,7 @@ impl Content {
                 refresh_streams
             }
             (Content::TimeAndSales(Some(panel)), VisualConfig::TimeAndSales(cfg)) => {
-                panel.config = cfg;
+                panel.set_config(cfg);
                 false
             }
             (Content::Ladder(Some(panel)), VisualConfig::Ladder(cfg)) => {

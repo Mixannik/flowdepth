@@ -14,7 +14,7 @@ use data::chart::{
 };
 use data::layout::pane::VisualConfig;
 use data::panel::ladder;
-use data::panel::timeandsales::{StackedBar, StackedBarRatio};
+use data::panel::timeandsales::{StackedBar, StackedBarRatio, TapeFeed};
 use data::util::format_with_commas;
 
 use crate::widget::pick_list;
@@ -627,11 +627,53 @@ pub fn timesales_cfg_view<'a>(
     cfg: timeandsales::Config,
     pane: pane_grid::Pane,
 ) -> Element<'a, Message> {
+    let feed_column = {
+        let feed_picklist = pick_list(TapeFeed::ALL, Some(cfg.feed), move |feed| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::TimeAndSales(timeandsales::Config { feed, ..cfg }),
+                false,
+            )
+        });
+
+        let mut col = column![
+            text("Feed").size(crate::style::text_size::SECTION),
+            feed_picklist
+        ]
+        .spacing(8);
+
+        match cfg.feed {
+            TapeFeed::Trades => {
+                let merge = checkbox(cfg.merge_taker_orders)
+                    .label("Merge fills of one market order")
+                    .on_toggle(move |merge_taker_orders| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::TimeAndSales(timeandsales::Config {
+                                merge_taker_orders,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    });
+                col = col.push(merge);
+            }
+            TapeFeed::Liquidations => {
+                col = col.push(
+                    text("Binance perpetuals only; Binance sends at most one per second")
+                        .size(crate::style::text_size::BODY),
+                );
+            }
+        }
+
+        col
+    };
+
     let trade_size_column = {
         let filter = cfg.trade_size_filter;
         let slider = labeled_slider(
             "Trade",
-            0.0..=50000.0,
+            0.0..=1_000_000.0,
             filter,
             move |value| {
                 Message::VisualConfigChanged(
@@ -644,7 +686,7 @@ pub fn timesales_cfg_view<'a>(
                 )
             },
             |value| format!(">${}", format_with_commas(*value as f64)),
-            Some(500.0),
+            Some(5_000.0),
         );
 
         column![
@@ -656,7 +698,7 @@ pub fn timesales_cfg_view<'a>(
 
     let retention_minutes = (cfg.trade_retention.as_secs_f32() / 60.0).max(1.0);
     let retention_slider = {
-        let slider_ui = slider(1.0..=60.0, retention_minutes, move |new_minutes| {
+        let slider_ui = slider(1.0..=240.0, retention_minutes, move |new_minutes| {
             let mins = new_minutes.round().max(1.0) as u64;
             Message::VisualConfigChanged(
                 pane,
@@ -789,6 +831,7 @@ pub fn timesales_cfg_view<'a>(
     };
 
     let content = split_column![
+        feed_column,
         trade_size_column,
         history_column,
         stacked_bar,

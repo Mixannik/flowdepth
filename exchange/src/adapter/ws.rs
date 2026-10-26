@@ -145,6 +145,9 @@ impl<T> Drop for ChannelStream<T> {
 #[derive(Clone, Debug)]
 pub(super) struct WsSession {
     streams: Arc<[StreamKind]>,
+    /// Auxiliary sockets (e.g. liquidations) must not report Connected/Disconnected for
+    /// the streams they piggyback on, or connectivity status would flap with them.
+    silent: bool,
 }
 
 /// How often [`on_tick`](WsAdapter::on_tick) fires. Also serves as the time-bucket
@@ -209,13 +212,22 @@ pub(super) trait WsAdapter {
 
 impl WsSession {
     pub(super) fn new(streams: Arc<[StreamKind]>) -> Self {
-        Self { streams }
+        Self {
+            streams,
+            silent: false,
+        }
+    }
+
+    pub(super) fn silent(mut self) -> Self {
+        self.silent = true;
+        self
     }
 
     pub(super) fn run<A: WsAdapter + Send + 'static>(self, mut adapter: A) -> ChannelStream<Event> {
         let (mut event_tx, event_rx) = channel(512);
 
         let streams = Arc::clone(&self.streams);
+        let silent = self.silent;
 
         let task = tokio::spawn(async move {
             if streams.is_empty() {
@@ -246,7 +258,10 @@ impl WsSession {
                             "WS ConnectFailed | reason={reason} count={disconnect_count} backoff_next={:?}",
                             backoff.peek_delay()
                         );
-                        let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+                        if !silent {
+                            let _ =
+                                event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+                        }
                         let delay = backoff.delay();
                         backoff.record_failure();
                         log::info!("WS ReconnectScheduled | attempt={attempt} delay={delay:?}");
@@ -266,7 +281,9 @@ impl WsSession {
                 for event in adapter.on_connected().await {
                     let _ = event_tx.send(event);
                 }
-                let _ = event_tx.send(Event::Connected(Arc::clone(&streams)));
+                if !silent {
+                    let _ = event_tx.send(Event::Connected(Arc::clone(&streams)));
+                }
 
                 let tick_interval = adapter.tick_interval();
                 let tick_sleep = tokio::time::sleep(tick_interval);
@@ -410,7 +427,9 @@ impl WsSession {
                     for event in adapter.on_disconnected(&reason).await {
                         let _ = event_tx.send(event);
                     }
-                    let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+                    if !silent {
+                        let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+                    }
                 }
 
                 let delay = backoff.delay();

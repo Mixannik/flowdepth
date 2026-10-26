@@ -3,8 +3,8 @@ use crate::style;
 use data::config::theme::{darken, lighten};
 use data::config::timezone::TimeLabelKind;
 pub use data::panel::timeandsales::Config;
-use data::panel::timeandsales::{HistAgg, HistAggValues, StackedBar};
-use exchange::unit::Qty;
+use data::panel::timeandsales::{HistAgg, HistAggValues, StackedBar, TapeFeed};
+use exchange::unit::{Price, Qty};
 use exchange::{SizeUnit, TickerInfo, Trade, UnixMs, unit::qty::volume_size_unit};
 
 use iced::widget::canvas::{self, Canvas, Text};
@@ -67,7 +67,10 @@ impl super::Panel for TimeAndSales {
     }
 
     fn is_empty(&self) -> bool {
-        self.recent_trades.is_empty() && self.paused_trades_buffer.is_empty()
+        // Liquidations can be minutes apart; an empty feed is normal, not "loading".
+        self.config.feed == TapeFeed::Trades
+            && self.recent_trades.is_empty()
+            && self.paused_trades_buffer.is_empty()
     }
 
     fn view<'a>(&'a self, timezone: data::UserTimezone) -> Element<'a, Message> {
@@ -110,7 +113,32 @@ impl TimeAndSales {
         }
     }
 
+    pub fn set_config(&mut self, config: Config) {
+        if config.feed != self.config.feed {
+            self.recent_trades.clear();
+            self.paused_trades_buffer.clear();
+            self.hist_agg = HistAgg::default();
+            self.max_filtered_qty = Qty::ZERO;
+            self.scroll_offset = 0.0;
+            self.is_paused = false;
+        }
+        self.config = config;
+        self.cache.clear();
+    }
+
     pub fn insert_buffer(&mut self, trades_buffer: &[Trade]) {
+        if self.config.feed == TapeFeed::Trades {
+            self.push_rows(trades_buffer, self.config.merge_taker_orders);
+        }
+    }
+
+    pub fn insert_liquidations(&mut self, liquidations: &[Trade]) {
+        if self.config.feed == TapeFeed::Liquidations {
+            self.push_rows(liquidations, false);
+        }
+    }
+
+    fn push_rows(&mut self, trades_buffer: &[Trade], merge_taker_orders: bool) {
         let size_filter = self.config.trade_size_filter;
 
         let target_trades = if self.is_paused {
@@ -121,21 +149,38 @@ impl TimeAndSales {
 
         let market_type = self.ticker_info.market_type();
         let size_in_quote_ccy = volume_size_unit() == SizeUnit::Quote;
+        let min_ticksize = self.ticker_info.min_ticksize;
 
         for trade in trades_buffer {
-            let trade_size_value =
-                market_type.qty_in_quote_value(trade.qty, trade.price, size_in_quote_ccy);
+            let mergeable = merge_taker_orders
+                && target_trades
+                    .back()
+                    .is_some_and(|last| last.time == trade.time && last.is_sell == trade.is_sell);
 
-            if trade_size_value as f32 >= size_filter {
-                self.max_filtered_qty = self.max_filtered_qty.max(trade.qty);
+            let row = if mergeable {
+                let last = target_trades.back_mut().unwrap();
+                if !self.is_paused {
+                    self.hist_agg.remove(last);
+                }
+                // Size-weighted average price of the whole taker order.
+                let (q0, q1) = (last.qty.to_f64(), trade.qty.to_f64());
+                let vwap = (last.price.to_f64() * q0 + trade.price.to_f64() * q1) / (q0 + q1);
+                last.price = Price::from_f64(vwap).round_to_min_tick(min_ticksize);
+                last.qty += trade.qty;
+                *last
+            } else {
+                target_trades.push_back(*trade);
+                *trade
+            };
+
+            let row_size_value =
+                market_type.qty_in_quote_value(row.qty, row.price, size_in_quote_ccy);
+            if row_size_value as f32 >= size_filter {
+                self.max_filtered_qty = self.max_filtered_qty.max(row.qty);
             }
 
-            target_trades.push_back(*trade);
-
-            if !self.is_paused
-                && let Some(last) = target_trades.back()
-            {
-                self.hist_agg.add(last);
+            if !self.is_paused {
+                self.hist_agg.add(&row);
             }
         }
 
@@ -550,6 +595,33 @@ impl canvas::Program<Message> for TimeAndSalesView<'_> {
                     text_color,
                 );
                 frame.fill_text(trade_qty);
+            }
+
+            if self.panel.config.feed == TapeFeed::Liquidations
+                && self.panel.recent_trades.is_empty()
+            {
+                let filter = self.panel.config.trade_size_filter;
+                let content = if filter > 0.0 {
+                    format!(
+                        "No liquidations ≥ ${} yet",
+                        data::util::abbr_large_numbers(filter as f64)
+                    )
+                } else {
+                    "No liquidations yet".to_string()
+                };
+                frame.fill_text(Text {
+                    content,
+                    position: Point {
+                        x: frame.width() * 0.5,
+                        y: stacked_bar_h + TRADE_ROW_HEIGHT * 1.5,
+                    },
+                    size: TEXT_SIZE,
+                    font: style::AZERET_MONO,
+                    color: palette.background.strong.text.scale_alpha(0.6),
+                    align_x: Alignment::Center.into(),
+                    align_y: Alignment::Center.into(),
+                    ..Default::default()
+                });
             }
 
             if is_scroll_paused {
