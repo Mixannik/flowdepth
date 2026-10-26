@@ -559,12 +559,11 @@ pub(super) async fn fetch_historical_oi(
         // (and on retries); keep an hour of margin.
         let thirty_days_ago = now_ms.saturating_sub(THIRTY_DAYS_MS) + 60 * 60 * 1000;
 
+        // Scrolling a chart back past Binance's 30 days of OI history is normal, not an
+        // error worth a toast: there is simply nothing to show there.
         if end < thirty_days_ago {
-            let err_msg = format!(
-                "Requested end time {end} is before available data (30 days is the API limit)"
-            );
-            log::error!("{}", err_msg);
-            return Err(AdapterError::InvalidRequest(err_msg));
+            log::debug!("OI range ends at {end}, before Binance's 30-day history; skipped");
+            return Ok(Vec::new());
         }
 
         let adjusted_start = if start < thirty_days_ago {
