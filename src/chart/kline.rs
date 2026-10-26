@@ -38,6 +38,7 @@ use std::{cell::RefCell, sync::Arc, time::Instant};
 
 mod drawing;
 mod naked_levels;
+mod oi_bars;
 mod signals;
 mod tpo;
 mod zones;
@@ -2816,6 +2817,7 @@ impl canvas::Program<Message> for KlineChart {
                             exhaustion,
                             stacked,
                             unfinished,
+                            oi_bars,
                         } => Some((
                             signals::Enabled {
                                 absorption: *absorption,
@@ -2826,10 +2828,29 @@ impl canvas::Program<Message> for KlineChart {
                                 stacked: *stacked,
                                 unfinished: *unfinished,
                             },
+                            *oi_bars,
                         )),
                         _ => None,
                     });
-                    if let Some((_, zones_enabled)) = signals {
+                    if let Some((_, _, true)) = signals
+                        && let Some(oi) = self.indicators[KlineIndicator::OpenInterest]
+                            .as_ref()
+                            .and_then(|indi| indi.open_interest())
+                    {
+                        oi_bars::draw(
+                            &self.data_source,
+                            oi,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            region.y + region.height,
+                            chart.cell_width,
+                            chart.scaling,
+                            palette,
+                        );
+                    }
+                    if let Some((_, zones_enabled, _)) = signals {
                         // Stacks follow the Imbalance study's ratio when it is on.
                         let (threshold, _, ignore_zeros) = imbalance.unwrap_or((200, None, true));
                         zones::draw(
@@ -2850,7 +2871,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((enabled, _)) = signals {
+                    if let Some((enabled, _, _)) = signals {
                         // Mirrors the summary block placement in `draw_clusters`.
                         let below_offset = if show_summary {
                             let summary =

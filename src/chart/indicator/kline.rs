@@ -123,6 +123,11 @@ pub trait KlineIndicatorImpl {
     fn on_basis_change(&mut self, _source: &PlotData<KlineDataPoint>) {}
 
     fn on_open_interest(&mut self, _pairs: &[exchange::OpenInterest]) {}
+
+    /// Open interest samples by time, for indicators that hold them.
+    fn open_interest(&self) -> Option<&std::collections::BTreeMap<UnixMs, f64>> {
+        None
+    }
 }
 
 pub struct FetchCtx<'a> {

@@ -215,6 +215,10 @@ impl KlineIndicatorImpl for OpenInterestIndicator {
         self.data.extend(data.iter().map(|oi| (oi.time, oi.value)));
         self.clear_all_caches();
     }
+
+    fn open_interest(&self) -> Option<&BTreeMap<UnixMs, f64>> {
+        Some(&self.data)
+    }
 }
 
 #[cfg(test)]
