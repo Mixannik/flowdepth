@@ -781,43 +781,73 @@ pub(super) async fn fetch_trades(
         return fetch_intraday_trades(hub, ticker_info, from_time).await;
     }
 
-    let from_date = chrono::DateTime::from_timestamp_millis(from_time_ms)
+    let mut date = chrono::DateTime::from_timestamp_millis(from_time_ms)
         .ok_or_else(|| AdapterError::ParseError("Invalid timestamp".into()))?
         .date_naive();
+    let today = today_midnight.date_naive();
+    let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or_default();
 
     let client = hub.client().clone();
 
-    match get_hist_trades_with_client(&client, ticker_info, from_date, data_path).await {
-        Ok(mut trades) => {
-            if let Some(latest_trade) = trades.last().copied() {
-                match fetch_intraday_trades(hub, ticker_info, latest_trade.time).await {
-                    Ok(intraday_trades) => {
-                        trades.extend(intraday_trades);
+    // A request starting at a day's last trade gets nothing new from that day's archive, so
+    // move on to the next day's archive instead of re-reading the same one forever.
+    loop {
+        match get_hist_trades_with_client(&client, ticker_info, date, data_path.clone()).await {
+            Ok(trades) => {
+                let mut trades: Vec<Trade> =
+                    trades.into_iter().filter(|t| t.time >= from_time).collect();
+                let Some(latest_trade) = trades.last().copied() else {
+                    date = date.succ_opt().unwrap_or(today);
+                    if date < today {
+                        continue;
                     }
-                    Err(e) => {
-                        log::error!("Failed to fetch intraday trades: {}", e);
+                    return fetch_intraday_trades(hub, ticker_info, from_time).await;
+                };
+                // Binance REST only serves the last two days; older gaps come from the next
+                // archive on the following request.
+                if intraday_window_covers(latest_trade.time.as_u64(), now_ms) {
+                    match fetch_intraday_trades(hub, ticker_info, latest_trade.time).await {
+                        Ok(intraday_trades) => trades.extend(intraday_trades),
+                        Err(e) => log::error!("Failed to fetch intraday trades: {}", e),
                     }
                 }
+                return Ok(trades);
             }
-
-            Ok(trades)
-        }
-        Err(e) => {
-            log::warn!(
-                "Historical trades fetch failed: {}, falling back to intraday fetch",
-                e
-            );
-            fetch_intraday_trades(hub, ticker_info, from_time).await
+            Err(e) => {
+                log::warn!(
+                    "Historical trades fetch failed: {}, falling back to intraday fetch",
+                    e
+                );
+                return fetch_intraday_trades(hub, ticker_info, from_time).await;
+            }
         }
     }
+}
+
+/// Binance futures `aggTrades` rejects start times older than two days (code -4166). Keep an
+/// hour of margin for the request's own latency.
+const INTRADAY_WINDOW_MS: u64 = 47 * 60 * 60 * 1000;
+
+fn intraday_window_covers(start_ms: u64, now_ms: u64) -> bool {
+    now_ms.saturating_sub(start_ms) < INTRADAY_WINDOW_MS
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        historical_trade_archive_is_missing, oi_request_limit,
+        historical_trade_archive_is_missing, intraday_window_covers, oi_request_limit,
         remember_missing_historical_trade_archive,
     };
+
+    #[test]
+    fn rest_trades_are_only_requested_within_two_days() {
+        const HOUR: u64 = 60 * 60 * 1000;
+        let now = 1_000 * HOUR;
+        assert!(intraday_window_covers(now - 30 * HOUR, now));
+        // Binance answers -4166 "restricted to recent 2 days" for these.
+        assert!(!intraday_window_covers(now - 48 * HOUR, now));
+        assert!(!intraday_window_covers(now - 70 * HOUR, now));
+    }
 
     #[test]
     fn open_interest_short_range_never_uses_zero_limit() {

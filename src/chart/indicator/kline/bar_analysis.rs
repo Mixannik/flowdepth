@@ -284,6 +284,8 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
             let row_height = table_height / rows_count;
             let column_width = ctx.cell_width;
             let text_size = (row_height * 0.5).clamp(5.0, TEXT_SIZE);
+            // Labels like "-1.2k" / "+12.3%" are about six glyphs wide.
+            let text_fits = column_width >= text_size * 0.62 * 6.0;
             let border_color = palette.background.strong.color;
 
             let mut header_labels: Vec<&str> = Vec::with_capacity(5);
@@ -401,6 +403,7 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                                 palette.background.weakest.text,
                             ));
                         }
+                        let delta_rows_from = rows.len();
                         if self.settings.show_delta {
                             rows.push((abbr_large_numbers(row.delta.to_f64()), delta_color));
                         }
@@ -416,6 +419,17 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                                     Size::new(column_width, 1.0),
                                     border_color,
                                 );
+                            }
+                            if !text_fits {
+                                // Too narrow for numbers: tint the delta rows by sign instead.
+                                if idx >= delta_rows_from {
+                                    frame.fill_rectangle(
+                                        Point::new(column_left, row_y),
+                                        Size::new(column_width, row_height),
+                                        color.scale_alpha(0.45),
+                                    );
+                                }
+                                continue;
                             }
                             draw_text(
                                 frame,

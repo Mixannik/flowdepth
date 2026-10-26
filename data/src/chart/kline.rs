@@ -736,7 +736,7 @@ impl KlineChartKind {
         match self {
             // Zoomed far out footprints become colored strips (text hides itself), so the
             // session around a level fits on screen.
-            KlineChartKind::Footprint { .. } => 10.0,
+            KlineChartKind::Footprint { .. } => 5.0,
             KlineChartKind::Candles => 1.0,
         }
     }
