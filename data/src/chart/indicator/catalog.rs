@@ -197,6 +197,15 @@ pub const DEFINITIONS: &[Definition] = &[
         Runtime::Overlay,
         Editor::Tpo
     ),
+    define!(
+        NakedLevels,
+        "Naked session levels",
+        "Untested POC, VAH and VAL of previous daily and weekly sessions, extended until price trades through them.",
+        Profiles,
+        Levels,
+        Runtime::Overlay,
+        Editor::None
+    ),
 ];
 
 pub fn definition(kind: KlineIndicator) -> &'static Definition {

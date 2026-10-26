@@ -37,6 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, sync::Arc, time::Instant};
 
 mod drawing;
+mod naked_levels;
 mod signals;
 mod tpo;
 
@@ -2759,6 +2760,19 @@ impl canvas::Program<Message> for KlineChart {
                         imbalance.is_some(),
                     );
 
+                    if self.indicator_enabled(KlineIndicator::NakedLevels) {
+                        naked_levels::draw(
+                            &self.data_source,
+                            frame,
+                            interval_to_x,
+                            price_to_y,
+                            region.x + region.width,
+                            chart.scaling,
+                            align_session_start,
+                            palette,
+                        );
+                    }
+
                     render_data_source(
                         &self.data_source,
                         frame,
@@ -2859,6 +2873,18 @@ impl canvas::Program<Message> for KlineChart {
                             chart_interval_ms,
                             visible_low.to_f64(),
                             visible_high.to_f64(),
+                            palette,
+                        );
+                    }
+                    if self.indicator_enabled(KlineIndicator::NakedLevels) {
+                        naked_levels::draw(
+                            &self.data_source,
+                            frame,
+                            interval_to_x,
+                            price_to_y,
+                            region.x + region.width,
+                            chart.scaling,
+                            align_session_start,
                             palette,
                         );
                     }

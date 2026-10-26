@@ -33,6 +33,7 @@ pub enum KlineIndicator {
     Macd,
     Adx,
     Tpo,
+    NakedLevels,
 }
 
 impl Indicator for KlineIndicator {

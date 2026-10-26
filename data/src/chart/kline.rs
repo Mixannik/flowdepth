@@ -704,7 +704,10 @@ impl KlineChartKind {
     pub fn allows_indicator(&self, indicator: KlineIndicator) -> bool {
         match self {
             KlineChartKind::Candles => !matches!(indicator, KlineIndicator::BarAnalysis),
-            KlineChartKind::Footprint { .. } => !indicator.is_overlay(),
+            // Naked session levels are reference lines, so they also suit footprints.
+            KlineChartKind::Footprint { .. } => {
+                !indicator.is_overlay() || indicator == KlineIndicator::NakedLevels
+            }
         }
     }
 
