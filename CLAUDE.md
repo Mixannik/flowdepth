@@ -31,6 +31,7 @@
 - Индикатор **Naked session levels** (`src/chart/kline/naked_levels.rs`): nPOC/nVAH/nVAL недельных (2) и nPOC дневных (3) сессий, по сделкам или по объёму свечей.
 - Signals: **Stacked imbalances** и **Unfinished auctions** (`src/chart/kline/zones.rs`); футпринт сжимается до ~2 px, текст прячется (`MIN_TEXT_BAR_PX`).
 - **Лёгкая история**: свечи старше 48 ч сворачивают сырые сделки в суммы по ~60–600 ценам (`KlineDataPoint::compact_trades`), экстремумы точные.
+- Кэш сделок (`market.redb`): старше 2 дней — поминутные суммы по ценам (`aggregate_trades_for_cache`, id с битом `AGGREGATE_ID_BIT`, пузыри их игнорируют); старый сырой кэш удаляется один раз при открытии.
 - Binance REST `aggTrades` отдаёт только 2 дня (код -4166): старее — следующий дневной архив (`fetch_trades`).
 - Ловушка iced: `Frame::with_clip` теряет трансформ графика — не использовать в chart-space.
 
