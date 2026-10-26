@@ -710,8 +710,11 @@ impl RequestHandler {
                         );
                         return Ok(None);
                     }
+                    // A yielded worker hands back its unfetched tail (same end, later start):
+                    // that is a continuation, not a repeat, so it skips the cooldown.
                     RequestStatus::Completed(ts)
                         if (exact || contained)
+                            && !(new_to == exist_to && new_from > exist_from)
                             && now.saturating_sub(*ts) <= Self::COMPLETED_RETENTION_MS =>
                     {
                         log::debug!(
@@ -798,8 +801,11 @@ impl RequestHandler {
                         );
                         return Ok(None);
                     }
+                    // A yielded worker hands back its unfetched tail (same end, later start):
+                    // that is a continuation, not a repeat, so it skips the cooldown.
                     RequestStatus::Completed(ts)
                         if (exact || contained)
+                            && !(new_to == exist_to && new_from > exist_from)
                             && now.saturating_sub(*ts) <= Self::COMPLETED_RETENTION_MS =>
                     {
                         log::debug!(
