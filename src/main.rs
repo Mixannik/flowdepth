@@ -908,10 +908,15 @@ impl Flowsurface {
 
                 // Inactive layouts tick too: their panes resolve streams, roll candles and
                 // schedule fetches in the background, so a tab switch shows current data.
+                // They wait until startup finishes, so the active layout's history loads
+                // and connects first instead of competing with every other tab.
+                let active_layout = self.layout_manager.active_layout_id().map(|id| id.unique);
+                let warm_inactive = !self.startup_loading.is_active();
                 let chart_tick = Task::batch(
                     self.layout_manager
                         .layouts
                         .iter_mut()
+                        .filter(|layout| warm_inactive || Some(layout.id.unique) == active_layout)
                         .map(|layout| {
                             let layout_id = layout.id.unique;
                             layout
