@@ -2801,6 +2801,17 @@ impl canvas::Program<Message> for KlineChart {
                         _ => None,
                     });
                     if let Some(enabled) = signals {
+                        // Mirrors the summary block placement in `draw_clusters`.
+                        let below_offset = if self.visual_config.show_footprint_summary {
+                            let summary =
+                                FootprintSummaryLayout::new(chart.cell_height, chart.scaling);
+                            chart.cell_height / 2.0
+                                + summary.gap
+                                + 2.0 * summary.text_size
+                                + summary.line_gap
+                        } else {
+                            chart.cell_height / 2.0
+                        };
                         signals::draw(
                             &self.data_source,
                             frame,
@@ -2809,7 +2820,9 @@ impl canvas::Program<Message> for KlineChart {
                             interval_to_x,
                             price_to_y,
                             chart.cell_width,
+                            chart.cell_height,
                             chart.scaling,
+                            below_offset,
                             enabled,
                             palette,
                         );

@@ -295,7 +295,10 @@ pub(super) fn draw(
     x: impl Fn(u64) -> f32,
     y: impl Fn(Price) -> f32,
     cell_width: f32,
+    cell_height: f32,
     scaling: f32,
+    // Chart-space height of what is drawn under each bar's low (the footprint summary), 0 if none.
+    below_offset: f32,
     enabled: Enabled,
     palette: &Palette,
 ) {
@@ -324,6 +327,9 @@ pub(super) fn draw(
         let center_x = x(time);
         let price_y = |price: f64| y(Price::from_f64(price));
 
+        // Labels under a bar go below its footprint summary (V/Δ) instead of over it.
+        let below_bar = |price: f64| price_y(price) + below_offset + px(4.0);
+
         match signal.kind {
             SignalKind::BullishAbsorption | SignalKind::BearishAbsorption => {
                 let bullish = signal.kind == SignalKind::BullishAbsorption;
@@ -333,18 +339,27 @@ pub(super) fn draw(
                     palette.danger.strong.color
                 };
                 let anchor = if bullish { bar.low } else { bar.high };
-                let radius = (cell_width * 0.32).max(px(8.0));
+                // Ring the bar's edge rows, not half the bar: a big ring hides the numbers.
+                let radius = (cell_height * 1.5).clamp(px(6.0), (cell_width * 0.3).max(px(6.0)));
                 let circle = Path::circle(Point::new(center_x, price_y(anchor)), radius);
                 frame.stroke(
                     &circle,
                     Stroke::default().with_color(color).with_width(stroke_width),
                 );
                 let label_y = if bullish {
-                    price_y(anchor) + radius + px(4.0)
+                    below_bar(anchor).max(price_y(anchor) + radius + px(4.0))
                 } else {
                     price_y(anchor) - radius - px(4.0) - label_size
                 };
-                draw_label(frame, "Absorption", center_x, label_y, label_size, color);
+                draw_label(
+                    frame,
+                    "Absorption",
+                    center_x,
+                    label_y,
+                    label_size,
+                    color,
+                    palette,
+                );
             }
             SignalKind::TrappedLongs {
                 zone_low,
@@ -383,9 +398,17 @@ pub(super) fn draw(
                 let label_y = if longs {
                     top - px(4.0) - label_size
                 } else {
-                    top + height + px(4.0)
+                    below_bar(zone_low).max(top + height + px(4.0))
                 };
-                draw_label(frame, text, left + width / 2.0, label_y, label_size, color);
+                draw_label(
+                    frame,
+                    text,
+                    left + width / 2.0,
+                    label_y,
+                    label_size,
+                    color,
+                    palette,
+                );
             }
             SignalKind::BuyerExhaustion | SignalKind::SellerExhaustion => {
                 let buyers = signal.kind == SignalKind::BuyerExhaustion;
@@ -393,7 +416,7 @@ pub(super) fn draw(
                 let tip_y = if buyers {
                     price_y(bar.high) - px(6.0)
                 } else {
-                    price_y(bar.low) + px(6.0)
+                    below_bar(bar.low)
                 };
                 let size = px(7.0);
                 // Arrow pointing away from the exhausted extreme.
@@ -410,7 +433,15 @@ pub(super) fn draw(
                 } else {
                     tip_y + size * 1.4 + px(4.0)
                 };
-                draw_label(frame, "Exhaustion", center_x, label_y, label_size, color);
+                draw_label(
+                    frame,
+                    "Exhaustion",
+                    center_x,
+                    label_y,
+                    label_size,
+                    color,
+                    palette,
+                );
             }
         }
     }
@@ -438,26 +469,29 @@ fn draw_hatched_zone(
             .with_color(color.scale_alpha(0.8))
             .with_width(stroke_width * 0.6),
     );
-    // Diagonal hatching clipped to the zone.
-    frame.with_clip(
-        iced::Rectangle::new(Point::new(left, top), Size::new(width, height)),
-        |frame| {
-            let hatch = Stroke::default()
-                .with_color(color.scale_alpha(0.45))
-                .with_width(stroke_width * 0.5);
-            let mut offset = -height;
-            while offset < width {
-                let line = Path::line(
-                    Point::new(left + offset, top + height),
-                    Point::new(left + offset + height, top),
-                );
-                frame.stroke(&line, hatch);
-                offset += spacing;
-            }
-        },
-    );
+    // 45° hatching, each line clipped to the zone by hand: `Frame::with_clip` drafts a frame
+    // without the chart's translate/scale, so lines drawn in chart space would land elsewhere.
+    let hatch = Stroke::default()
+        .with_color(color.scale_alpha(0.45))
+        .with_width(stroke_width * 0.5);
+    if height <= 0.0 || width <= 0.0 || spacing <= 0.0 {
+        return;
+    }
+    let mut offset = -height;
+    while offset < width {
+        // Line from (left + offset, bottom) rising to (left + offset + height, top),
+        // parametrised by t in 0..=1 and clipped to left..=left + width.
+        let t_min = (-offset / height).max(0.0);
+        let t_max = ((width - offset) / height).min(1.0);
+        if t_min < t_max {
+            let at = |t: f32| Point::new(left + offset + t * height, top + height - t * height);
+            frame.stroke(&Path::line(at(t_min), at(t_max)), hatch);
+        }
+        offset += spacing;
+    }
 }
 
+/// Draws `text` centered on `center_x` on a dark backing so it stays readable over cells.
 fn draw_label(
     frame: &mut Frame,
     text: &str,
@@ -465,7 +499,16 @@ fn draw_label(
     top_y: f32,
     size: f32,
     color: iced::Color,
+    palette: &Palette,
 ) {
+    // Monospace glyphs are ~0.6 em wide.
+    let width = text.chars().count() as f32 * size * 0.62 + size * 0.6;
+    let height = size * 1.3;
+    frame.fill_rectangle(
+        Point::new(center_x - width / 2.0, top_y - size * 0.15),
+        Size::new(width, height),
+        palette.background.base.color.scale_alpha(0.85),
+    );
     frame.fill_text(canvas::Text {
         content: text.to_string(),
         position: Point::new(center_x, top_y),
