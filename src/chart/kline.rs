@@ -24,7 +24,7 @@ use data::chart::{Autoscale, KlineChartKind, ViewConfig};
 use data::config::theme::{composite_color, contrast_ratio, mix_color};
 use data::util::abbr_large_numbers;
 use exchange::unit::{Price, PriceStep, Qty};
-use exchange::{Kline, OpenInterest as OIData, TickerInfo, Trade, UnixMs};
+use exchange::{Kline, OpenInterest as OIData, TickMultiplier, TickerInfo, Trade, UnixMs};
 
 use iced::task::Handle;
 use iced::theme::Palette;
@@ -326,6 +326,7 @@ pub struct KlineChart {
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
     drawings: drawing::DrawingState,
+    pending_tick_multiplier: Option<TickMultiplier>,
 }
 
 #[derive(Debug, Default)]
@@ -475,6 +476,7 @@ impl KlineChart {
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
+                    pending_tick_multiplier: None,
                 }
             }
             Basis::Tick(interval) => {
@@ -555,6 +557,7 @@ impl KlineChart {
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
+                    pending_tick_multiplier: None,
                 }
             }
         }
@@ -2417,10 +2420,45 @@ impl KlineChart {
 
         if let Some(t) = now {
             self.last_tick = t;
+            if let Some(multiplier) = self.auto_row_size_multiplier() {
+                log::info!(
+                    "FOOTPRINT AutoRowSize | row_px={:.1} -> multiplier={}",
+                    self.chart.cell_height * self.chart.scaling,
+                    multiplier
+                );
+                let step = multiplier.multiply_with_min_tick_step(self.chart.ticker_info);
+                self.change_tick_size(step);
+                self.pending_tick_multiplier = Some(multiplier);
+            }
             self.fetch_missing_data()
         } else {
             None
         }
+    }
+
+    /// Multiplier picked by auto row size since the pane last asked; the pane stores it in its
+    /// settings so the header and saved state show the step actually in use.
+    pub fn take_pending_tick_multiplier(&mut self) -> Option<TickMultiplier> {
+        self.pending_tick_multiplier.take()
+    }
+
+    /// With auto row size on, returns a new multiplier when on-screen footprint rows leave the
+    /// readable band, chosen so rows land near the target height. Inside the band the step is
+    /// kept, so panning and live updates don't trigger a costly re-bin.
+    fn auto_row_size_multiplier(&self) -> Option<TickMultiplier> {
+        if !self.visual_config.auto_row_size
+            || !matches!(self.kind, KlineChartKind::Footprint { .. })
+        {
+            return None;
+        }
+
+        let chart = &self.chart;
+        if chart.bounds.height <= f32::EPSILON {
+            return None;
+        }
+        let min_step = PriceStep::from(chart.ticker_info.min_ticksize).units.max(1);
+        let current = (chart.tick_size.units.max(1) / min_step).max(1);
+        pick_row_size_multiplier(current, chart.cell_height * chart.scaling).map(TickMultiplier)
     }
 
     pub fn toggle_indicator(&mut self, indicator: KlineIndicator) {
@@ -6714,6 +6752,32 @@ fn draw_imbalance_markers(
     }
 }
 
+/// Auto row size: given the current tick multiplier and the on-screen row height it produces,
+/// returns the "nice" multiplier that brings rows closest to the target height, or `None` while
+/// rows are already inside the readable band (or the best choice is the current one).
+fn pick_row_size_multiplier(current: i64, row_px: f32) -> Option<u16> {
+    const MIN_ROW_PX: f32 = 13.0;
+    const MAX_ROW_PX: f32 = 30.0;
+    const TARGET_ROW_PX: f32 = 18.0;
+    const NICE_MULTIPLIERS: [u16; 16] = [
+        1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000, 2000, 2500, 5000, 10000,
+    ];
+
+    if !row_px.is_finite() || row_px <= 0.0 || (MIN_ROW_PX..=MAX_ROW_PX).contains(&row_px) {
+        return None;
+    }
+
+    // Row height scales linearly with the step while the visible price span is fixed.
+    let wanted = (current as f32 * TARGET_ROW_PX / row_px).ln();
+    let best = NICE_MULTIPLIERS.iter().copied().min_by(|a, b| {
+        let da = (f32::from(*a).ln() - wanted).abs();
+        let db = (f32::from(*b).ln() - wanted).abs();
+        da.total_cmp(&db)
+    })?;
+
+    (i64::from(best) != current).then_some(best)
+}
+
 /// The bar's point of control: the price level with the most traded volume.
 fn bar_poc_price(footprint: &KlineTrades) -> Option<Price> {
     footprint
@@ -7496,6 +7560,32 @@ mod tests {
             .map(|group| group.total_qty())
             .fold(Qty::ZERO, |total, qty| total + qty);
         assert_eq!(total_qty.to_f64(), 10.0);
+    }
+
+    #[test]
+    fn auto_row_size_keeps_readable_rows() {
+        assert_eq!(pick_row_size_multiplier(100, 18.0), None);
+        assert_eq!(pick_row_size_multiplier(100, 13.0), None);
+        assert_eq!(pick_row_size_multiplier(100, 30.0), None);
+    }
+
+    #[test]
+    fn auto_row_size_coarsens_thin_rows() {
+        // 6.6px at 100x wants ~273x: 250x is the closest nice step.
+        assert_eq!(pick_row_size_multiplier(100, 6.6), Some(250));
+        assert_eq!(pick_row_size_multiplier(1, 1.0), Some(20));
+    }
+
+    #[test]
+    fn auto_row_size_refines_tall_rows() {
+        assert_eq!(pick_row_size_multiplier(500, 90.0), Some(100));
+        assert_eq!(pick_row_size_multiplier(2, 200.0), Some(1));
+    }
+
+    #[test]
+    fn auto_row_size_ignores_invalid_rows() {
+        assert_eq!(pick_row_size_multiplier(50, 0.0), None);
+        assert_eq!(pick_row_size_multiplier(50, f32::NAN), None);
     }
 
     #[test]

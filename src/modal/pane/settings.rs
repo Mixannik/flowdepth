@@ -1071,6 +1071,23 @@ pub fn kline_cfg_view<'a>(
                 TooltipPosition::Top,
             );
 
+            let auto_row_size_checkbox = tooltip(
+                checkbox(cfg.auto_row_size)
+                    .label("Auto row size")
+                    .on_toggle(move |value| {
+                        Message::VisualConfigChanged(
+                            pane,
+                            VisualConfig::Kline(data::chart::kline::Config {
+                                auto_row_size: value,
+                                ..cfg
+                            }),
+                            false,
+                        )
+                    }),
+                Some("Pick the price step automatically so cluster rows stay readable"),
+                TooltipPosition::Top,
+            );
+
             let scaling = {
                 let picklist = pick_list(
                     data::chart::kline::ClusterScaling::ALL,
@@ -1127,6 +1144,7 @@ pub fn kline_cfg_view<'a>(
                 display_readout_section,
                 column![text("Footprint summary").size(crate::style::text_size::SECTION), footprint_summary_checkbox].spacing(8),
                 column![text("Cluster type").size(crate::style::text_size::SECTION), cluster_picklist].spacing(8),
+                column![text("Row size").size(crate::style::text_size::SECTION), auto_row_size_checkbox].spacing(8),
                 ; spacing = 12, align_x = Alignment::Start
             ];
 

@@ -812,6 +812,8 @@ pub struct Config {
     pub show_footprint_summary: bool,
     // Whether to show a small candle next to footprint table clusters.
     pub show_footprint_table_candle: bool,
+    /// Pick the footprint price step automatically so rows stay readable (Coinglass "Row size: Auto").
+    pub auto_row_size: bool,
     // Optional main-chart order-flow bubbles for regular candlesticks.
     pub volume_bubbles: VolumeBubbleConfig,
     /// Session volume profile overlay for regular candlesticks.
@@ -838,6 +840,7 @@ impl Default for Config {
             data_labels_always_visible: false,
             show_footprint_summary: false,
             show_footprint_table_candle: true,
+            auto_row_size: false,
             volume_bubbles: VolumeBubbleConfig::default(),
             session_volume_profile: SessionVolumeProfileConfig::default(),
             vwap: VwapConfig::default(),

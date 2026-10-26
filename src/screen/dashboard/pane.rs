@@ -2676,9 +2676,15 @@ impl State {
             Content::Heatmap { chart, .. } => chart
                 .as_mut()
                 .and_then(|c| c.invalidate(Some(now)).map(Action::Chart)),
-            Content::Kline { chart, .. } => chart
-                .as_mut()
-                .and_then(|c| c.invalidate(Some(now)).map(Action::Chart)),
+            Content::Kline { chart, .. } => {
+                let chart = chart.as_mut()?;
+                let action = chart.invalidate(Some(now)).map(Action::Chart);
+                if let Some(multiplier) = chart.take_pending_tick_multiplier() {
+                    self.settings.tick_multiply = Some(multiplier);
+                    chart.reset_request_handler();
+                }
+                action
+            }
             Content::TimeAndSales(panel) => panel
                 .as_mut()
                 .and_then(|p| p.invalidate(Some(now)).map(Action::Panel)),
