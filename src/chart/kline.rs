@@ -6185,6 +6185,9 @@ fn draw_clusters(
             let half_width = table_width / 2.0;
             let cell_border = 1.0;
             let grid_color = layout.pal.background.weakest.text.scale_alpha(0.32);
+            let poc_color = layout.pal.warning.strong.color;
+            let poc_outline = (1.5_f32 / scaling).max(cell_border);
+            let poc_price = bar_poc_price(footprint);
             for (price, group) in &footprint.trades {
                 let buy_qty = group.buy_qty.to_f64();
                 let sell_qty = group.sell_qty.to_f64();
@@ -6286,6 +6289,18 @@ fn draw_clusters(
                     grid_color,
                 );
 
+                if show_text && poc_price == Some(*price) {
+                    draw_cell_outline(
+                        frame,
+                        Rectangle::new(
+                            Point::new(area.table_left, row_top),
+                            Size::new(table_width, layout.cell_h),
+                        ),
+                        poc_outline,
+                        poc_color,
+                    );
+                }
+
                 if show_text {
                     draw_cluster_text(
                         frame,
@@ -6334,11 +6349,7 @@ fn draw_clusters(
                 .values()
                 .map(|group| group.total_qty().to_f64())
                 .fold(0.0, f64::max);
-            let poc_price = footprint
-                .trades
-                .iter()
-                .max_by(|(_, a), (_, b)| a.total_qty().cmp(&b.total_qty()))
-                .map(|(price, _)| *price);
+            let poc_price = bar_poc_price(footprint);
 
             for (price, group) in &footprint.trades {
                 let buy_qty = group.buy_qty.to_f64();
@@ -6381,21 +6392,15 @@ fn draw_clusters(
                 );
 
                 if show_text && poc_price == Some(*price) {
-                    let (x, w, h) = (area.table_left, table_width, layout.cell_h);
-                    for (origin, size) in [
-                        (Point::new(x, row_top), Size::new(w, poc_outline)),
-                        (
-                            Point::new(x, row_top + h - poc_outline),
-                            Size::new(w, poc_outline),
+                    draw_cell_outline(
+                        frame,
+                        Rectangle::new(
+                            Point::new(area.table_left, row_top),
+                            Size::new(table_width, layout.cell_h),
                         ),
-                        (Point::new(x, row_top), Size::new(poc_outline, h)),
-                        (
-                            Point::new(x + w - poc_outline, row_top),
-                            Size::new(poc_outline, h),
-                        ),
-                    ] {
-                        frame.fill_rectangle(origin, size, poc_color);
-                    }
+                        poc_outline,
+                        poc_color,
+                    );
                 }
 
                 if show_text {
@@ -6706,6 +6711,39 @@ fn draw_imbalance_markers(
                 );
             }
         }
+    }
+}
+
+/// The bar's point of control: the price level with the most traded volume.
+fn bar_poc_price(footprint: &KlineTrades) -> Option<Price> {
+    footprint
+        .trades
+        .iter()
+        .max_by(|(_, a), (_, b)| a.total_qty().cmp(&b.total_qty()))
+        .map(|(price, _)| *price)
+}
+
+/// Draws a rectangular outline inside `cell` with the given thickness.
+fn draw_cell_outline(frame: &mut canvas::Frame, cell: Rectangle, thickness: f32, color: Color) {
+    let Rectangle {
+        x,
+        y,
+        width,
+        height,
+    } = cell;
+    for (origin, size) in [
+        (Point::new(x, y), Size::new(width, thickness)),
+        (
+            Point::new(x, y + height - thickness),
+            Size::new(width, thickness),
+        ),
+        (Point::new(x, y), Size::new(thickness, height)),
+        (
+            Point::new(x + width - thickness, y),
+            Size::new(thickness, height),
+        ),
+    ] {
+        frame.fill_rectangle(origin, size, color);
     }
 }
 
