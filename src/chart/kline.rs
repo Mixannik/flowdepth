@@ -37,6 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, sync::Arc, time::Instant};
 
 mod drawing;
+mod signals;
 mod tpo;
 
 /// Maximum number of raw trades to retain in memory.
@@ -2786,6 +2787,33 @@ impl canvas::Program<Message> for KlineChart {
                             );
                         },
                     );
+
+                    let signals = studies.iter().find_map(|study| match study {
+                        FootprintStudy::Signals {
+                            absorption,
+                            trapped,
+                            exhaustion,
+                        } => Some(signals::Enabled {
+                            absorption: *absorption,
+                            trapped: *trapped,
+                            exhaustion: *exhaustion,
+                        }),
+                        _ => None,
+                    });
+                    if let Some(enabled) = signals {
+                        signals::draw(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            chart.cell_width,
+                            chart.scaling,
+                            enabled,
+                            palette,
+                        );
+                    }
                 }
                 KlineChartKind::Candles => {
                     let candle_width = chart.cell_width * 0.8;

@@ -1741,28 +1741,32 @@ pub enum FootprintStudy {
         color_scale: Option<usize>,
         ignore_zeros: bool,
     },
+    /// Coinglass-style footprint signals; each kind can be toggled.
+    Signals {
+        absorption: bool,
+        trapped: bool,
+        exhaustion: bool,
+    },
 }
 
 impl FootprintStudy {
     pub fn is_same_type(&self, other: &Self) -> bool {
-        matches!(
-            (self, other),
-            (FootprintStudy::NPoC { .. }, FootprintStudy::NPoC { .. })
-                | (
-                    FootprintStudy::Imbalance { .. },
-                    FootprintStudy::Imbalance { .. }
-                )
-        )
+        std::mem::discriminant(self) == std::mem::discriminant(other)
     }
 }
 
 impl FootprintStudy {
-    pub const ALL: [FootprintStudy; 2] = [
+    pub const ALL: [FootprintStudy; 3] = [
         FootprintStudy::NPoC { lookback: 80 },
         FootprintStudy::Imbalance {
             threshold: 200,
             color_scale: Some(400),
             ignore_zeros: true,
+        },
+        FootprintStudy::Signals {
+            absorption: true,
+            trapped: true,
+            exhaustion: true,
         },
     ];
 }
@@ -1772,6 +1776,7 @@ impl std::fmt::Display for FootprintStudy {
         match self {
             FootprintStudy::NPoC { .. } => write!(f, "Naked Point of Control"),
             FootprintStudy::Imbalance { .. } => write!(f, "Imbalance"),
+            FootprintStudy::Signals { .. } => write!(f, "Signals"),
         }
     }
 }

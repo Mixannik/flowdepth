@@ -1412,6 +1412,47 @@ pub mod study {
                         .padding(4)
                         .into()
                 }
+                FootprintStudy::Signals {
+                    absorption,
+                    trapped,
+                    exhaustion,
+                } => {
+                    let absorption_cb =
+                        checkbox(absorption)
+                            .label("Absorption")
+                            .on_toggle(move |value| {
+                                on_change(FootprintStudy::Signals {
+                                    absorption: value,
+                                    trapped,
+                                    exhaustion,
+                                })
+                            });
+                    let trapped_cb =
+                        checkbox(trapped)
+                            .label("Trapped traders")
+                            .on_toggle(move |value| {
+                                on_change(FootprintStudy::Signals {
+                                    absorption,
+                                    trapped: value,
+                                    exhaustion,
+                                })
+                            });
+                    let exhaustion_cb =
+                        checkbox(exhaustion)
+                            .label("Exhaustion")
+                            .on_toggle(move |value| {
+                                on_change(FootprintStudy::Signals {
+                                    absorption,
+                                    trapped,
+                                    exhaustion: value,
+                                })
+                            });
+
+                    column![absorption_cb, trapped_cb, exhaustion_cb]
+                        .padding(8)
+                        .spacing(8)
+                        .into()
+                }
             }
         }
     }
