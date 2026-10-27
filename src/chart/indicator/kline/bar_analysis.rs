@@ -11,7 +11,7 @@ use crate::{
 
 use data::chart::{
     BasisSeries, PlotData,
-    kline::{FootprintSummary, KlineDataPoint},
+    kline::{FootprintSummary, KlineDataPoint, KlineTrades},
 };
 use data::util::abbr_large_numbers;
 use exchange::{Kline, Trade};
@@ -28,8 +28,73 @@ use std::{collections::BTreeMap, ops::RangeInclusive};
 
 pub struct BarAnalysisIndicator {
     cache: Caches,
-    data: BasisSeries<FootprintSummary>,
+    data: BasisSeries<BarStats>,
     settings: BarAnalysisSettings,
+}
+
+/// One column of the table. Trade-based stats need the raw executions in arrival
+/// order, so they are `None` once a candle was compacted or came from cached aggregates.
+#[derive(Debug, Clone, Copy)]
+struct BarStats {
+    summary: FootprintSummary,
+    trades: Option<usize>,
+    /// Highest and lowest running delta reached inside the bar (it opens at 0).
+    max_delta: Option<f64>,
+    min_delta: Option<f64>,
+}
+
+impl BarStats {
+    /// Tick bars keep no execution order: counts only, no intrabar delta path.
+    fn from_footprint(footprint: &KlineTrades) -> Option<Self> {
+        let summary = FootprintSummary::from_trades(footprint)?;
+        let trades = footprint
+            .trades
+            .values()
+            .map(|group| group.buy_count + group.sell_count)
+            .sum();
+        Some(Self {
+            summary,
+            trades: Some(trades),
+            max_delta: None,
+            min_delta: None,
+        })
+    }
+
+    fn from_datapoint(dp: &KlineDataPoint) -> Option<Self> {
+        let base = Self::from_footprint(&dp.footprint)?;
+        let raw = dp.compacted_ids.is_none() && !dp.trade_sequence.is_empty();
+        if !raw {
+            return Some(Self {
+                trades: None,
+                ..base
+            });
+        }
+
+        // Backfill can land after live trades; walk the bar in time order.
+        let mut sequence: Vec<&Trade> = dp.trade_sequence.iter().collect();
+        if !sequence.is_sorted_by_key(|t| t.time) {
+            sequence.sort_by_key(|t| t.time);
+        }
+        let (mut running, mut max_delta, mut min_delta) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for trade in sequence {
+            let qty = trade.qty.to_f64();
+            running += if trade.is_sell { -qty } else { qty };
+            max_delta = max_delta.max(running);
+            min_delta = min_delta.min(running);
+        }
+
+        Some(Self {
+            max_delta: Some(max_delta),
+            min_delta: Some(min_delta),
+            ..base
+        })
+    }
+
+    fn avg_size(&self) -> Option<f64> {
+        self.trades
+            .filter(|&n| n > 0)
+            .map(|n| self.summary.total.to_f64() / n as f64)
+    }
 }
 
 impl BarAnalysisIndicator {
@@ -71,7 +136,7 @@ impl BarAnalysisIndicator {
                     .datapoints
                     .iter()
                     .filter_map(|(timestamp, dp)| {
-                        FootprintSummary::from_trades(&dp.footprint).map(|row| (*timestamp, row))
+                        BarStats::from_datapoint(dp).map(|row| (*timestamp, row))
                     })
                     .collect::<BTreeMap<_, _>>()
             },
@@ -81,7 +146,7 @@ impl BarAnalysisIndicator {
                     .iter()
                     .enumerate()
                     .filter_map(|(idx, dp)| {
-                        FootprintSummary::from_trades(&dp.footprint).map(|row| (idx as u64, row))
+                        BarStats::from_footprint(&dp.footprint).map(|row| (idx as u64, row))
                     })
                     .collect::<BTreeMap<_, _>>()
             },
@@ -118,7 +183,7 @@ impl KlineIndicatorImpl for BarAnalysisIndicator {
                 if let Some(data) = self.data.time_mut() {
                     for kline in klines {
                         match timeseries.datapoints.get(&kline.time) {
-                            Some(dp) => match FootprintSummary::from_trades(&dp.footprint) {
+                            Some(dp) => match BarStats::from_datapoint(dp) {
                                 Some(summary) => {
                                     data.insert(kline.time, summary);
                                 }
@@ -156,7 +221,7 @@ impl KlineIndicatorImpl for BarAnalysisIndicator {
                 if let Some(data) = self.data.time_mut() {
                     for ts in affected {
                         match timeseries.datapoints.get(&ts) {
-                            Some(dp) => match FootprintSummary::from_trades(&dp.footprint) {
+                            Some(dp) => match BarStats::from_datapoint(dp) {
                                 Some(summary) => {
                                     data.insert(ts, summary);
                                 }
@@ -181,7 +246,7 @@ impl KlineIndicatorImpl for BarAnalysisIndicator {
                     // Recompute the last old bar (may have been modified) and any new bars
                     for idx in start..new_len {
                         if let Some(dp) = tick_aggr.datapoints.get(idx) {
-                            match FootprintSummary::from_trades(&dp.footprint) {
+                            match BarStats::from_footprint(&dp.footprint) {
                                 Some(summary) => {
                                     data.insert(idx as u64, summary);
                                 }
@@ -212,6 +277,9 @@ struct BarAnalysisSettings {
     show_volume: bool,
     show_delta: bool,
     show_delta_pct: bool,
+    show_max_min_delta: bool,
+    show_trades: bool,
+    show_avg_size: bool,
 }
 
 impl Default for BarAnalysisSettings {
@@ -221,14 +289,47 @@ impl Default for BarAnalysisSettings {
             show_volume: true,
             show_delta: true,
             show_delta_pct: true,
+            show_max_min_delta: true,
+            show_trades: true,
+            show_avg_size: true,
         }
+    }
+}
+
+impl BarAnalysisSettings {
+    fn header_labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::with_capacity(9);
+        if self.show_buy_sell {
+            labels.push("Buy");
+            labels.push("Sell");
+        }
+        if self.show_volume {
+            labels.push("Total");
+        }
+        if self.show_delta {
+            labels.push("Δ");
+        }
+        if self.show_delta_pct {
+            labels.push("Δ%");
+        }
+        if self.show_max_min_delta {
+            labels.push("Max Δ");
+            labels.push("Min Δ");
+        }
+        if self.show_trades {
+            labels.push("Trades");
+        }
+        if self.show_avg_size {
+            labels.push("Avg");
+        }
+        labels
     }
 }
 
 struct BarAnalysisCanvas<'a> {
     cache: &'a Cache,
     ctx: &'a ViewState,
-    series: AnySeries<'a, FootprintSummary>,
+    series: AnySeries<'a, BarStats>,
     settings: BarAnalysisSettings,
     visible_range: RangeInclusive<u64>,
 }
@@ -265,43 +366,14 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
             let pane_height = bounds.height / ctx.scaling;
             let table_top = 0.0;
             let table_height = pane_height.max(24.0);
-            let rows_count = {
-                let mut count: f32 = 0.0;
-                if self.settings.show_buy_sell {
-                    count += 2.0;
-                }
-                if self.settings.show_volume {
-                    count += 1.0;
-                }
-                if self.settings.show_delta {
-                    count += 1.0;
-                }
-                if self.settings.show_delta_pct {
-                    count += 1.0;
-                }
-                count.max(1.0)
-            };
+            let header_labels = self.settings.header_labels();
+            let rows_count = (header_labels.len() as f32).max(1.0);
             let row_height = table_height / rows_count;
             let column_width = ctx.cell_width;
             let text_size = (row_height * 0.5).clamp(5.0, TEXT_SIZE);
             // Labels like "-1.2k" / "+12.3%" are about six glyphs wide.
             let text_fits = column_width >= text_size * 0.62 * 6.0;
             let border_color = palette.background.strong.color;
-
-            let mut header_labels: Vec<&str> = Vec::with_capacity(5);
-            if self.settings.show_buy_sell {
-                header_labels.push("Buy");
-                header_labels.push("Sell");
-            }
-            if self.settings.show_volume {
-                header_labels.push("Total");
-            }
-            if self.settings.show_delta {
-                header_labels.push("Δ");
-            }
-            if self.settings.show_delta_pct {
-                header_labels.push("Δ%");
-            }
 
             let max_label_chars = header_labels
                 .iter()
@@ -367,7 +439,8 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                 ));
 
                 self.series
-                    .for_each_in(self.visible_range.clone(), |x, row| {
+                    .for_each_in(self.visible_range.clone(), |x, stats| {
+                        let row = &stats.summary;
                         let column_left = ctx.interval_to_x(x) - column_width / 2.0;
 
                         if column_left > view_right || column_left + column_width < view_left {
@@ -386,32 +459,63 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                             palette.danger.base.color
                         };
 
-                        let mut rows: Vec<(String, Color)> = Vec::with_capacity(5);
+                        let neutral = palette.background.weakest.text;
+                        let missing = || ("—".to_string(), neutral.scale_alpha(0.5), false);
+
+                        // (text, color, tint by sign when the column is too narrow for text)
+                        let mut rows: Vec<(String, Color, bool)> = Vec::with_capacity(9);
                         if self.settings.show_buy_sell {
                             rows.push((
                                 abbr_large_numbers(row.buy.to_f64()),
                                 palette.success.base.color,
+                                false,
                             ));
                             rows.push((
                                 abbr_large_numbers(row.sell.to_f64()),
                                 palette.danger.base.color,
+                                false,
                             ));
                         }
                         if self.settings.show_volume {
-                            rows.push((
-                                abbr_large_numbers(row.total.to_f64()),
-                                palette.background.weakest.text,
-                            ));
+                            rows.push((abbr_large_numbers(row.total.to_f64()), neutral, false));
                         }
-                        let delta_rows_from = rows.len();
                         if self.settings.show_delta {
-                            rows.push((abbr_large_numbers(row.delta.to_f64()), delta_color));
+                            rows.push((abbr_large_numbers(row.delta.to_f64()), delta_color, true));
                         }
                         if self.settings.show_delta_pct {
-                            rows.push((format!("{:+.1}%", row.delta_pct), delta_color));
+                            rows.push((format!("{:+.1}%", row.delta_pct), delta_color, true));
+                        }
+                        if self.settings.show_max_min_delta {
+                            for extreme in [stats.max_delta, stats.min_delta] {
+                                rows.push(match extreme {
+                                    Some(value) => {
+                                        let color = if value > 0.0 {
+                                            palette.success.base.color
+                                        } else if value < 0.0 {
+                                            palette.danger.base.color
+                                        } else {
+                                            neutral
+                                        };
+                                        (abbr_large_numbers(value), color, value != 0.0)
+                                    }
+                                    None => missing(),
+                                });
+                            }
+                        }
+                        if self.settings.show_trades {
+                            rows.push(match stats.trades {
+                                Some(count) => (abbr_large_numbers(count as f64), neutral, false),
+                                None => missing(),
+                            });
+                        }
+                        if self.settings.show_avg_size {
+                            rows.push(match stats.avg_size() {
+                                Some(avg) => (abbr_large_numbers(avg), neutral, false),
+                                None => missing(),
+                            });
                         }
 
-                        for (idx, (label, color)) in rows.iter().enumerate() {
+                        for (idx, (label, color, tint)) in rows.iter().enumerate() {
                             let row_y = table_top + row_height * idx as f32;
                             if idx > 0 {
                                 frame.fill_rectangle(
@@ -422,7 +526,7 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                             }
                             if !text_fits {
                                 // Too narrow for numbers: tint the delta rows by sign instead.
-                                if idx >= delta_rows_from {
+                                if *tint {
                                     frame.fill_rectangle(
                                         Point::new(column_left, row_y),
                                         Size::new(column_width, row_height),
@@ -462,6 +566,73 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
         _cursor: mouse::Cursor,
     ) -> mouse::Interaction {
         mouse::Interaction::default()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use data::chart::kline::{BubbleVolumeSummary, TradeCoverage};
+    use exchange::UnixMs;
+    use exchange::unit::{Price, PriceStep, Qty};
+
+    fn candle(trades: &[(u64, bool, f64)]) -> KlineDataPoint {
+        let price = Price::from_f64(100.0);
+        let mut dp = KlineDataPoint {
+            kline: Kline {
+                time: UnixMs::new(60_000),
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: exchange::Volume::empty_buy_sell(),
+            },
+            footprint: KlineTrades::new(),
+            bubble_summary: BubbleVolumeSummary::default(),
+            trade_coverage: TradeCoverage::Unknown,
+            trade_sequence: Vec::new(),
+            trade_ids: Default::default(),
+            compacted_ids: None,
+        };
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        for (i, &(time, is_sell, qty)) in trades.iter().enumerate() {
+            dp.add_trade(
+                &Trade {
+                    id: Some(i as u64 + 1),
+                    time: UnixMs::new(time),
+                    is_sell,
+                    price,
+                    qty: Qty::from_f64(qty),
+                },
+                step,
+            );
+        }
+        dp
+    }
+
+    #[test]
+    fn running_delta_extremes_follow_trade_time() {
+        // Arrival order differs from time order: +3 @61s, -5 @62s, +1 @63s, the last two swapped.
+        let dp = candle(&[
+            (61_000, false, 3.0),
+            (63_000, false, 1.0),
+            (62_000, true, 5.0),
+        ]);
+        let stats = BarStats::from_datapoint(&dp).unwrap();
+        assert_eq!(stats.trades, Some(3));
+        assert!((stats.max_delta.unwrap() - 3.0).abs() < 1e-9);
+        assert!((stats.min_delta.unwrap() + 2.0).abs() < 1e-9);
+        assert!((stats.avg_size().unwrap() - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn compacted_candle_hides_trade_stats() {
+        let mut dp = candle(&[(61_000, false, 1.0)]);
+        dp.compacted_ids = Some((1, 1));
+        let stats = BarStats::from_datapoint(&dp).unwrap();
+        assert!(stats.trades.is_none() && stats.max_delta.is_none() && stats.avg_size().is_none());
     }
 }
 
