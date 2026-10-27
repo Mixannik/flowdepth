@@ -221,37 +221,71 @@ pub struct KlineDataPoint {
     pub intrabar: Option<IntrabarStats>,
 }
 
-/// What only the raw executions in time order can tell about a candle.
+/// What only the raw executions in time order can tell about a candle (or a stretch of
+/// it: backfill delivers a candle in pieces, and pieces that do not overlap in time join
+/// exactly, see [`IntrabarStats::then`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IntrabarStats {
     pub trades: usize,
     /// Highest and lowest running delta reached inside the bar (it opens at 0).
     pub max_delta: f64,
     pub min_delta: f64,
+    /// Delta at the end of the stretch.
+    pub net_delta: f64,
+    pub first_time: UnixMs,
+    pub last_time: UnixMs,
 }
 
 impl IntrabarStats {
     pub fn from_sequence(trades: &[Trade]) -> Option<Self> {
-        if trades.is_empty() {
-            return None;
-        }
+        Self::from_trades(trades.iter())
+    }
+
+    fn from_trades<'a>(trades: impl Iterator<Item = &'a Trade>) -> Option<Self> {
         // Backfill can land after live trades; walk the bar in time order.
-        let mut sequence: Vec<&Trade> = trades.iter().collect();
+        let mut sequence: Vec<&Trade> = trades.collect();
         if !sequence.is_sorted_by_key(|t| t.time) {
             sequence.sort_by_key(|t| t.time);
         }
+        let (first, last) = (sequence.first()?.time, sequence.last()?.time);
         let (mut running, mut max_delta, mut min_delta) = (0.0_f64, 0.0_f64, 0.0_f64);
-        for trade in sequence {
+        for trade in &sequence {
             let qty = trade.qty.to_f64();
             running += if trade.is_sell { -qty } else { qty };
             max_delta = max_delta.max(running);
             min_delta = min_delta.min(running);
         }
         Some(Self {
-            trades: trades.len(),
+            trades: sequence.len(),
             max_delta,
             min_delta,
+            net_delta: running,
+            first_time: first,
+            last_time: last,
         })
+    }
+
+    /// `self` followed by `later`.
+    fn then(self, later: Self) -> Self {
+        Self {
+            trades: self.trades + later.trades,
+            max_delta: self.max_delta.max(self.net_delta + later.max_delta),
+            min_delta: self.min_delta.min(self.net_delta + later.min_delta),
+            net_delta: self.net_delta + later.net_delta,
+            first_time: self.first_time,
+            last_time: later.last_time,
+        }
+    }
+
+    /// Joins two stretches of one candle; `None` when they interleave in time.
+    fn join(self, other: Self) -> Option<Self> {
+        if other.last_time <= self.first_time {
+            Some(other.then(self))
+        } else if other.first_time >= self.last_time {
+            Some(self.then(other))
+        } else {
+            None
+        }
     }
 }
 
@@ -386,10 +420,6 @@ impl KlineDataPoint {
             if id & AGGREGATE_ID_BIT != 0 && self.compacted_ids.is_none() {
                 self.compacted_ids = Some((u64::MAX, 0));
             }
-            // A raw execution landing after compaction makes the saved stats incomplete.
-            if id & AGGREGATE_ID_BIT == 0 && self.compacted_ids.is_some() {
-                self.intrabar = None;
-            }
         }
         self.footprint.add_trade_to_nearest_bin(trade, step);
         self.trade_sequence.push(*trade);
@@ -415,12 +445,21 @@ impl KlineDataPoint {
     }
 
     /// Intrabar stats from the raw executions while they are kept, else the ones saved at
-    /// compaction. `None` for candles built from cached aggregates.
+    /// compaction joined with raw executions that arrived after it. `None` for candles
+    /// built from cached aggregates, or when late executions interleave the saved stretch.
     pub fn intrabar_stats(&self) -> Option<IntrabarStats> {
         if self.compacted_ids.is_none() {
-            IntrabarStats::from_sequence(&self.trade_sequence)
-        } else {
-            self.intrabar
+            return IntrabarStats::from_sequence(&self.trade_sequence);
+        }
+        let saved = self.intrabar?;
+        // Compacted bins carry no id; cached aggregates carry the aggregate bit.
+        let late = self
+            .trade_sequence
+            .iter()
+            .filter(|t| t.id.is_some_and(|id| id & AGGREGATE_ID_BIT == 0));
+        match IntrabarStats::from_trades(late) {
+            Some(late) => saved.join(late),
+            None => Some(saved),
         }
     }
 
@@ -439,9 +478,7 @@ impl KlineDataPoint {
             return;
         }
         let step = compact_step(high.units - low.units);
-        if self.compacted_ids.is_none() {
-            self.intrabar = IntrabarStats::from_sequence(&self.trade_sequence);
-        }
+        self.intrabar = self.intrabar_stats();
 
         let mut first_id = self.compacted_ids.map(|(first, _)| first);
         let mut last_id = self.compacted_ids.map(|(_, last)| last);

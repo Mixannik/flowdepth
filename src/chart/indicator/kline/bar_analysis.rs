@@ -625,6 +625,45 @@ mod tests {
     }
 
     #[test]
+    fn backfill_pieces_join_after_compaction() {
+        let trades: Vec<(u64, bool, f64)> = (0..600)
+            .map(|i| (61_000 + i, i % 3 != 0, 1.0 + (i % 5) as f64))
+            .collect();
+        let whole = BarStats::from_datapoint(&candle(&trades)).unwrap();
+
+        // Later half lands first and is compacted, then the earlier half arrives.
+        let mut dp = candle(&trades[300..]);
+        dp.compact_trades();
+        assert!(dp.compacted_ids.is_some());
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        for (i, &(time, is_sell, qty)) in trades[..300].iter().enumerate() {
+            dp.add_trade(
+                &Trade {
+                    id: Some(10_000 + i as u64),
+                    time: UnixMs::new(time),
+                    is_sell,
+                    price: Price::from_f64(100.0),
+                    qty: Qty::from_f64(qty),
+                },
+                step,
+            );
+        }
+        let joined = BarStats::from_datapoint(&dp).unwrap();
+        assert_eq!(joined.trades, Some(600));
+        let close = |a: Option<f64>, b: Option<f64>| (a.unwrap() - b.unwrap()).abs() < 1e-9;
+        assert!(close(joined.max_delta, whole.max_delta));
+        assert!(close(joined.min_delta, whole.min_delta));
+
+        // Compacting again keeps the joined result.
+        dp.compact_trades();
+        let again = BarStats::from_datapoint(&dp).unwrap();
+        assert_eq!(again.trades, Some(600));
+        assert!(close(again.min_delta, whole.min_delta));
+    }
+
+    #[test]
     fn cached_aggregates_hide_trade_stats() {
         let mut dp = candle(&[(61_000, false, 1.0)]);
         dp.compacted_ids = Some((1, 1));
