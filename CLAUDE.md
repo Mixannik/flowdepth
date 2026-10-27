@@ -37,6 +37,8 @@
 - **Лента ликвидаций**: Time & Sales → Feed: Liquidations (Binance `forceOrder` только на `/market`, отдельный «тихий» сокет `WsSession::silent`); склейка частей рыночной заявки в ленте.
 - **Вкладки**: все раскладки живые — подписки на объединение потоков (`Dashboard::market_subscriptions(&UniqueStreams)`), события через `route_to_layouts`, тик/бэкфилл для всех раскладок (main.rs).
 - Ловушка iced: `Frame::with_clip` теряет трансформ графика — не использовать в chart-space.
+- Шкала времени у пользователя — в UTC (лог пишется по МСК, UTC+3): сверять свечи по числу сделок в Bar Stats.
+- У Binance бывают дыры в `aggTrades` (27.10 00:03–00:30 UTC: в REST нет сделок, а в klines они есть). Кэш при чтении считает долгую тишину дырой (`trade_integrity_gaps`) и докачивает; дыру на стороне биржи закроет только дневной архив, когда выйдет.
 
 ## Раскладки у пользователя
 JDK 1m, JDK FP 5m (Delta Table), JDK FP 15m (Table), JDK HTF 4h (+NakedLevels на 4h), Orderflow, Test.
