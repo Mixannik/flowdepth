@@ -392,12 +392,14 @@ impl TimeSeries<KlineDataPoint> {
             let trades = std::mem::take(&mut data_point.trade_sequence);
             let coverage = data_point.trade_coverage;
             let compacted = data_point.compacted_ids;
+            let intrabar = data_point.intrabar;
             data_point.clear_trades();
             for trade in &trades {
                 data_point.add_trade(trade, tick_size);
             }
             data_point.trade_coverage = coverage;
             data_point.compacted_ids = compacted;
+            data_point.intrabar = intrabar;
             data_point.calculate_poc();
         }
         self.update_poc_status();
@@ -766,6 +768,8 @@ mod tests {
         let prices: Vec<Price> = dp.trade_sequence.iter().map(|t| t.price).collect();
         assert_eq!(prices.iter().max(), Some(&Price::from_f64(110.0)));
         assert_eq!(prices.iter().min(), Some(&Price::from_f64(100.0)));
+        let intrabar = dp.intrabar_stats();
+        assert_eq!(intrabar.map(|s| s.trades), Some(trades.len()));
 
         // Rebinning at a coarse row gives the same total per side, and refetched
         // trades are not counted twice.
@@ -774,6 +778,8 @@ mod tests {
         });
         series.change_tick_size(coarse);
         series.insert_trades_existing_buckets(&trades[..10]);
+        // Saved intrabar stats survive rebinning and already-counted refetches.
+        assert_eq!(series.datapoints[&old_time].intrabar_stats(), intrabar);
         let rows = &series.datapoints[&old_time].footprint.trades;
         let sum = |rows: &rustc_hash::FxHashMap<Price, crate::chart::kline::GroupedTrades>,
                    sell: bool| {

@@ -386,6 +386,10 @@ impl KlineDataPoint {
             if id & AGGREGATE_ID_BIT != 0 && self.compacted_ids.is_none() {
                 self.compacted_ids = Some((u64::MAX, 0));
             }
+            // A raw execution landing after compaction makes the saved stats incomplete.
+            if id & AGGREGATE_ID_BIT == 0 && self.compacted_ids.is_some() {
+                self.intrabar = None;
+            }
         }
         self.footprint.add_trade_to_nearest_bin(trade, step);
         self.trade_sequence.push(*trade);
