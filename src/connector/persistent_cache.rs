@@ -535,7 +535,33 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
     ) -> CacheSlice<Trade> {
         let key = dataset_key(ticker_info, TRADE_DATASET);
-        self.read_records(CacheKind::Trade, &key, from, to_exclusive, from)
+        let mut slice: CacheSlice<Trade> =
+            self.read_records(CacheKind::Trade, &key, from, to_exclusive, from);
+
+        // Like klines, coverage alone is not proof: older fetch code persisted coverage past
+        // the trades it actually stored (e.g. 27.10 00:03–00:30 UTC sat empty). Turn
+        // implausibly long silences back into gaps so the fetcher repairs them.
+        let holes = trade_integrity_gaps(&slice.records, from.as_u64(), to_exclusive.as_u64());
+        if !holes.is_empty() {
+            log::warn!(
+                "CACHE TradeIntegrityGap | key={key} records={} detected_gaps={} first_gap={}..{}",
+                slice.records.len(),
+                holes.len(),
+                holes[0].0,
+                holes[0].1
+            );
+            let gaps = slice
+                .gaps
+                .iter()
+                .map(|(gap_from, gap_to)| (gap_from.as_u64(), gap_to.as_u64()))
+                .chain(holes)
+                .collect();
+            slice.gaps = merge_intervals(gaps)
+                .into_iter()
+                .map(|(gap_from, gap_to)| (UnixMs::new(gap_from), UnixMs::new(gap_to)))
+                .collect();
+        }
+        slice
     }
 
     /// Trades older than two days are stored as per-minute price aggregates (see
@@ -1558,6 +1584,41 @@ fn valid_intervals(intervals: &[(u64, u64)]) -> bool {
         })
 }
 
+/// Shortest silence inside covered trades that counts as missing data.
+const TRADE_HOLE_MIN_MS: u64 = 5 * 60 * 1000;
+/// ... and it must also be this many times the slice's average spacing, so quiet
+/// markets with sparse trades are not refetched forever.
+const TRADE_HOLE_SPACING_FACTOR: u64 = 200;
+
+/// Silences in `records` (sorted by time) that are far longer than the slice's own
+/// trade rhythm, including at the edges of `from..to_exclusive`.
+fn trade_integrity_gaps(records: &[Trade], from: u64, to_exclusive: u64) -> Vec<(u64, u64)> {
+    let (Some(first), Some(last)) = (records.first(), records.last()) else {
+        return Vec::new();
+    };
+    let (first, last) = (first.time.as_u64(), last.time.as_u64());
+    if records.len() < 2 || last <= first {
+        return Vec::new();
+    }
+    let average = (last - first) / (records.len() as u64 - 1);
+    let threshold = TRADE_HOLE_MIN_MS.max(average.saturating_mul(TRADE_HOLE_SPACING_FACTOR));
+
+    let mut holes = Vec::new();
+    if first.saturating_sub(from) > threshold {
+        holes.push((from, first));
+    }
+    for pair in records.windows(2) {
+        let (a, b) = (pair[0].time.as_u64(), pair[1].time.as_u64());
+        if b.saturating_sub(a) > threshold {
+            holes.push((a + 1, b));
+        }
+    }
+    if to_exclusive.saturating_sub(last + 1) > threshold {
+        holes.push((last + 1, to_exclusive));
+    }
+    holes
+}
+
 fn merge_intervals(mut intervals: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     intervals.retain(|(from, to)| from < to);
     intervals.sort_unstable_by_key(|interval| interval.0);
@@ -1682,6 +1743,32 @@ mod tests {
             0.001,
             None,
         )
+    }
+
+    fn timed_trade(time: u64) -> Trade {
+        Trade {
+            id: Some(time),
+            time: UnixMs::new(time),
+            is_sell: false,
+            price: exchange::unit::Price::from_f64(100.0),
+            qty: exchange::unit::Qty::from_f64(1.0),
+        }
+    }
+
+    #[test]
+    fn long_silence_inside_covered_trades_becomes_a_gap() {
+        // A trade every second, then nothing for 27 minutes (the 27.10 00:03-00:30 UTC hole).
+        let mut trades: Vec<Trade> = (0..180).map(|s| timed_trade(s * 1_000)).collect();
+        trades.extend((0..60).map(|s| timed_trade(1_800_000 + s * 1_000)));
+        let gaps = trade_integrity_gaps(&trades, 0, 1_860_000);
+        assert_eq!(gaps, vec![(179_001, 1_800_000)]);
+    }
+
+    #[test]
+    fn sparse_market_is_not_flagged() {
+        // One trade every 10 minutes: long spacing is the market's own rhythm.
+        let trades: Vec<Trade> = (0..12).map(|i| timed_trade(i * 600_000)).collect();
+        assert!(trade_integrity_gaps(&trades, 0, 6_600_000).is_empty());
     }
 
     #[test]
