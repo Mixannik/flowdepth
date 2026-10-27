@@ -10,6 +10,7 @@
 - Настройки/раскладки приложения: `%APPDATA%\flowsurface\saved-state.json`, лог: `%APPDATA%\flowsurface\logs\flowsurface-current.log`.
 - Скрипты: `C:\Users\MSI\Flowdepth\tools\` (бэкапы `saved-state.before-*.json` тоже там).
 - Материалы JDK (посты и скрины из X): `C:\Users\MSI\Flowdepth\jdk\`.
+- Материалы @Stoiiic (AMT, пассивный спот, OB Depth/Pressure Bands, VWAP-полосы): `C:\Users\MSI\Flowdepth\stoiiic\README.md` (конспект) + картинки.
 
 ## Сборка и тесты
 - `$env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"` (rustup ставился через winget, PATH сессии его не видит).
