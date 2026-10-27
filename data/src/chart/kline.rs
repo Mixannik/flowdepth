@@ -216,6 +216,43 @@ pub struct KlineDataPoint {
     /// [`KlineDataPoint::compact_trades`]): the id range already counted, so refetched
     /// executions are not added twice.
     pub compacted_ids: Option<(u64, u64)>,
+    /// Stats of the raw executions, saved by [`KlineDataPoint::compact_trades`] before
+    /// they are folded away.
+    pub intrabar: Option<IntrabarStats>,
+}
+
+/// What only the raw executions in time order can tell about a candle.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IntrabarStats {
+    pub trades: usize,
+    /// Highest and lowest running delta reached inside the bar (it opens at 0).
+    pub max_delta: f64,
+    pub min_delta: f64,
+}
+
+impl IntrabarStats {
+    pub fn from_sequence(trades: &[Trade]) -> Option<Self> {
+        if trades.is_empty() {
+            return None;
+        }
+        // Backfill can land after live trades; walk the bar in time order.
+        let mut sequence: Vec<&Trade> = trades.iter().collect();
+        if !sequence.is_sorted_by_key(|t| t.time) {
+            sequence.sort_by_key(|t| t.time);
+        }
+        let (mut running, mut max_delta, mut min_delta) = (0.0_f64, 0.0_f64, 0.0_f64);
+        for trade in sequence {
+            let qty = trade.qty.to_f64();
+            running += if trade.is_sell { -qty } else { qty };
+            max_delta = max_delta.max(running);
+            min_delta = min_delta.min(running);
+        }
+        Some(Self {
+            trades: trades.len(),
+            max_delta,
+            min_delta,
+        })
+    }
 }
 
 /// Ids of per-price aggregates written to the trade cache carry this bit; exchange ids never
@@ -370,6 +407,17 @@ impl KlineDataPoint {
         self.trade_sequence.clear();
         self.trade_ids.clear();
         self.compacted_ids = None;
+        self.intrabar = None;
+    }
+
+    /// Intrabar stats from the raw executions while they are kept, else the ones saved at
+    /// compaction. `None` for candles built from cached aggregates.
+    pub fn intrabar_stats(&self) -> Option<IntrabarStats> {
+        if self.compacted_ids.is_none() {
+            IntrabarStats::from_sequence(&self.trade_sequence)
+        } else {
+            self.intrabar
+        }
     }
 
     /// Folds raw executions into one aggregate per (price row, side), about
@@ -387,6 +435,9 @@ impl KlineDataPoint {
             return;
         }
         let step = compact_step(high.units - low.units);
+        if self.compacted_ids.is_none() {
+            self.intrabar = IntrabarStats::from_sequence(&self.trade_sequence);
+        }
 
         let mut first_id = self.compacted_ids.map(|(first, _)| first);
         let mut last_id = self.compacted_ids.map(|(_, last)| last);

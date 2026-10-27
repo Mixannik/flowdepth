@@ -7664,6 +7664,7 @@ mod tests {
             trade_sequence: Vec::new(),
             trade_ids: Default::default(),
             compacted_ids: None,
+            intrabar: None,
         };
         candle.add_trade(&previously_aggregated, price_step);
 

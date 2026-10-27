@@ -32,8 +32,8 @@ pub struct BarAnalysisIndicator {
     settings: BarAnalysisSettings,
 }
 
-/// One column of the table. Trade-based stats need the raw executions in arrival
-/// order, so they are `None` once a candle was compacted or came from cached aggregates.
+/// One column of the table. Trade-based stats come from the raw executions (or what was
+/// saved from them at compaction), so they are `None` for candles from cached aggregates.
 #[derive(Debug, Clone, Copy)]
 struct BarStats {
     summary: FootprintSummary,
@@ -62,30 +62,11 @@ impl BarStats {
 
     fn from_datapoint(dp: &KlineDataPoint) -> Option<Self> {
         let base = Self::from_footprint(&dp.footprint)?;
-        let raw = dp.compacted_ids.is_none() && !dp.trade_sequence.is_empty();
-        if !raw {
-            return Some(Self {
-                trades: None,
-                ..base
-            });
-        }
-
-        // Backfill can land after live trades; walk the bar in time order.
-        let mut sequence: Vec<&Trade> = dp.trade_sequence.iter().collect();
-        if !sequence.is_sorted_by_key(|t| t.time) {
-            sequence.sort_by_key(|t| t.time);
-        }
-        let (mut running, mut max_delta, mut min_delta) = (0.0_f64, 0.0_f64, 0.0_f64);
-        for trade in sequence {
-            let qty = trade.qty.to_f64();
-            running += if trade.is_sell { -qty } else { qty };
-            max_delta = max_delta.max(running);
-            min_delta = min_delta.min(running);
-        }
-
+        let intrabar = dp.intrabar_stats();
         Some(Self {
-            max_delta: Some(max_delta),
-            min_delta: Some(min_delta),
+            trades: intrabar.map(|s| s.trades),
+            max_delta: intrabar.map(|s| s.max_delta),
+            min_delta: intrabar.map(|s| s.min_delta),
             ..base
         })
     }
@@ -593,6 +574,7 @@ mod tests {
             trade_sequence: Vec::new(),
             trade_ids: Default::default(),
             compacted_ids: None,
+            intrabar: None,
         };
         let step = PriceStep {
             units: Price::from_f64(0.1).units,
@@ -628,7 +610,22 @@ mod tests {
     }
 
     #[test]
-    fn compacted_candle_hides_trade_stats() {
+    fn compaction_keeps_trade_stats() {
+        let trades: Vec<(u64, bool, f64)> = (0..300)
+            .map(|i| (61_000 + i, i % 3 == 0, 1.0 + (i % 7) as f64))
+            .collect();
+        let mut dp = candle(&trades);
+        let before = BarStats::from_datapoint(&dp).unwrap();
+        dp.compact_trades();
+        assert!(dp.compacted_ids.is_some() && dp.trade_sequence.len() < 300);
+        let after = BarStats::from_datapoint(&dp).unwrap();
+        assert_eq!(after.trades, Some(300));
+        assert_eq!(after.max_delta, before.max_delta);
+        assert_eq!(after.min_delta, before.min_delta);
+    }
+
+    #[test]
+    fn cached_aggregates_hide_trade_stats() {
         let mut dp = candle(&[(61_000, false, 1.0)]);
         dp.compacted_ids = Some((1, 1));
         let stats = BarStats::from_datapoint(&dp).unwrap();

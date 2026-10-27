@@ -263,6 +263,7 @@ impl TimeSeries<KlineDataPoint> {
                     trade_sequence: Vec::new(),
                     trade_ids: Default::default(),
                     compacted_ids: None,
+                    intrabar: None,
                 });
 
             entry.kline = *kline;
@@ -302,6 +303,7 @@ impl TimeSeries<KlineDataPoint> {
                     trade_sequence: Vec::new(),
                     trade_ids: Default::default(),
                     compacted_ids: None,
+                    intrabar: None,
                 });
 
             entry.add_trade(trade, self.tick_size);
