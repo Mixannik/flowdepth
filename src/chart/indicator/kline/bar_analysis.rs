@@ -477,7 +477,8 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                                         } else {
                                             neutral
                                         };
-                                        (abbr_large_numbers(value), color, value != 0.0)
+                                        // Zero still tints (grey) so it reads apart from "—".
+                                        (abbr_large_numbers(value), color, true)
                                     }
                                     None => missing(),
                                 });
