@@ -351,9 +351,12 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
             let rows_count = (header_labels.len() as f32).max(1.0);
             let row_height = table_height / rows_count;
             let column_width = ctx.cell_width;
-            let text_size = (row_height * 0.5).clamp(5.0, TEXT_SIZE);
+            let screen_row_height = row_height * ctx.scaling;
+            // Text keeps its on-screen size at any zoom; drawn in chart space, so divide back.
+            let screen_text_size = (screen_row_height * 0.5).clamp(8.0, TEXT_SIZE);
+            let text_size = screen_text_size / ctx.scaling;
             // Labels like "-1.2k" / "+12.3%" are about six glyphs wide.
-            let text_fits = column_width >= text_size * 0.62 * 6.0;
+            let text_fits = column_width * ctx.scaling >= screen_text_size * 0.62 * 6.0;
             let border_color = palette.background.strong.color;
 
             let max_label_chars = header_labels
@@ -361,11 +364,8 @@ impl canvas::Program<Message> for BarAnalysisCanvas<'_> {
                 .map(|s| s.chars().count())
                 .max()
                 .unwrap_or(3);
-            let header_width = text_size * max_label_chars as f32 * 0.72 + 12.0;
-            let screen_text_size = text_size * ctx.scaling;
-            let screen_row_height = row_height * ctx.scaling;
             let screen_table_top = table_top * ctx.scaling;
-            let screen_header_width = header_width * ctx.scaling;
+            let screen_header_width = screen_text_size * max_label_chars as f32 * 0.72 + 12.0;
             let header_x = bounds.width - screen_header_width;
 
             // Header row labels and separators
