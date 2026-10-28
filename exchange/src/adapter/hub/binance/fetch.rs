@@ -657,6 +657,17 @@ fn archive_time_ms(raw: u64) -> u64 {
     }
 }
 
+/// Spot archives write "True"/"False", futures archives "true"/"false".
+fn archive_bool(raw: &str) -> Option<bool> {
+    if raw.eq_ignore_ascii_case("true") {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("false") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
 async fn get_hist_trades_with_client(
     client: &reqwest::Client,
     ticker_info: TickerInfo,
@@ -745,7 +756,7 @@ async fn get_hist_trades_with_client(
             record.ok().and_then(|record| {
                 let id = record.get(0)?.parse::<u64>().ok()?;
                 let time = archive_time_ms(record.get(5)?.parse::<u64>().ok()?);
-                let is_sell = record.get(6)?.parse::<bool>().ok()?;
+                let is_sell = archive_bool(record.get(6)?)?;
                 let price_f64 = record.get(1)?.parse::<f64>().ok()?;
 
                 let price = Price::from_f64(price_f64).round_to_min_tick(ticker_info.min_ticksize);
@@ -846,7 +857,7 @@ fn intraday_window_covers(start_ms: u64, now_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
+        archive_bool, archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
         oi_request_limit, remember_missing_historical_trade_archive,
     };
 
@@ -854,6 +865,13 @@ mod tests {
     fn spot_archive_microseconds_become_milliseconds() {
         assert_eq!(archive_time_ms(1_793_059_200_482_489), 1_793_059_200_482);
         assert_eq!(archive_time_ms(1_793_059_200_482), 1_793_059_200_482);
+    }
+
+    #[test]
+    fn archive_sides_parse_in_both_spellings() {
+        assert_eq!(archive_bool("True"), Some(true));
+        assert_eq!(archive_bool("false"), Some(false));
+        assert_eq!(archive_bool("1"), None);
     }
 
     #[test]

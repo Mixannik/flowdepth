@@ -6454,6 +6454,12 @@ fn draw_clusters(
     footprint: &KlineTrades,
 ) {
     let text_color = layout.pal.background.weakest.text;
+    let min_imbalance_qty = zones::average_row_qty(
+        footprint
+            .trades
+            .values()
+            .map(|group| group.buy_qty.to_f64() + group.sell_qty.to_f64()),
+    );
 
     let bar_width_factor: f32 = 0.9;
     let inset = (layout.cell_w * (1.0 - bar_width_factor)) / 2.0;
@@ -6558,6 +6564,7 @@ fn draw_clusters(
                         threshold,
                         color_scale,
                         ignore_zeros,
+                        min_imbalance_qty,
                         layout.cell_h,
                         layout.pal,
                         buyside_x,
@@ -6976,6 +6983,7 @@ fn draw_clusters(
                         threshold,
                         color_scale,
                         ignore_zeros,
+                        min_imbalance_qty,
                         layout.cell_h,
                         layout.pal,
                         buyside_x,
@@ -7061,6 +7069,8 @@ fn draw_imbalance_markers(
     threshold: usize,
     color_scale: Option<usize>,
     ignore_zeros: bool,
+    // Thin rows make big ratios out of small numbers; the dominant side must reach this.
+    min_qty: f64,
     cell_height: f32,
     palette: &Palette,
     buyside_x: f32,
@@ -7091,7 +7101,7 @@ fn draw_imbalance_markers(
 
         if diagonal_buy_qty >= sell_qty {
             let required_qty = sell_qty * (100 + threshold) as f64 / 100.0;
-            if diagonal_buy_qty > required_qty {
+            if diagonal_buy_qty > required_qty && diagonal_buy_qty >= min_qty {
                 let ratio = diagonal_buy_qty / required_qty;
                 let alpha = alpha_from_ratio(ratio);
 
@@ -7104,7 +7114,7 @@ fn draw_imbalance_markers(
             }
         } else {
             let required_qty = diagonal_buy_qty * (100 + threshold) as f64 / 100.0;
-            if sell_qty > required_qty {
+            if sell_qty > required_qty && sell_qty >= min_qty {
                 let ratio = sell_qty / required_qty;
                 let alpha = alpha_from_ratio(ratio);
 

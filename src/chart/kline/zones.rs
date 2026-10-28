@@ -2,7 +2,8 @@
 //! bar to the right until price trades through it.
 //!
 //! - Stacked imbalance: at least [`STACK_MIN`] adjacent rows of one bar imbalanced on the same
-//!   side (the diagonal rule of the Imbalance study, 300% by default). Buy stacks act as
+//!   side (the diagonal rule of the Imbalance study, 300% by default, and the dominant side at
+//!   least the bar's average one-side row volume, so thin spot rows don't count). Buy stacks act as
 //!   support and end when a later bar trades below the zone; sell stacks mirror above.
 //! - Unfinished auction: at the bar's extreme tick both aggressive buyers and sellers traded,
 //!   so the auction did not finish there. Checked on raw trades, not on the footprint rows:
@@ -88,6 +89,20 @@ pub(super) struct Auction {
     pub end: Option<usize>,
 }
 
+/// Average volume of one side of a non-empty row (half the average row total): the least an
+/// imbalance's dominant side must have. A 4:1 ratio of 0.4 vs 0.1 BTC is noise, common on
+/// thin spot rows.
+pub(super) fn average_row_qty(row_totals: impl Iterator<Item = f64>) -> f64 {
+    let (sum, count) = row_totals
+        .filter(|qty| *qty > 0.0)
+        .fold((0.0, 0usize), |(sum, count), qty| (sum + qty, count + 1));
+    if count == 0 {
+        0.0
+    } else {
+        sum / count as f64 / 2.0
+    }
+}
+
 /// Stacked imbalances on `bars` (oldest first). `step` is the row size in price.
 pub(super) fn stacked_imbalances(bars: &[Bar], step: f64, rule: ImbalanceRule) -> Vec<Stack> {
     let mut stacks = Vec::new();
@@ -98,9 +113,16 @@ pub(super) fn stacked_imbalances(bars: &[Bar], step: f64, rule: ImbalanceRule) -
                 .ok()
                 .map(|k| &bar.rows[k])
         };
+        let min_qty = average_row_qty(bar.rows.iter().map(|r| r.buy + r.sell));
         let imbalanced = |row: &Row, side: Side| match side {
-            Side::Buy => rule.holds(row.buy, row_at(row.index - 1).map_or(0.0, |d| d.sell)),
-            Side::Sell => rule.holds(row.sell, row_at(row.index + 1).map_or(0.0, |d| d.buy)),
+            Side::Buy => {
+                row.buy >= min_qty
+                    && rule.holds(row.buy, row_at(row.index - 1).map_or(0.0, |d| d.sell))
+            }
+            Side::Sell => {
+                row.sell >= min_qty
+                    && rule.holds(row.sell, row_at(row.index + 1).map_or(0.0, |d| d.buy))
+            }
         };
 
         for side in [Side::Buy, Side::Sell] {
@@ -490,6 +512,16 @@ mod tests {
                 end: None,
             }]
         );
+    }
+
+    #[test]
+    fn thin_rows_are_not_a_stack() {
+        // Same 4:1 ratios, but the stacked rows are far below the bar's average row volume.
+        let r = rows(
+            100,
+            &[(0.1, 0.5), (2.0, 0.5), (2.0, 0.5), (2.0, 0.5), (60.0, 60.0)],
+        );
+        assert!(stacked_imbalances(&[bar(100.0, 104.0, r)], 1.0, RULE).is_empty());
     }
 
     #[test]
