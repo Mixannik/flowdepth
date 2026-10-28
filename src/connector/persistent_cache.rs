@@ -1745,6 +1745,49 @@ mod tests {
         )
     }
 
+    /// Research helper: dumps cached BinanceLinear BTCUSDT trades (minute aggregates for old
+    /// days) from a copy of market.redb to CSV in the archive column layout.
+    /// FLOWDEPTH_DUMP_DB=<copy.redb> FLOWDEPTH_DUMP_DIR=<dir> cargo test --release dump_cached_trades -- --ignored
+    #[test]
+    #[ignore]
+    fn dump_cached_trades() {
+        use std::io::Write;
+        let db_path = std::env::var("FLOWDEPTH_DUMP_DB").unwrap();
+        let out_dir = std::path::PathBuf::from(std::env::var("FLOWDEPTH_DUMP_DIR").unwrap());
+        std::fs::create_dir_all(&out_dir).unwrap();
+        let path = PathBuf::from(db_path);
+        let cache = MarketDataCache {
+            db: open_initialized_database(&path).unwrap(),
+            path,
+        };
+        const DAY: u64 = 86_400_000;
+        let now = chrono::Utc::now().timestamp_millis() as u64;
+        let mut day = now / DAY * DAY - 40 * DAY;
+        while day < now {
+            let slice = cache.read_trades(ticker_info(), UnixMs::new(day), UnixMs::new(day + DAY));
+            if !slice.records.is_empty() {
+                let name = chrono::DateTime::from_timestamp_millis(day as i64)
+                    .unwrap()
+                    .format("BTCUSDT-cache-%Y-%m-%d.csv");
+                let mut file =
+                    std::io::BufWriter::new(std::fs::File::create(out_dir.join(name.to_string())).unwrap());
+                for t in &slice.records {
+                    writeln!(
+                        file,
+                        "0,{},{},0,0,{},{}",
+                        t.price.to_f64(),
+                        t.qty.to_f64(),
+                        t.time.as_u64(),
+                        t.is_sell
+                    )
+                    .unwrap();
+                }
+                println!("{name}: {}", slice.records.len());
+            }
+            day += DAY;
+        }
+    }
+
     fn timed_trade(time: u64) -> Trade {
         Trade {
             id: Some(time),
