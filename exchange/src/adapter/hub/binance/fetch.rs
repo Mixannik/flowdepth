@@ -647,6 +647,16 @@ async fn fetch_intraday_trades(
     Ok(trades)
 }
 
+/// Spot archives since 2025 store microseconds, futures archives milliseconds.
+fn archive_time_ms(raw: u64) -> u64 {
+    // Milliseconds stay below 1e14 until the year 5138.
+    if raw >= 100_000_000_000_000 {
+        raw / 1_000
+    } else {
+        raw
+    }
+}
+
 async fn get_hist_trades_with_client(
     client: &reqwest::Client,
     ticker_info: TickerInfo,
@@ -734,7 +744,7 @@ async fn get_hist_trades_with_client(
         trades.extend(csv_reader.records().filter_map(|record| {
             record.ok().and_then(|record| {
                 let id = record.get(0)?.parse::<u64>().ok()?;
-                let time = record.get(5)?.parse::<u64>().ok()?;
+                let time = archive_time_ms(record.get(5)?.parse::<u64>().ok()?);
                 let is_sell = record.get(6)?.parse::<bool>().ok()?;
                 let price_f64 = record.get(1)?.parse::<f64>().ok()?;
 
@@ -836,9 +846,15 @@ fn intraday_window_covers(start_ms: u64, now_ms: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        historical_trade_archive_is_missing, intraday_window_covers, oi_request_limit,
-        remember_missing_historical_trade_archive,
+        archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
+        oi_request_limit, remember_missing_historical_trade_archive,
     };
+
+    #[test]
+    fn spot_archive_microseconds_become_milliseconds() {
+        assert_eq!(archive_time_ms(1_793_059_200_482_489), 1_793_059_200_482);
+        assert_eq!(archive_time_ms(1_793_059_200_482), 1_793_059_200_482);
+    }
 
     #[test]
     fn rest_trades_are_only_requested_within_two_days() {
