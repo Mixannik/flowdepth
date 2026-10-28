@@ -46,6 +46,7 @@
 - **Лента ликвидаций**: Time & Sales → Feed: Liquidations (Binance `forceOrder` только на `/market`, отдельный «тихий» сокет `WsSession::silent`); склейка частей рыночной заявки в ленте.
 - **Вкладки**: все раскладки живые — подписки на объединение потоков (`Dashboard::market_subscriptions(&UniqueStreams)`), события через `route_to_layouts`, тик/бэкфилл для всех раскладок (main.rs).
 - **CVD Futures + Spot** (`src/chart/indicator/kline/spot_cvd.rs`, `KlineIndicator::SpotCvd`): перп-CVD и спот-CVD Binance в одной панели, каждая линия нормирована по видимому участку (как Coinglass). Спот — по спотовым свечам (taker buy), `FetchRange::SpotKlines`, текущий бар опрашивается раз в 10 с. Заменяет обычный CVD (в JDK FP 15m старый CVD убран).
+- **Уровни прошлых периодов** PDH/PDL, PWH/PWL, PMH/PML (`src/chart/indicator/kline/period_levels.rs`, `KlineIndicator::PeriodLevels`, оверлей с собственными данными — `Runtime::PeriodLevels`): по дневным свечам, запрос `FetchRange::RefKlines { spot: false, timeframe: D1 }` (тот же путь, что спот-свечи для CVD, `spot: true`).
 - Ловушка iced: `Frame::with_clip` теряет трансформ графика — не использовать в chart-space.
 - Шкала времени у пользователя — в UTC (лог пишется по МСК, UTC+3): сверять свечи по числу сделок в Bar Stats.
 - У Binance бывают дыры в `aggTrades` (27.10 00:03–00:30 UTC: в REST нет сделок, а в klines они есть). Кэш при чтении считает долгую тишину дырой (`trade_integrity_gaps`) и докачивает; дыру на стороне биржи закроет только дневной архив, когда выйдет.
