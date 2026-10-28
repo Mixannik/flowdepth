@@ -126,7 +126,9 @@ fn drawing_canvas_center(bounds: Rectangle) -> Point {
 
 impl KlineChart {
     const MAX_FIXED_VOLUME_PROFILES: usize = 16;
-    const MAX_FIXED_VOLUME_PROFILE_RANGE_MS: u64 = 7 * 24 * 60 * 60_000;
+    /// Ranges over `range_levels::CANDLE_PROFILE_AFTER_MS` come from hourly candles, so a
+    /// quarter is affordable.
+    const MAX_FIXED_VOLUME_PROFILE_RANGE_MS: u64 = 92 * 24 * 60 * 60_000;
     const MAX_FIXED_VOLUME_PROFILE_CANDLES: usize = 10_000;
 
     pub(super) fn drawing_anchor(&self, point: Point, bounds: Rectangle) -> DrawingAnchor {
@@ -252,6 +254,15 @@ impl KlineChart {
         else {
             return false;
         };
+        if super::range_levels::uses_candles(from.as_u64(), to.as_u64()) {
+            return super::range_levels::missing_hourly(
+                &self.range_hourly,
+                from.as_u64(),
+                to.as_u64(),
+                UnixMs::now().as_u64(),
+            )
+            .is_none_or(|(missing_from, _)| missing_from > from.as_u64());
+        }
         let (_, latest) = timeseries.timerange();
         let historical_to =
             super::historical_trade_target_to(latest, timeframe.to_milliseconds(), UnixMs::now());
@@ -2528,6 +2539,14 @@ fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message
             value
         },
     );
+    let extend = toggle(
+        "Extend POC / VA right (all charts of ticker)",
+        config.extend_levels,
+        |mut value, enabled| {
+            value.extend_levels = enabled;
+            value
+        },
+    );
 
     container(
         column![
@@ -2549,6 +2568,7 @@ fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message
             row![poc, va].spacing(8),
             vwap,
             high_low,
+            extend,
             button(text("Delete drawing"))
                 .on_press(Message::Drawing(DrawingMessage::DeleteSelected)),
         ]

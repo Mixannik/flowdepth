@@ -1228,6 +1228,53 @@ impl Dashboard {
             }))
     }
 
+    /// Levels of the fixed-range profiles drawn on this layout's charts, with the pane and
+    /// ticker they belong to.
+    pub fn range_levels(
+        &self,
+        main_window: window::Id,
+    ) -> Vec<(
+        uuid::Uuid,
+        exchange::Ticker,
+        Vec<chart::kline::range_levels::RangeLevels>,
+    )> {
+        self.iter_all_panes(main_window)
+            .filter_map(|(_, _, state)| {
+                let pane::Content::Kline { chart: Some(c), .. } = &state.content else {
+                    return None;
+                };
+                let levels = c.range_levels();
+                let ticker = state.stream_pair()?.ticker;
+                (!levels.is_empty()).then_some((state.unique_id(), ticker, levels))
+            })
+            .collect()
+    }
+
+    /// Hands every chart the profile levels drawn on other charts of its ticker.
+    pub fn set_shared_range_levels(
+        &mut self,
+        main_window: window::Id,
+        all: &[(
+            uuid::Uuid,
+            exchange::Ticker,
+            Vec<chart::kline::range_levels::RangeLevels>,
+        )],
+    ) {
+        for (_, _, state) in self.iter_all_panes_mut(main_window) {
+            let (id, ticker) = (state.unique_id(), state.stream_pair().map(|t| t.ticker));
+            if let pane::Content::Kline { chart: Some(c), .. } = &mut state.content {
+                let shared = all
+                    .iter()
+                    .filter(|(source, source_ticker, _)| {
+                        *source != id && Some(*source_ticker) == ticker
+                    })
+                    .flat_map(|(_, _, levels)| levels.iter().copied())
+                    .collect();
+                c.set_shared_range_levels(shared);
+            }
+        }
+    }
+
     fn iter_all_panes_mut(
         &mut self,
         main_window: window::Id,

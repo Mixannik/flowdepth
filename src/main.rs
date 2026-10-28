@@ -156,6 +156,8 @@ struct Flowsurface {
     startup_loading: StartupLoading,
     startup_main_window_target: StartupMainWindowTarget,
     closing_startup_window: Option<window::Id>,
+    /// Last time fixed-range profile levels were shared between charts of a ticker.
+    range_levels_synced: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -465,6 +467,7 @@ impl Flowsurface {
             startup_loading: StartupLoading::new(),
             startup_main_window_target,
             closing_startup_window: None,
+            range_levels_synced: Instant::now(),
         };
 
         if let Some(err) = audio_init_err {
@@ -905,6 +908,22 @@ impl Flowsurface {
 
                 let main_window_id = self.main_window.id;
                 let data_sources = Arc::clone(&self.data_sources);
+
+                // A fixed-range profile drawn on one chart (usually 4h) shows its levels on
+                // every chart of the same ticker, in every layout.
+                if now.duration_since(self.range_levels_synced) >= Duration::from_secs(1) {
+                    self.range_levels_synced = now;
+                    let layouts = &mut self.layout_manager.layouts;
+                    let all = layouts
+                        .iter()
+                        .flat_map(|layout| layout.dashboard.range_levels(main_window_id))
+                        .collect::<Vec<_>>();
+                    for layout in layouts.iter_mut() {
+                        layout
+                            .dashboard
+                            .set_shared_range_levels(main_window_id, &all);
+                    }
+                }
 
                 // Inactive layouts tick too: their panes resolve streams, roll candles and
                 // schedule fetches in the background, so a tab switch shows current data.

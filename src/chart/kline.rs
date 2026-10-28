@@ -39,6 +39,7 @@ use std::{cell::RefCell, sync::Arc, time::Instant};
 mod drawing;
 mod naked_levels;
 mod oi_bars;
+pub mod range_levels;
 mod signals;
 mod tpo;
 mod zones;
@@ -334,6 +335,10 @@ pub struct KlineChart {
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
     drawings: drawing::DrawingState,
     pending_tick_multiplier: Option<TickMultiplier>,
+    /// Hourly candles (open time → candle) for long fixed-range profiles.
+    range_hourly: std::collections::BTreeMap<u64, Kline>,
+    /// Fixed-range profile levels drawn on other charts of this ticker.
+    shared_range_levels: Vec<range_levels::RangeLevels>,
 }
 
 #[derive(Debug, Default)]
@@ -484,6 +489,8 @@ impl KlineChart {
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
                     pending_tick_multiplier: None,
+                    range_hourly: std::collections::BTreeMap::new(),
+                    shared_range_levels: Vec::new(),
                 }
             }
             Basis::Tick(interval) => {
@@ -565,6 +572,8 @@ impl KlineChart {
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
                     pending_tick_multiplier: None,
+                    range_hourly: std::collections::BTreeMap::new(),
+                    shared_range_levels: Vec::new(),
                 }
             }
         }
@@ -941,6 +950,9 @@ impl KlineChart {
                     let mut ranges = self
                         .fixed_volume_profiles()
                         .into_iter()
+                        .filter(|(from, to, _)| {
+                            !range_levels::uses_candles(from.as_u64(), to.as_u64())
+                        })
                         .filter_map(|(from, to, _)| {
                             let from = from.max(kline_earliest);
                             let to = to.min(historical_to);
@@ -972,6 +984,40 @@ impl KlineChart {
                             return Some(action);
                         }
                         break;
+                    }
+                }
+
+                // Long fixed ranges are profiled from hourly candles (the VWAP's path).
+                if matches!(self.kind, KlineChartKind::Candles) {
+                    for (from, to, _) in self.fixed_volume_profiles() {
+                        if !range_levels::uses_candles(from.as_u64(), to.as_u64()) {
+                            continue;
+                        }
+                        let Some((fetch_from, fetch_to)) = range_levels::missing_hourly(
+                            &self.range_hourly,
+                            from.as_u64(),
+                            to.as_u64(),
+                            now.as_u64(),
+                        ) else {
+                            continue;
+                        };
+                        let range = FetchRange::RefKlines {
+                            from: UnixMs::new(fetch_from),
+                            to: UnixMs::new(fetch_to),
+                            timeframe: exchange::Timeframe::H1,
+                            spot: false,
+                        };
+                        if let Some(action) = request_fetch(
+                            &mut self.request_handler,
+                            range,
+                            Some(&self.chart.ticker_info),
+                        ) {
+                            log::info!(
+                                "FIXED VP HourlyFetch | range={}",
+                                fetcher::format_fetch_range(&range)
+                            );
+                            return Some(action);
+                        }
                     }
                 }
 
@@ -2285,6 +2331,9 @@ impl KlineChart {
                 indi.draw_overlay(frame, &ctx);
             }
         }
+        let mut levels = self.range_levels();
+        levels.extend_from_slice(&self.shared_range_levels);
+        range_levels::draw(&levels, frame, &ctx);
     }
 
     pub fn insert_ref_klines(
@@ -2304,6 +2353,56 @@ impl KlineChart {
 
         for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
             indi.on_ref_klines(spot, timeframe, klines);
+        }
+        if !spot && timeframe == exchange::Timeframe::H1 {
+            self.range_hourly
+                .extend(klines.iter().map(|k| (k.time.as_u64(), *k)));
+            if self.has_fixed_volume_profiles() {
+                self.invalidate(None);
+            }
+        }
+    }
+
+    /// Levels of this chart's fixed-range profiles that continue to the right edge, for
+    /// this chart and for the other charts of its ticker.
+    pub fn range_levels(&self) -> Vec<range_levels::RangeLevels> {
+        self.fixed_volume_profiles()
+            .into_iter()
+            .filter(|(_, _, config)| config.extend_levels)
+            .filter_map(|(from, to, config)| {
+                let profile = self.fixed_volume_profile(from, to, &config)?;
+                Some(range_levels::RangeLevels {
+                    to: to.as_u64(),
+                    poc: profile.poc.to_f64(),
+                    vah: profile.vah.to_f64(),
+                    val: profile.val.to_f64(),
+                })
+            })
+            .collect()
+    }
+
+    pub fn set_shared_range_levels(&mut self, levels: Vec<range_levels::RangeLevels>) {
+        if self.shared_range_levels != levels {
+            self.shared_range_levels = levels;
+            self.chart.cache.clear_all();
+        }
+    }
+
+    /// The fixed-range profile as far as its data is loaded: hourly candles for long
+    /// ranges, trades otherwise.
+    fn fixed_volume_profile(
+        &self,
+        from: UnixMs,
+        to: UnixMs,
+        config: &FixedRangeVolumeProfileConfig,
+    ) -> Option<SessionProfile> {
+        let tick_size = self.chart.tick_size;
+        if range_levels::uses_candles(from.as_u64(), to.as_u64()) {
+            build_candle_volume_profile(&self.range_hourly, from, to, tick_size, config)
+        } else if self.fixed_volume_profile_ready(from, to) {
+            build_fixed_range_volume_profile(&self.data_source, from, to, tick_size, config)
+        } else {
+            build_partial_fixed_range_volume_profile(&self.data_source, from, to, tick_size, config)
         }
     }
 
@@ -3056,26 +3155,7 @@ impl canvas::Program<Message> for KlineChart {
                         );
                     }
                     for (from, to, config) in self.fixed_volume_profiles() {
-                        if self.fixed_volume_profile_ready(from, to) {
-                            draw_fixed_range_volume_profile(
-                                &self.data_source,
-                                frame,
-                                from,
-                                to,
-                                interval_to_x,
-                                price_to_y,
-                                chart.cell_height,
-                                chart.tick_size,
-                                &config,
-                                palette,
-                            );
-                        } else if let Some(profile) = build_partial_fixed_range_volume_profile(
-                            &self.data_source,
-                            from,
-                            to,
-                            chart.tick_size,
-                            &config,
-                        ) {
+                        if let Some(profile) = self.fixed_volume_profile(from, to, &config) {
                             draw_volume_profile(
                                 frame,
                                 profile,
@@ -5021,8 +5101,71 @@ fn build_volume_profile(
         }
     }
 
-    let high = high?;
-    let low = low?;
+    finish_volume_profile(bins, row_units, from, to, high?, low?, style)
+}
+
+/// Fixed-range profile from candles (hourly for long ranges, where a month of trades is
+/// too much to download): each candle's volume is spread evenly over its price range.
+/// Rows are at least the configured size and coarse enough for at most
+/// `range_levels::MAX_CANDLE_PROFILE_ROWS` rows over the range.
+fn build_candle_volume_profile(
+    candles: &std::collections::BTreeMap<u64, Kline>,
+    from: UnixMs,
+    to: UnixMs,
+    tick_size: PriceStep,
+    config: &FixedRangeVolumeProfileConfig,
+) -> Option<SessionProfile> {
+    if to <= from {
+        return None;
+    }
+    let bars = || candles.range(from.as_u64()..to.as_u64()).map(|(_, k)| k);
+    let high = bars().map(|k| k.high).max()?;
+    let low = bars().map(|k| k.low).min()?;
+    let style = VolumeProfileVisualSettings::from(config);
+    let tick_units = tick_size.units.max(1);
+    let min_row = tick_units.saturating_mul(i64::from(style.row_size_ticks.clamp(1, 50)));
+    let span = (high.units - low.units).max(1);
+    let rows_wanted = range_levels::MAX_CANDLE_PROFILE_ROWS as i64;
+    let row_units = (span.div_euclid(rows_wanted) / tick_units + 1)
+        .saturating_mul(tick_units)
+        .max(min_row);
+
+    let mut bins: FxHashMap<i64, ProfileBin> = FxHashMap::default();
+    for kline in bars() {
+        let total = kline.volume.total().to_f64();
+        if total <= 0.0 {
+            continue;
+        }
+        let (buy, sell) = kline
+            .volume
+            .buy_sell()
+            .map_or((total / 2.0, total / 2.0), |(b, s)| {
+                (b.to_f64(), s.to_f64())
+            });
+        // Half-open [low, high): a candle ending where the next one starts must not put
+        // both candles' volume into the shared boundary row.
+        let first = kline.low.units.div_euclid(row_units);
+        let last = (kline.high.units - 1).div_euclid(row_units).max(first);
+        let rows = (last - first + 1) as f64;
+        for row in first..=last {
+            let bin = bins.entry(row.saturating_mul(row_units)).or_default();
+            bin.buy += buy / rows;
+            bin.sell += sell / rows;
+        }
+    }
+    finish_volume_profile(bins, row_units, from, to, high, low, style)
+}
+
+/// POC, value area and VWAP of binned volume; `bins` are keyed by the row's low edge.
+fn finish_volume_profile(
+    bins: FxHashMap<i64, ProfileBin>,
+    row_units: i64,
+    from: UnixMs,
+    to: UnixMs,
+    high: Price,
+    low: Price,
+    style: VolumeProfileVisualSettings,
+) -> Option<SessionProfile> {
     let mut rows: Vec<_> = bins
         .into_iter()
         .map(|(units, bin)| (Price::from_units(units.saturating_add(row_units / 2)), bin))
@@ -5106,34 +5249,6 @@ fn draw_session_volume_profiles(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn draw_fixed_range_volume_profile(
-    data_source: &PlotData<KlineDataPoint>,
-    frame: &mut canvas::Frame,
-    from: UnixMs,
-    to: UnixMs,
-    interval_to_x: impl Fn(u64) -> f32,
-    price_to_y: impl Fn(Price) -> f32,
-    cell_height: f32,
-    tick_size: PriceStep,
-    config: &FixedRangeVolumeProfileConfig,
-    palette: &Palette,
-) {
-    if let Some(profile) =
-        build_fixed_range_volume_profile(data_source, from, to, tick_size, config)
-    {
-        draw_volume_profile(
-            frame,
-            profile,
-            &interval_to_x,
-            &price_to_y,
-            cell_height,
-            config.into(),
-            palette,
-        );
-    }
-}
-
 fn draw_volume_profile(
     frame: &mut canvas::Frame,
     profile: SessionProfile,
@@ -5143,7 +5258,19 @@ fn draw_volume_profile(
     style: VolumeProfileVisualSettings,
     palette: &Palette,
 ) {
-    let row_height = cell_height * f32::from(style.row_size_ticks.max(1)) * 0.86;
+    // Candle-based profiles use rows coarser than the configured size: take the spacing
+    // of adjacent rows when there is one.
+    let row_step = profile
+        .rows
+        .windows(2)
+        .map(|pair| (price_to_y(pair[1].0) - price_to_y(pair[0].0)).abs())
+        .filter(|gap| *gap > 0.0)
+        .fold(f32::INFINITY, f32::min);
+    let row_height = if row_step.is_finite() {
+        row_step
+    } else {
+        cell_height * f32::from(style.row_size_ticks.max(1))
+    } * 0.86;
     let session_left = interval_to_x(profile.start);
     let session_right = interval_to_x(profile.end);
     let full_width = (session_right - session_left).abs();
@@ -7585,6 +7712,93 @@ fn price_padding_from_pixels(cell_height: f32, tick_size: f32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hourly_bar(hour: u64, low: f64, high: f64, volume: f64) -> (u64, Kline) {
+        let time = hour * range_levels::HOUR_MS;
+        let kline = Kline {
+            time: UnixMs::new(time),
+            open: Price::from_f64(low),
+            high: Price::from_f64(high),
+            low: Price::from_f64(low),
+            close: Price::from_f64(high),
+            volume: exchange::Volume::TotalOnly(Qty::from_f64(volume)),
+        };
+        (time, kline)
+    }
+
+    #[test]
+    fn candle_profile_spreads_volume_and_finds_value_area() {
+        let hour = range_levels::HOUR_MS;
+        // Rows of 1.0: 100 → 1, 101 → 1 + 10, 102 → 10, 103 → 10.
+        let candles = [
+            hourly_bar(0, 100.0, 102.0, 2.0),
+            hourly_bar(1, 101.0, 104.0, 30.0),
+            // Outside the range: ignored.
+            hourly_bar(5, 200.0, 210.0, 1000.0),
+        ]
+        .into_iter()
+        .collect();
+        let step = PriceStep {
+            units: Price::from_f64(1.0).units,
+        };
+        let profile = build_candle_volume_profile(
+            &candles,
+            UnixMs::new(0),
+            UnixMs::new(2 * hour),
+            step,
+            &FixedRangeVolumeProfileConfig::default(),
+        )
+        .expect("profile");
+        let volumes: Vec<_> = profile
+            .rows
+            .iter()
+            .map(|(price, bin)| (price.to_f64(), bin.volume()))
+            .collect();
+        assert_eq!(
+            volumes,
+            vec![(100.5, 1.0), (101.5, 11.0), (102.5, 10.0), (103.5, 10.0)]
+        );
+        // 70% of 32 = 22.4: POC 11, then 102 (10 > 1), then 103 (10 > 1).
+        assert_eq!(profile.poc.to_f64(), 101.5);
+        assert_eq!(profile.vah.to_f64(), 103.5);
+        assert_eq!(profile.val.to_f64(), 101.5);
+        assert_eq!(
+            (profile.low.to_f64(), profile.high.to_f64()),
+            (100.0, 104.0)
+        );
+    }
+
+    #[test]
+    fn candle_profile_rows_coarsen_over_wide_ranges() {
+        let hour = range_levels::HOUR_MS;
+        // A month of hourly candles over a 10_000 span with a 0.1 tick: rows must not be
+        // 0.1 wide, and the busy 80_000..80_500 area must hold the POC.
+        let candles: std::collections::BTreeMap<_, _> = (0..720)
+            .map(|h| {
+                if h % 10 == 0 {
+                    hourly_bar(h, 75_000.0, 85_000.0, 10.0)
+                } else {
+                    hourly_bar(h, 80_000.0, 80_500.0, 50.0)
+                }
+            })
+            .collect();
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let profile = build_candle_volume_profile(
+            &candles,
+            UnixMs::new(0),
+            UnixMs::new(720 * hour),
+            step,
+            &FixedRangeVolumeProfileConfig::default(),
+        )
+        .expect("profile");
+        assert!(profile.rows.len() <= range_levels::MAX_CANDLE_PROFILE_ROWS + 1);
+        let poc = profile.poc.to_f64();
+        // Prices are row centres; rows are ~33 wide here.
+        assert!((79_980.0..=80_520.0).contains(&poc), "POC at {poc}");
+        assert!(profile.val.to_f64() >= 79_900.0 && profile.vah.to_f64() <= 80_600.0);
+    }
 
     fn test_trade(id: u64, time: u64, qty: f64) -> Trade {
         Trade {

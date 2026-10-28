@@ -130,7 +130,11 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
         if spot || timeframe != Timeframe::H1 {
             return;
         }
-        self.hourly.extend(klines.iter().map(|k| {
+        // Long fixed-range profiles fetch months of hourly candles on the same path; keep
+        // only what this indicator draws (previous and current month).
+        let since = month_starts(chrono::Utc::now().timestamp_millis() as u64).1;
+        let klines = klines.iter().filter(|k| k.time.as_u64() >= since);
+        self.hourly.extend(klines.map(|k| {
             let typical = (k.high.to_f64() + k.low.to_f64() + k.close.to_f64()) / 3.0;
             (k.time.as_u64(), (typical, k.volume.total().to_f64()))
         }));

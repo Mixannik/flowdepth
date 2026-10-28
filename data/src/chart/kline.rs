@@ -83,6 +83,9 @@ pub mod drawing {
         pub show_value_area: bool,
         pub show_vwap: bool,
         pub show_range_high_low: bool,
+        /// POC, VAH and VAL continue from the range's end to the right edge, on this
+        /// chart and on every other chart of the same ticker.
+        pub extend_levels: bool,
     }
 
     impl Default for FixedRangeVolumeProfileConfig {
@@ -97,6 +100,7 @@ pub mod drawing {
                 show_value_area: true,
                 show_vwap: true,
                 show_range_high_low: true,
+                extend_levels: true,
             }
         }
     }
