@@ -1,8 +1,8 @@
-//! Spot vs Perp CVD: the spot pair's cumulative delta (Binance spot klines carry the
-//! taker-buy volume) drawn over this perpetual's CVD. Both start from the first bar
-//! present in both series. Spot volume is several times smaller than perp volume, so
-//! the spot line is scaled to the visible span of the perp line; the axis shows perp
-//! values and the tooltip shows both exactly.
+//! CVD Futures + Spot (Coinglass style): this perpetual's CVD and the spot pair's CVD
+//! (Binance spot klines carry the taker-buy volume) in one panel. Both start from the
+//! first bar present in both series. Spot volume is several times smaller than perp
+//! volume, so each line is normalized to the visible span; the axis shows futures
+//! values, the legend and tooltip show both exactly.
 use crate::chart::{
     Basis, Caches, Message, ViewState,
     indicator::{
@@ -23,6 +23,10 @@ use std::{collections::BTreeMap, ops::RangeInclusive};
 
 /// Live refresh period of the forming spot bar.
 const POLL_MS: u64 = 10_000;
+
+/// Coinglass colours: futures blue, spot orange.
+const FUTURES_COLOR: iced::Color = iced::Color::from_rgb(0.31, 0.56, 0.97);
+const SPOT_COLOR: iced::Color = iced::Color::from_rgb(0.97, 0.62, 0.25);
 
 /// Cumulative values at one bar.
 #[derive(Debug, Clone, Copy, Default)]
@@ -135,7 +139,7 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         data_labels_always_visible: bool,
         visible_range: RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
-        if let Some(message) = self.unavailable_message(chart, "Spot vs Perp CVD") {
+        if let Some(message) = self.unavailable_message(chart, "CVD Futures + Spot") {
             return center(text(message)).into();
         }
         if visible_range.end() < visible_range.start() {
@@ -149,7 +153,7 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
                     "loading".to_string()
                 };
                 PlotTooltip::new(format!(
-                    "Spot CVD: {spot}\nPerp CVD: {}",
+                    "Futures CVD: {}\nSpot CVD: {spot}",
                     format_with_commas(f64::from(p.perp))
                 ))
             }),
@@ -162,12 +166,32 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
             AnySeries::forward_unix_ms(&self.series),
             visible_range,
         );
-        column![
-            text("Spot CVD (orange, own scale) · Perp CVD (axis)")
-                .size(crate::style::text_size::TINY),
-            plot
+        let last = self.series.last_key_value().map(|(_, p)| *p);
+        let value = |v: Option<f32>| {
+            v.map_or_else(
+                || "—".to_string(),
+                |v| {
+                    let sign = if v >= 0.0 { "+" } else { "" };
+                    format!("{sign}{}", format_with_commas(f64::from(v)))
+                },
+            )
+        };
+        let size = crate::style::text_size::TINY;
+        let legend = row![
+            text("CVD").size(size),
+            text(format!("━ Futures {}", value(last.map(|p| p.perp))))
+                .size(size)
+                .color(FUTURES_COLOR),
+            text(format!(
+                "━ Spot {}",
+                value(last.filter(|p| p.has_spot).map(|p| p.spot))
+            ))
+            .size(size)
+            .color(SPOT_COLOR),
+            text("normalized").size(size),
         ]
-        .into()
+        .spacing(10);
+        column![legend, plot].into()
     }
 
     fn availability(&self, chart: &ViewState) -> IndicatorAvailability {
@@ -283,15 +307,11 @@ where
         &self,
         frame: &mut canvas::Frame,
         ctx: &ViewState,
-        theme: &iced::Theme,
+        _theme: &iced::Theme,
         s: &S,
         range: RangeInclusive<u64>,
         scale: &YScale,
     ) {
-        let palette = theme.palette();
-        let perp_color = palette.secondary.strong.color;
-        let spot_color = iced::Color::from_rgb8(0xF0, 0x9A, 0x3E);
-
         let mut spot_extents: Option<(f32, f32)> = None;
         s.for_each_in(range.clone(), |_, p| {
             if p.has_spot {
@@ -337,11 +357,11 @@ where
         });
         frame.stroke(
             &perp_path.build(),
-            Stroke::default().with_width(1.0).with_color(perp_color),
+            Stroke::default().with_width(1.5).with_color(FUTURES_COLOR),
         );
         frame.stroke(
             &spot_path.build(),
-            Stroke::default().with_width(1.5).with_color(spot_color),
+            Stroke::default().with_width(1.5).with_color(SPOT_COLOR),
         );
     }
 

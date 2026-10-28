@@ -209,8 +209,8 @@ pub const DEFINITIONS: &[Definition] = &[
     ),
     define!(
         SpotCvd,
-        "Spot vs Perp CVD",
-        "Spot CVD of the same pair on Binance spot next to this perpetual's CVD, both from the first common bar. Shows whether spot or perp drives the move.",
+        "CVD Futures + Spot",
+        "This perpetual's CVD together with the same pair's Binance spot CVD, each normalized to the visible range (as on Coinglass). Shows whether spot or futures drives the move. Replaces the plain CVD panel.",
         OrderFlow,
         Delta,
         Runtime::SpotCvd,
