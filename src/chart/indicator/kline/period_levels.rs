@@ -3,7 +3,9 @@
 //! the levels exist even when the chart has only a few days loaded.
 use crate::chart::{
     Basis, Message, ViewState,
-    indicator::kline::{AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl},
+    indicator::kline::{
+        AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl, OverlayCtx,
+    },
 };
 use crate::connector::fetcher::FetchRange;
 
@@ -54,14 +56,14 @@ fn day_start(ms: u64) -> u64 {
 }
 
 /// Monday 00:00 UTC of the week containing `ms` (the epoch was a Thursday).
-fn week_start(ms: u64) -> u64 {
+pub(super) fn week_start(ms: u64) -> u64 {
     const MONDAY_SHIFT: u64 = 3 * DAY_MS;
     let week = 7 * DAY_MS;
     ((ms + MONDAY_SHIFT) / week * week).saturating_sub(MONDAY_SHIFT)
 }
 
 /// First day 00:00 UTC of the month containing `ms`, and of the month before it.
-fn month_starts(ms: u64) -> (u64, u64) {
+pub(super) fn month_starts(ms: u64) -> (u64, u64) {
     let date = Utc
         .timestamp_millis_opt(ms as i64)
         .single()
@@ -170,7 +172,10 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
         })
     }
 
-    fn on_ref_klines(&mut self, klines: &[Kline]) {
+    fn on_ref_klines(&mut self, spot: bool, timeframe: Timeframe, klines: &[Kline]) {
+        if spot || timeframe != Timeframe::D1 {
+            return;
+        }
         self.daily.extend(
             klines
                 .iter()
@@ -178,27 +183,27 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
         );
     }
 
-    fn period_levels(&self) -> Vec<Level> {
-        compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64)
+    fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
+        let levels = compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64);
+        draw(&levels, frame, ctx);
     }
 }
 
-const WEEK_COLOR: iced::Color = iced::Color::from_rgb(0.72, 0.56, 1.0);
-const MONTH_COLOR: iced::Color = iced::Color::from_rgb(1.0, 0.47, 0.72);
+/// Muted violet and rose, distinct from the green/red zones.
+const WEEK_COLOR: iced::Color = iced::Color::from_rgb(0.66, 0.58, 0.88);
+const MONTH_COLOR: iced::Color = iced::Color::from_rgb(0.86, 0.56, 0.70);
 
 /// Draws each level from the start of the current period to `right_x`, labelled at its
 /// left end so the labels stay clear of the right-edge naked-level labels.
-#[allow(clippy::too_many_arguments)]
-pub fn draw(
-    levels: &[Level],
-    frame: &mut Frame,
-    x: impl Fn(u64) -> f32,
-    y: impl Fn(Price) -> f32,
-    left_x: f32,
-    right_x: f32,
-    scaling: f32,
-    text_color: iced::Color,
-) {
+fn draw(levels: &[Level], frame: &mut Frame, ctx: &OverlayCtx) {
+    let OverlayCtx {
+        x,
+        y,
+        left_x,
+        right_x,
+        scaling,
+        text_color,
+    } = *ctx;
     let px = |p: f32| p / scaling;
     let label_size = px(10.0);
     for level in levels {
@@ -207,18 +212,19 @@ pub fn draw(
             continue;
         }
         let line_y = y(Price::from_f64(level.price));
-        let (color, width, dashed) = match level.period {
-            Period::Day => (text_color.scale_alpha(0.6), 1.0, true),
-            Period::Week => (WEEK_COLOR, 1.3, false),
-            Period::Month => (MONTH_COLOR, 1.6, false),
+        // Background references: thin, dashed and faint so candles and zones stay on top.
+        let (color, dash): (_, &'static [f32]) = match level.period {
+            Period::Day => (text_color.scale_alpha(0.28), &[3.0, 4.0]),
+            Period::Week => (WEEK_COLOR.scale_alpha(0.38), &[6.0, 4.0]),
+            Period::Month => (MONTH_COLOR.scale_alpha(0.38), &[10.0, 4.0]),
         };
-        let mut stroke = Stroke::default().with_color(color).with_width(px(width));
-        if dashed {
-            stroke.line_dash = LineDash {
-                segments: &[6.0, 4.0],
+        let stroke = Stroke {
+            line_dash: LineDash {
+                segments: dash,
                 offset: 0,
-            };
-        }
+            },
+            ..Stroke::default().with_color(color).with_width(px(1.0))
+        };
         frame.stroke(
             &Path::line(Point::new(start, line_y), Point::new(right_x, line_y)),
             stroke,
@@ -227,7 +233,7 @@ pub fn draw(
             content: format!("{} {:.0}", level.name(), level.price),
             position: Point::new(start + label_size * 0.4, line_y - label_size * 0.15),
             size: iced::Pixels(label_size),
-            color,
+            color: color.scale_alpha(1.6),
             align_x: Alignment::Start.into(),
             align_y: Alignment::End.into(),
             font: crate::style::AZERET_MONO,

@@ -315,6 +315,7 @@ pub enum FetchedData {
     RefKlines {
         data: Vec<Kline>,
         spot: bool,
+        timeframe: Timeframe,
         req_id: Option<uuid::Uuid>,
     },
 }
@@ -2246,6 +2247,7 @@ fn ref_klines_fetch_task(
                 data: FetchedData::RefKlines {
                     data,
                     spot,
+                    timeframe,
                     req_id: Some(req_id),
                 },
                 stream: chart_stream,

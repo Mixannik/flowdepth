@@ -268,7 +268,10 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         self.sync_perp(source, 0);
     }
 
-    fn on_ref_klines(&mut self, klines: &[Kline]) {
+    fn on_ref_klines(&mut self, spot: bool, timeframe: Timeframe, klines: &[Kline]) {
+        if !spot || self.timeframe != Some(timeframe) {
+            return;
+        }
         self.spot.extend(klines.iter().map(|k| {
             let delta = k
                 .volume

@@ -10,6 +10,7 @@ use exchange::{Kline, Timeframe, Trade, UnixMs};
 use super::plot::AnySeries;
 
 pub mod bar_analysis;
+pub mod htf_vwap;
 pub mod open_interest;
 pub mod period_levels;
 pub mod scripted;
@@ -126,18 +127,27 @@ pub trait KlineIndicatorImpl {
 
     fn on_open_interest(&mut self, _pairs: &[exchange::OpenInterest]) {}
 
-    /// Reference klines requested through `FetchRange::RefKlines`.
-    fn on_ref_klines(&mut self, _klines: &[Kline]) {}
+    /// Reference klines requested through `FetchRange::RefKlines`; every indicator sees
+    /// every batch and keeps only its own (by market and timeframe).
+    fn on_ref_klines(&mut self, _spot: bool, _timeframe: Timeframe, _klines: &[Kline]) {}
 
-    /// Previous day/week/month highs and lows, for indicators that hold them.
-    fn period_levels(&self) -> Vec<period_levels::Level> {
-        Vec::new()
-    }
+    /// Draws on the price chart, for overlays that own fetched data.
+    fn draw_overlay(&self, _frame: &mut iced::widget::canvas::Frame, _ctx: &OverlayCtx) {}
 
     /// Open interest samples by time, for indicators that hold them.
     fn open_interest(&self) -> Option<&std::collections::BTreeMap<UnixMs, f64>> {
         None
     }
+}
+
+/// Chart-space mapping for `KlineIndicatorImpl::draw_overlay`.
+pub struct OverlayCtx<'a> {
+    pub x: &'a dyn Fn(u64) -> f32,
+    pub y: &'a dyn Fn(exchange::unit::Price) -> f32,
+    pub left_x: f32,
+    pub right_x: f32,
+    pub scaling: f32,
+    pub text_color: iced::Color,
 }
 
 pub struct FetchCtx<'a> {
@@ -156,6 +166,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         Runtime::OpenInterest => Box::new(open_interest::OpenInterestIndicator::new()),
         Runtime::SpotCvd => Box::new(spot_cvd::SpotCvdIndicator::new()),
         Runtime::PeriodLevels => Box::new(period_levels::PeriodLevelsIndicator::new()),
+        Runtime::HtfVwap => Box::new(htf_vwap::HtfVwapIndicator::new()),
         Runtime::Scripted(kind) => Box::new(scripted::ScriptedIndicator::new(kind)),
         Runtime::Overlay => Box::new(OverlayIndicator),
     }

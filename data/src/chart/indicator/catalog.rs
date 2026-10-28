@@ -36,8 +36,9 @@ pub enum Runtime {
     BarAnalysis,
     OpenInterest,
     SpotCvd,
-    /// Price-chart overlay that owns fetched data.
+    /// Price-chart overlays that own fetched data.
     PeriodLevels,
+    HtfVwap,
     Scripted(ScriptKind),
     Overlay,
 }
@@ -74,7 +75,10 @@ macro_rules! define {
             icon: Icon::$icon,
             runtime: $runtime,
             editor: $editor,
-            placement: if matches!($runtime, Runtime::Overlay | Runtime::PeriodLevels) {
+            placement: if matches!(
+                $runtime,
+                Runtime::Overlay | Runtime::PeriodLevels | Runtime::HtfVwap
+            ) {
                 IndicatorPlacement::Overlay
             } else {
                 IndicatorPlacement::Panel
@@ -225,6 +229,15 @@ pub const DEFINITIONS: &[Definition] = &[
         Profiles,
         Levels,
         Runtime::PeriodLevels,
+        Editor::None
+    ),
+    define!(
+        HtfVwap,
+        "VWAP week + month",
+        "Developing weekly (from Monday UTC) and monthly VWAP from hourly candles (typical price × volume), so they work on any timeframe without a month of trades.",
+        Profiles,
+        Trend,
+        Runtime::HtfVwap,
         Editor::None
     ),
 ];

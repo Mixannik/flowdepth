@@ -823,12 +823,18 @@ impl State {
         }
     }
 
-    pub fn insert_ref_klines(&mut self, req_id: Option<uuid::Uuid>, spot: bool, klines: &[Kline]) {
+    pub fn insert_ref_klines(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        spot: bool,
+        timeframe: Timeframe,
+        klines: &[Kline],
+    ) {
         if let Content::Kline {
             chart: Some(chart), ..
         } = &mut self.content
         {
-            chart.insert_ref_klines(req_id, spot, klines);
+            chart.insert_ref_klines(req_id, spot, timeframe, klines);
         }
     }
 

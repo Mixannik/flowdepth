@@ -2255,7 +2255,8 @@ impl KlineChart {
         }
     }
 
-    fn draw_period_levels(
+    /// Overlays that own fetched data (period levels, week/month VWAP).
+    fn draw_data_overlays(
         &self,
         frame: &mut canvas::Frame,
         region: iced::Rectangle,
@@ -2264,25 +2265,30 @@ impl KlineChart {
         x: impl Fn(u64) -> f32,
         y: impl Fn(Price) -> f32,
     ) {
-        if !self.indicator_enabled(KlineIndicator::PeriodLevels) {
-            return;
-        }
-        let Some(indi) = self.indicators[KlineIndicator::PeriodLevels].as_ref() else {
-            return;
-        };
-        indicator::kline::period_levels::draw(
-            &indi.period_levels(),
-            frame,
-            x,
-            y,
-            region.x,
-            region.x + region.width,
+        let ctx = indicator::kline::OverlayCtx {
+            x: &x,
+            y: &y,
+            left_x: region.x,
+            right_x: region.x + region.width,
             scaling,
-            palette.background.base.text,
-        );
+            text_color: palette.background.base.text,
+        };
+        for kind in [KlineIndicator::PeriodLevels, KlineIndicator::HtfVwap] {
+            if self.indicator_enabled(kind)
+                && let Some(indi) = self.indicators[kind].as_ref()
+            {
+                indi.draw_overlay(frame, &ctx);
+            }
+        }
     }
 
-    pub fn insert_ref_klines(&mut self, req_id: Option<uuid::Uuid>, spot: bool, klines: &[Kline]) {
+    pub fn insert_ref_klines(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        spot: bool,
+        timeframe: exchange::Timeframe,
+        klines: &[Kline],
+    ) {
         if let Some(req_id) = req_id {
             if klines.is_empty() {
                 self.request_handler.mark_no_data(req_id);
@@ -2291,13 +2297,8 @@ impl KlineChart {
             }
         }
 
-        let target = if spot {
-            KlineIndicator::SpotCvd
-        } else {
-            KlineIndicator::PeriodLevels
-        };
-        if let Some(indi) = self.indicators[target].as_mut() {
-            indi.on_ref_klines(klines);
+        for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
+            indi.on_ref_klines(spot, timeframe, klines);
         }
     }
 
@@ -2826,7 +2827,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    self.draw_period_levels(
+                    self.draw_data_overlays(
                         frame,
                         region,
                         chart.scaling,
@@ -2999,7 +3000,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    self.draw_period_levels(
+                    self.draw_data_overlays(
                         frame,
                         region,
                         chart.scaling,

@@ -36,6 +36,7 @@ pub enum KlineIndicator {
     NakedLevels,
     SpotCvd,
     PeriodLevels,
+    HtfVwap,
 }
 
 impl Indicator for KlineIndicator {

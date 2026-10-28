@@ -965,7 +965,9 @@ impl KlineChartKind {
                 !indicator.is_overlay()
                     || matches!(
                         indicator,
-                        KlineIndicator::NakedLevels | KlineIndicator::PeriodLevels
+                        KlineIndicator::NakedLevels
+                            | KlineIndicator::PeriodLevels
+                            | KlineIndicator::HtfVwap
                     )
             }
         }

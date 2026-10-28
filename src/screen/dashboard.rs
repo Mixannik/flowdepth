@@ -1840,7 +1840,12 @@ impl Dashboard {
                     }
                 }
             }
-            FetchedData::RefKlines { data, spot, req_id } => {
+            FetchedData::RefKlines {
+                data,
+                spot,
+                timeframe,
+                req_id,
+            } => {
                 log::debug!(
                     "DATA RefKlines Distribute | pane={} req={} spot={spot} count={}",
                     fetcher::short_id(pane_id),
@@ -1849,7 +1854,7 @@ impl Dashboard {
                 );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
-                    pane_state.insert_ref_klines(req_id, spot, &data);
+                    pane_state.insert_ref_klines(req_id, spot, timeframe, &data);
                 }
             }
         }
