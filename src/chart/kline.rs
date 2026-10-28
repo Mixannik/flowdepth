@@ -49,7 +49,7 @@ const MIN_TEXT_BAR_PX: f32 = 44.0;
 
 /// Maximum number of raw trades to retain in memory.
 /// Older trades are pruned by exchange timestamp when this cap is exceeded.
-/// 50k trades ≈ 1.5-3 MB depending on Trade size.
+/// 50k trades в‰€ 1.5-3 MB depending on Trade size.
 const MAX_RAW_TRADES: usize = 50_000;
 const MAX_LIVE_TRADE_BUCKETS: usize = 4_096;
 
@@ -335,7 +335,7 @@ pub struct KlineChart {
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
     drawings: drawing::DrawingState,
     pending_tick_multiplier: Option<TickMultiplier>,
-    /// Hourly candles (open time → candle) for long fixed-range profiles.
+    /// Hourly candles (open time в†’ candle) for long fixed-range profiles.
     range_hourly: std::collections::BTreeMap<u64, Kline>,
     /// Fixed-range profile levels drawn on other charts of this ticker.
     shared_range_levels: Vec<range_levels::RangeLevels>,
@@ -1480,7 +1480,7 @@ impl KlineChart {
         if let Some(FetchRange::Trades(from, to)) = fetch {
             if let Some((tail_from, tail_to)) = outcome.empty_tail {
                 log::info!(
-                    "FETCH EmptyCovered | req={} range={}→{} reason=no_progress_near_target",
+                    "FETCH EmptyCovered | req={} range={}в†’{} reason=no_progress_near_target",
                     fetcher::format_req_id(req_id),
                     fetcher::format_time_short(tail_from),
                     fetcher::format_time_short(tail_to)
@@ -1813,7 +1813,7 @@ impl KlineChart {
 
         if should_refetch_volume_bubbles {
             log::info!(
-                "CHART Settings | bubbles old={:?}→{:?} reason=session_changed",
+                "CHART Settings | bubbles old={:?}в†’{:?} reason=session_changed",
                 old_bubbles.session,
                 new_bubbles.session
             );
@@ -2382,7 +2382,8 @@ impl KlineChart {
     }
 
     /// Prices of every reference level this chart shows (fixed-range profiles, period
-    /// levels, naked levels, weekly/monthly VWAP), for the Signals "only near levels" filter.
+    /// levels, naked levels, weekly/monthly VWAP, the user's horizontal lines and rectangle
+    /// edges), for marking signals at a level and the "only near levels" filter.
     fn reference_level_prices(&self) -> Vec<f64> {
         let mut prices: Vec<f64> = self
             .range_levels()
@@ -2390,6 +2391,19 @@ impl KlineChart {
             .chain(&self.shared_range_levels)
             .flat_map(|levels| levels.prices())
             .collect();
+        if self.drawings.visible {
+            for drawing in self.drawings.drawings.iter().filter(|d| d.visible) {
+                match &drawing.geometry {
+                    data::chart::kline::drawing::DrawingGeometry::HorizontalLine { price } => {
+                        prices.push(price.to_f64());
+                    }
+                    data::chart::kline::drawing::DrawingGeometry::Rectangle { first, second } => {
+                        prices.extend([first.price.to_f64(), second.price.to_f64()]);
+                    }
+                    _ => {}
+                }
+            }
+        }
         for kind in [KlineIndicator::PeriodLevels, KlineIndicator::Vwap] {
             if self.indicator_enabled(kind)
                 && let Some(indi) = self.indicators[kind].as_ref()
@@ -3074,7 +3088,7 @@ impl canvas::Program<Message> for KlineChart {
                         );
                     }
                     if let Some((enabled, _, near_levels)) = signals {
-                        let reference_levels = near_levels.then(|| self.reference_level_prices());
+                        let reference_levels = self.reference_level_prices();
                         // Mirrors the summary block placement in `draw_clusters`.
                         let below_offset = if show_summary {
                             let summary =
@@ -3098,7 +3112,9 @@ impl canvas::Program<Message> for KlineChart {
                             chart.scaling,
                             below_offset,
                             enabled,
-                            reference_levels.as_deref(),
+                            &reference_levels,
+                            near_levels,
+                            chart.ticker_info.market_type() == exchange::adapter::MarketKind::Spot,
                             palette,
                         );
                     }
@@ -3492,7 +3508,10 @@ fn draw_gex_proxy_tooltip(
         .unwrap_or_else(|| zone_frame.observed_at.as_u64().to_string());
     let lines = [
         proxy_zone_label(zone.role).to_owned(),
-        format!("Range: ${:.2} – ${:.2}", zone.lower_price, zone.upper_price),
+        format!(
+            "Range: ${:.2} вЂ“ ${:.2}",
+            zone.lower_price, zone.upper_price
+        ),
         format!("Strength: {:.0}%", zone.strength * 100.0),
         format!("Provider Total GEX: {:+.2}", zone_frame.total_gex),
         format!("Observed: {observed} UTC"),
@@ -3605,7 +3624,10 @@ fn draw_gex_zone_tooltip(
         };
         lines.extend([
             label.to_owned(),
-            format!("Range: ${:.0} – ${:.0}", band.lower_price, band.upper_price),
+            format!(
+                "Range: ${:.0} вЂ“ ${:.0}",
+                band.lower_price, band.upper_price
+            ),
             format!("Net GEX: {:+.2}", band.net_gex_1pct),
             format!("Strength: {:.0}%", band.normalized_strength * 100.0),
             format!(
@@ -4842,7 +4864,7 @@ fn draw_vwap_overlay(
             if config.show_bands {
                 draw_cluster_text(
                     frame,
-                    "+σ",
+                    "+Пѓ",
                     Point::new(x, price_to_y(last.upper)),
                     7.0,
                     band_color,
@@ -4851,7 +4873,7 @@ fn draw_vwap_overlay(
                 );
                 draw_cluster_text(
                     frame,
-                    "-σ",
+                    "-Пѓ",
                     Point::new(x, price_to_y(last.lower)),
                     7.0,
                     band_color,
@@ -7046,7 +7068,7 @@ fn draw_clusters(
 
         draw_cluster_text(
             frame,
-            &format!("Δ: {}", abbr_large_numbers(summary.delta.to_f64())),
+            &format!("О”: {}", abbr_large_numbers(summary.delta.to_f64())),
             Point::new(
                 summary_x,
                 summary_y + summary_layout.text_size + summary_layout.line_gap,
@@ -7771,7 +7793,7 @@ mod tests {
     #[test]
     fn candle_profile_spreads_volume_and_finds_value_area() {
         let hour = range_levels::HOUR_MS;
-        // Rows of 1.0: 100 → 1, 101 → 1 + 10, 102 → 10, 103 → 10.
+        // Rows of 1.0: 100 в†’ 1, 101 в†’ 1 + 10, 102 в†’ 10, 103 в†’ 10.
         let candles = [
             hourly_bar(0, 100.0, 102.0, 2.0),
             hourly_bar(1, 101.0, 104.0, 30.0),

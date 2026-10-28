@@ -1769,8 +1769,9 @@ mod tests {
                 let name = chrono::DateTime::from_timestamp_millis(day as i64)
                     .unwrap()
                     .format("BTCUSDT-cache-%Y-%m-%d.csv");
-                let mut file =
-                    std::io::BufWriter::new(std::fs::File::create(out_dir.join(name.to_string())).unwrap());
+                let mut file = std::io::BufWriter::new(
+                    std::fs::File::create(out_dir.join(name.to_string())).unwrap(),
+                );
                 for t in &slice.records {
                     writeln!(
                         file,
