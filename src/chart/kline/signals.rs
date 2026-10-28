@@ -30,7 +30,7 @@ const EXHAUSTION_MAX_EDGE_SHARE: f64 = 0.10;
 /// reference level.
 const NEAR_LEVEL_SHARE: f64 = 0.003;
 /// Absorption strength: absorbed aggression (taker volume in the edge part) relative to the
-/// median bar volume of the previous `TYPICAL_BARS` bars. Fitted on BTC SepвЂ“Oct 2026
+/// median bar volume of the previous `TYPICAL_BARS` bars. Fitted on BTC Sep–Oct 2026
 /// (tools/research): the bar's extreme held the next hour 47% of the time below 0.10 and 67%
 /// above 0.25 on perp 15m. Direction after the signal was a coin flip in every tier.
 const ABSORPTION_WEAK_BELOW: f64 = 0.10;
@@ -368,14 +368,13 @@ pub(super) fn draw(
             continue;
         }
         let bar = &plain[signal.bar];
-        let at_level = near_any_level(bar.low, bar.high, levels);
-        if only_near_levels && !at_level {
+        if only_near_levels && !near_any_level(bar.low, bar.high, levels) {
             continue;
         }
         let center_x = x(time);
         let price_y = |price: f64| y(Price::from_f64(price));
 
-        // Labels under a bar go below its footprint summary (V/О”) instead of over it.
+        // Labels under a bar go below its footprint summary (V/Δ) instead of over it.
         let below_bar = |price: f64| price_y(price) + below_offset + px(4.0);
 
         match signal.kind {
@@ -393,9 +392,7 @@ pub(super) fn draw(
                     bar.buy_in_top()
                 };
                 let strength = typical_volume(series, time, interval).map(|v| absorbed / v);
-                let tier = AbsorptionTier::of(strength);
-                // A level nearby raises a tier on screen; the research measured volume only.
-                let shown = if at_level { tier.raised() } else { tier };
+                let shown = AbsorptionTier::of(strength);
                 if spot && shown != AbsorptionTier::Strong {
                     continue;
                 }
@@ -451,22 +448,13 @@ pub(super) fn draw(
                         );
                     }
                 }
-                // Same ring once more, wider: the signal sits at a reference level.
-                if at_level {
-                    frame.stroke(
-                        &Path::circle(center, radius + px(3.5)),
-                        Stroke::default()
-                            .with_color(color.scale_alpha(0.6))
-                            .with_width(stroke_width * 0.6),
-                    );
-                }
                 let label_y = if bullish {
                     below_bar(anchor)
                 } else {
                     price_y(anchor) - px(4.0) - label_size
                 };
                 let text = match (shown, strength) {
-                    (AbsorptionTier::Strong, Some(s)) => format!("Absorption {s:.2}Г—"),
+                    (AbsorptionTier::Strong, Some(s)) => format!("Absorption {s:.2}×"),
                     _ => "Absorption".to_string(),
                 };
                 labels.then(|| {
@@ -579,13 +567,6 @@ impl AbsorptionTier {
             _ => Self::Normal,
         }
     }
-
-    fn raised(self) -> Self {
-        match self {
-            Self::Weak => Self::Normal,
-            Self::Normal | Self::Strong => Self::Strong,
-        }
-    }
 }
 
 /// Median volume of up to `TYPICAL_BARS` bars before `time`, `None` with fewer than
@@ -631,7 +612,7 @@ fn draw_hatched_zone(
             .with_color(color.scale_alpha(0.8))
             .with_width(stroke_width * 0.6),
     );
-    // 45В° hatching, each line clipped to the zone by hand: `Frame::with_clip` drafts a frame
+    // 45° hatching, each line clipped to the zone by hand: `Frame::with_clip` drafts a frame
     // without the chart's translate/scale, so lines drawn in chart space would land elsewhere.
     let hatch = Stroke::default()
         .with_color(color.scale_alpha(0.45))
