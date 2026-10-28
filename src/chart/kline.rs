@@ -2381,6 +2381,36 @@ impl KlineChart {
             .collect()
     }
 
+    /// Prices of every reference level this chart shows (fixed-range profiles, period
+    /// levels, naked levels, weekly/monthly VWAP), for the Signals "only near levels" filter.
+    fn reference_level_prices(&self) -> Vec<f64> {
+        let mut prices: Vec<f64> = self
+            .range_levels()
+            .iter()
+            .chain(&self.shared_range_levels)
+            .flat_map(|levels| levels.prices())
+            .collect();
+        for kind in [KlineIndicator::PeriodLevels, KlineIndicator::Vwap] {
+            if self.indicator_enabled(kind)
+                && let Some(indi) = self.indicators[kind].as_ref()
+            {
+                prices.extend(indi.reference_prices());
+            }
+        }
+        if self.indicator_enabled(KlineIndicator::NakedLevels) {
+            prices.extend(
+                naked_levels::shown_levels(
+                    &self.data_source,
+                    align_session_start,
+                    &self.visual_config.indicator_configs.naked_levels,
+                )
+                .iter()
+                .map(|level| level.price),
+            );
+        }
+        prices
+    }
+
     pub fn set_shared_range_levels(&mut self, levels: Vec<range_levels::RangeLevels>) {
         if self.shared_range_levels != levels {
             self.shared_range_levels = levels;
@@ -2990,6 +3020,7 @@ impl canvas::Program<Message> for KlineChart {
                             stacked,
                             unfinished,
                             oi_bars,
+                            near_levels,
                         } => Some((
                             signals::Enabled {
                                 absorption: *absorption,
@@ -3001,10 +3032,11 @@ impl canvas::Program<Message> for KlineChart {
                                 unfinished: *unfinished,
                             },
                             *oi_bars,
+                            *near_levels,
                         )),
                         _ => None,
                     });
-                    if let Some((_, _, true)) = signals
+                    if let Some((_, _, true, _)) = signals
                         && let Some(oi) = self.indicators[KlineIndicator::OpenInterest]
                             .as_ref()
                             .and_then(|indi| indi.open_interest())
@@ -3022,7 +3054,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((_, zones_enabled, _)) = signals {
+                    if let Some((_, zones_enabled, _, _)) = signals {
                         // Stacks follow the Imbalance study's ratio when it is on.
                         let (threshold, _, ignore_zeros) = imbalance.unwrap_or((200, None, true));
                         zones::draw(
@@ -3043,7 +3075,8 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((enabled, _, _)) = signals {
+                    if let Some((enabled, _, _, near_levels)) = signals {
+                        let reference_levels = near_levels.then(|| self.reference_level_prices());
                         // Mirrors the summary block placement in `draw_clusters`.
                         let below_offset = if show_summary {
                             let summary =
@@ -3067,6 +3100,7 @@ impl canvas::Program<Message> for KlineChart {
                             chart.scaling,
                             below_offset,
                             enabled,
+                            reference_levels.as_deref(),
                             palette,
                         );
                     }

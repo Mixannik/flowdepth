@@ -191,16 +191,28 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
     }
 
     fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
+        draw(&self.shown_levels(), frame, ctx, &self.config);
+    }
+
+    fn reference_prices(&self) -> Vec<f64> {
+        self.shown_levels()
+            .iter()
+            .map(|level| level.price)
+            .collect()
+    }
+}
+
+impl PeriodLevelsIndicator {
+    fn shown_levels(&self) -> Vec<Level> {
         let cfg = self.config;
-        let levels: Vec<_> = compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64)
+        compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64)
             .into_iter()
             .filter(|level| match level.period {
                 Period::Day => cfg.day,
                 Period::Week => cfg.week,
                 Period::Month => cfg.month,
             })
-            .collect();
-        draw(&levels, frame, ctx, &cfg);
+            .collect()
     }
 }
 

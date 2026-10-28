@@ -140,6 +140,20 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
         }));
     }
 
+    /// Current weekly and monthly VWAP.
+    fn reference_prices(&self) -> Vec<f64> {
+        let anchors: [(bool, fn(u64) -> u64); 2] = [
+            (self.config.weekly, week_start),
+            (self.config.monthly, |t| month_starts(t).0),
+        ];
+        anchors
+            .into_iter()
+            .filter(|(enabled, _)| *enabled)
+            .filter_map(|(_, anchor)| sessions(&self.hourly, anchor).last()?.last().copied())
+            .map(|point| point.value)
+            .collect()
+    }
+
     fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
         let cfg = self.config;
         let label_size = 10.0 / ctx.scaling;

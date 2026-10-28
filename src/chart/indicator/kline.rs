@@ -134,6 +134,11 @@ pub trait KlineIndicatorImpl {
     /// Draws on the price chart, for overlays that own fetched data.
     fn draw_overlay(&self, _frame: &mut iced::widget::canvas::Frame, _ctx: &OverlayCtx) {}
 
+    /// Prices of the levels the overlay currently shows, for "near a level" filters.
+    fn reference_prices(&self) -> Vec<f64> {
+        Vec::new()
+    }
+
     /// Open interest samples by time, for indicators that hold them.
     fn open_interest(&self) -> Option<&std::collections::BTreeMap<UnixMs, f64>> {
         None

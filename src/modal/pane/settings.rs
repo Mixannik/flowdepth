@@ -1462,9 +1462,16 @@ pub mod study {
                     stacked,
                     unfinished,
                     oi_bars,
+                    near_levels,
                 } => {
                     let flags = [
-                        absorption, trapped, exhaustion, stacked, unfinished, oi_bars,
+                        absorption,
+                        trapped,
+                        exhaustion,
+                        stacked,
+                        unfinished,
+                        oi_bars,
+                        near_levels,
                     ];
                     let labels = [
                         "Absorption",
@@ -1473,6 +1480,7 @@ pub mod study {
                         "Stacked imbalances",
                         "Unfinished auctions",
                         "OI + delta bars (needs Open Interest)",
+                        "Only near levels (FRVP, period, naked, W/M VWAP; 0.3%)",
                     ];
                     let toggles = labels.into_iter().enumerate().map(|(i, label)| {
                         checkbox(flags[i])
@@ -1487,6 +1495,7 @@ pub mod study {
                                     stacked: f[3],
                                     unfinished: f[4],
                                     oi_bars: f[5],
+                                    near_levels: f[6],
                                 })
                             })
                             .into()

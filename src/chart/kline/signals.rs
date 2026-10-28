@@ -26,6 +26,18 @@ const EXHAUSTION_LOOKBACK: usize = 10;
 /// Exhaustion: the extreme level's volume relative to the bar's average level volume.
 const EXHAUSTION_MAX_EDGE_SHARE: f64 = 0.10;
 
+/// "Only near levels": a bar qualifies when its range comes within this share of price of a
+/// reference level.
+const NEAR_LEVEL_SHARE: f64 = 0.003;
+
+/// Whether the bar `low..=high` touches or comes within [`NEAR_LEVEL_SHARE`] of any level.
+pub(super) fn near_any_level(low: f64, high: f64, levels: &[f64]) -> bool {
+    levels.iter().any(|&level| {
+        let margin = level.abs() * NEAR_LEVEL_SHARE;
+        level >= low - margin && level <= high + margin
+    })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct Level {
     pub price: f64,
@@ -316,6 +328,8 @@ pub(super) fn draw(
     // Chart-space height of what is drawn under each bar's low (the footprint summary), 0 if none.
     below_offset: f32,
     enabled: Enabled,
+    // With "only near levels": the reference level prices a bar must be near.
+    near_levels: Option<&[f64]>,
     palette: &Palette,
 ) {
     let PlotData::TimeBased(series) = source else {
@@ -342,6 +356,9 @@ pub(super) fn draw(
             continue;
         }
         let bar = &plain[signal.bar];
+        if near_levels.is_some_and(|levels| !near_any_level(bar.low, bar.high, levels)) {
+            continue;
+        }
         let center_x = x(time);
         let price_y = |price: f64| y(Price::from_f64(price));
 
@@ -555,6 +572,17 @@ fn draw_label(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn near_levels_within_three_tenths_of_a_percent() {
+        // Level inside the bar.
+        assert!(near_any_level(99_900.0, 100_100.0, &[100_000.0]));
+        // 0.3% of 100_000 = 300 above the high: still near; 400 is not.
+        assert!(near_any_level(99_500.0, 99_700.0, &[100_000.0]));
+        assert!(!near_any_level(99_500.0, 99_600.0, &[100_000.0]));
+        assert!(!near_any_level(99_500.0, 99_600.0, &[]));
+        assert!(near_any_level(99_500.0, 99_600.0, &[90_000.0, 99_350.0]));
+    }
 
     const ALL: Enabled = Enabled {
         absorption: true,

@@ -273,6 +273,28 @@ fn format_price(price: f64) -> String {
     }
 }
 
+/// The levels the indicator shows: weekly POC/VAH/VAL and daily POCs, as configured.
+pub(super) fn shown_levels(
+    source: &PlotData<KlineDataPoint>,
+    align: impl Fn(u64, u64) -> u64 + Copy,
+    config: &NakedLevelsConfig,
+) -> Vec<Level> {
+    let bars = collect_bars(source);
+    let mut levels = if config.weekly {
+        naked_levels(&bars, SessionKind::Weekly, MAX_WEEKLY_SESSIONS, align)
+    } else {
+        Vec::new()
+    };
+    if config.daily_poc {
+        levels.extend(
+            naked_levels(&bars, SessionKind::Daily, MAX_DAILY_SESSIONS, align)
+                .into_iter()
+                .filter(|level| level.kind == LevelKind::Poc),
+        );
+    }
+    levels
+}
+
 /// Draws naked levels from their session end to `right_x`: weekly POC/VAH/VAL as solid lines,
 /// daily POCs dashed. Daily value-area edges are left out; on higher timeframes they mostly
 /// crowd the price with noise.
@@ -288,25 +310,11 @@ pub(super) fn draw(
     palette: &Palette,
     config: &NakedLevelsConfig,
 ) {
-    let bars = collect_bars(source);
     let px = |p: f32| p / scaling;
     let label_size = px(10.0);
 
-    let weekly = if config.weekly {
-        naked_levels(&bars, SessionKind::Weekly, MAX_WEEKLY_SESSIONS, align)
-    } else {
-        Vec::new()
-    };
-    let daily = if config.daily_poc {
-        naked_levels(&bars, SessionKind::Daily, MAX_DAILY_SESSIONS, align)
-    } else {
-        Vec::new()
-    }
-    .into_iter()
-    .filter(|level| level.kind == LevelKind::Poc);
-
     let mut labels = Vec::new();
-    for level in weekly.into_iter().chain(daily) {
+    for level in shown_levels(source, align, config) {
         let left = x(level.from);
         if left >= right_x {
             continue;

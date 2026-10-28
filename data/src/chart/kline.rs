@@ -2084,6 +2084,10 @@ pub enum FootprintStudy {
         /// Bars classified by OI change and delta (new longs/shorts, covering, liquidation).
         #[serde(default = "enabled_by_default")]
         oi_bars: bool,
+        /// Only absorption/trapped/exhaustion bars near a reference level (fixed-range
+        /// profile levels, period levels, naked levels, weekly/monthly VWAP).
+        #[serde(default)]
+        near_levels: bool,
     },
 }
 
@@ -2112,6 +2116,7 @@ impl FootprintStudy {
             stacked: true,
             unfinished: true,
             oi_bars: true,
+            near_levels: false,
         },
     ];
 }
