@@ -10,6 +10,7 @@
 - Настройки/раскладки приложения: `%APPDATA%\flowsurface\saved-state.json`, лог: `%APPDATA%\flowsurface\logs\flowsurface-current.log`.
 - Скрипты: `C:\Users\MSI\Flowdepth\tools\` (бэкапы `saved-state.before-*.json` тоже там).
 - Материалы JDK (посты и скрины из X): `C:\Users\MSI\Flowdepth\jdk\`.
+- Чужие терминалы и идеи для кругозора (Hyblock, 0xArchive, Hyperliquid) — `C:\Users\MSI\Flowdepth\ideas\README.md`, не план.
 - Материалы @Stoiiic (AMT, пассивный спот, OB Depth/Pressure Bands, VWAP-полосы): `C:\Users\MSI\Flowdepth\stoiiic\README.md` (конспект) + картинки.
 
 ## Принцип работы — сначала очевидное (бритва Оккама)
