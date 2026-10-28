@@ -166,7 +166,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         Runtime::OpenInterest => Box::new(open_interest::OpenInterestIndicator::new()),
         Runtime::SpotCvd => Box::new(spot_cvd::SpotCvdIndicator::new()),
         Runtime::PeriodLevels => Box::new(period_levels::PeriodLevelsIndicator::new()),
-        Runtime::HtfVwap => Box::new(htf_vwap::HtfVwapIndicator::new()),
+        Runtime::Vwap => Box::new(htf_vwap::HtfVwapIndicator::new()),
         Runtime::Scripted(kind) => Box::new(scripted::ScriptedIndicator::new(kind)),
         Runtime::Overlay => Box::new(OverlayIndicator),
     }

@@ -967,7 +967,7 @@ impl KlineChartKind {
                         indicator,
                         KlineIndicator::NakedLevels
                             | KlineIndicator::PeriodLevels
-                            | KlineIndicator::HtfVwap
+                            | KlineIndicator::Vwap
                     )
             }
         }
@@ -1144,6 +1144,53 @@ impl Config {
 #[serde(default)]
 pub struct IndicatorConfigs {
     pub gex_levels: crate::chart::gex::GexLevelsConfig,
+    pub period_levels: PeriodLevelsConfig,
+    pub naked_levels: NakedLevelsConfig,
+}
+
+/// Previous day/week/month high-low levels.
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct PeriodLevelsConfig {
+    pub day: bool,
+    pub week: bool,
+    pub month: bool,
+    pub labels: bool,
+    /// Line opacity, 0.1–1.0.
+    pub opacity: f32,
+}
+
+impl Default for PeriodLevelsConfig {
+    fn default() -> Self {
+        Self {
+            day: true,
+            week: true,
+            month: true,
+            labels: true,
+            opacity: 0.4,
+        }
+    }
+}
+
+/// Naked (untested) session levels.
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct NakedLevelsConfig {
+    /// nPOC of the last daily sessions.
+    pub daily_poc: bool,
+    /// nPOC, nVAH and nVAL of the last weekly sessions.
+    pub weekly: bool,
+    pub labels: bool,
+}
+
+impl Default for NakedLevelsConfig {
+    fn default() -> Self {
+        Self {
+            daily_poc: true,
+            weekly: true,
+            labels: true,
+        }
+    }
 }
 
 /// Upstream CVD inputs. Legacy candle/reset fields are intentionally ignored.
@@ -1156,7 +1203,13 @@ pub struct CvdConfig {
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct VwapConfig {
+    /// Trade-based VWAP reset at `anchor`.
+    pub session: bool,
     pub anchor: SessionProfileInterval,
+    /// Developing weekly VWAP (from Monday UTC), from hourly candles.
+    pub weekly: bool,
+    /// Developing monthly VWAP, from hourly candles.
+    pub monthly: bool,
     pub line_width: f32,
     pub show_bands: bool,
     pub band_multiplier: f32,
@@ -1166,7 +1219,10 @@ pub struct VwapConfig {
 impl Default for VwapConfig {
     fn default() -> Self {
         Self {
+            session: true,
             anchor: SessionProfileInterval::Daily,
+            weekly: false,
+            monthly: false,
             line_width: 1.6,
             show_bands: true,
             band_multiplier: 1.0,

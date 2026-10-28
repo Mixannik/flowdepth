@@ -5,7 +5,10 @@
 //! candle's volume evenly over its range, so higher timeframes without trade history still
 //! get levels.
 
-use data::chart::{PlotData, kline::KlineDataPoint};
+use data::chart::{
+    PlotData,
+    kline::{KlineDataPoint, NakedLevelsConfig},
+};
 use exchange::unit::Price;
 use iced::{
     Alignment, Point, Size,
@@ -283,15 +286,24 @@ pub(super) fn draw(
     scaling: f32,
     align: impl Fn(u64, u64) -> u64 + Copy,
     palette: &Palette,
+    config: &NakedLevelsConfig,
 ) {
     let bars = collect_bars(source);
     let px = |p: f32| p / scaling;
     let label_size = px(10.0);
 
-    let weekly = naked_levels(&bars, SessionKind::Weekly, MAX_WEEKLY_SESSIONS, align);
-    let daily = naked_levels(&bars, SessionKind::Daily, MAX_DAILY_SESSIONS, align)
-        .into_iter()
-        .filter(|level| level.kind == LevelKind::Poc);
+    let weekly = if config.weekly {
+        naked_levels(&bars, SessionKind::Weekly, MAX_WEEKLY_SESSIONS, align)
+    } else {
+        Vec::new()
+    };
+    let daily = if config.daily_poc {
+        naked_levels(&bars, SessionKind::Daily, MAX_DAILY_SESSIONS, align)
+    } else {
+        Vec::new()
+    }
+    .into_iter()
+    .filter(|level| level.kind == LevelKind::Poc);
 
     let mut labels = Vec::new();
     for level in weekly.into_iter().chain(daily) {
@@ -328,6 +340,9 @@ pub(super) fn draw(
         });
     }
 
+    if !config.labels {
+        return;
+    }
     for label in merge_labels(labels, label_size * 1.4) {
         let color = if label.is_poc {
             palette.warning.strong.color

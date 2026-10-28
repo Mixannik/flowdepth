@@ -770,7 +770,7 @@ impl KlineChart {
                 let target_to = kline_latest.saturating_add(timeframe_ms).min(now);
                 let historical_trade_to =
                     historical_trade_target_to(kline_latest, timeframe_ms, now);
-                let vwap_required_from = self.indicator_enabled(KlineIndicator::Vwap).then(|| {
+                let vwap_required_from = self.session_vwap_enabled().then(|| {
                     let anchor_ms = self.visual_config.vwap.anchor.milliseconds();
                     vwap_required_from(target_to, visible_earliest_ms, anchor_ms)
                 });
@@ -872,7 +872,7 @@ impl KlineChart {
                 // footprint and bubbles. Fetch in bounded chronological chunks
                 // so daily/weekly profiles never create one unbounded request.
                 let svp_enabled = self.indicator_enabled(KlineIndicator::SessionVolumeProfile);
-                let vwap_enabled = self.indicator_enabled(KlineIndicator::Vwap);
+                let vwap_enabled = self.session_vwap_enabled();
                 if matches!(self.kind, KlineChartKind::Candles)
                     && (svp_enabled || vwap_enabled)
                     && !self.fetching_trades.0
@@ -2255,6 +2255,11 @@ impl KlineChart {
         }
     }
 
+    /// The VWAP indicator's trade-based session line (week/month lines come from candles).
+    fn session_vwap_enabled(&self) -> bool {
+        self.indicator_enabled(KlineIndicator::Vwap) && self.visual_config.vwap.session
+    }
+
     /// Overlays that own fetched data (period levels, week/month VWAP).
     fn draw_data_overlays(
         &self,
@@ -2273,7 +2278,7 @@ impl KlineChart {
             scaling,
             text_color: palette.background.base.text,
         };
-        for kind in [KlineIndicator::PeriodLevels, KlineIndicator::HtfVwap] {
+        for kind in [KlineIndicator::PeriodLevels, KlineIndicator::Vwap] {
             if self.indicator_enabled(kind)
                 && let Some(indi) = self.indicators[kind].as_ref()
             {
@@ -2825,6 +2830,19 @@ impl canvas::Program<Message> for KlineChart {
                             chart.scaling,
                             align_session_start,
                             palette,
+                            &self.visual_config.indicator_configs.naked_levels,
+                        );
+                    }
+                    if self.session_vwap_enabled() {
+                        draw_vwap_overlay(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            &self.visual_config.vwap,
+                            palette,
                         );
                     }
                     self.draw_data_overlays(
@@ -2998,6 +3016,7 @@ impl canvas::Program<Message> for KlineChart {
                             chart.scaling,
                             align_session_start,
                             palette,
+                            &self.visual_config.indicator_configs.naked_levels,
                         );
                     }
                     self.draw_data_overlays(
@@ -3068,7 +3087,7 @@ impl canvas::Program<Message> for KlineChart {
                             );
                         }
                     }
-                    if self.indicator_enabled(KlineIndicator::Vwap) {
+                    if self.session_vwap_enabled() {
                         draw_vwap_overlay(
                             &self.data_source,
                             frame,

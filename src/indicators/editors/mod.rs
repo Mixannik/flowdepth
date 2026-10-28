@@ -2,6 +2,7 @@
 mod bubbles;
 mod cvd;
 mod gex;
+mod levels;
 mod scripted;
 mod session_profile;
 mod tpo;
@@ -32,6 +33,8 @@ pub(super) fn view<'a>(
         Editor::None => text("This indicator has no additional settings.")
             .size(12)
             .into(),
+        Editor::PeriodLevels => levels::period_levels(pane, cfg),
+        Editor::NakedLevels => levels::naked_levels(pane, cfg),
         Editor::Cvd => cvd::view(pane, cfg),
         Editor::Period(kind) => scripted::view(pane, cfg, kind),
         Editor::Macd => scripted::view(pane, cfg, ScriptKind::Macd),

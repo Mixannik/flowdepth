@@ -38,13 +38,15 @@ pub enum Runtime {
     SpotCvd,
     /// Price-chart overlays that own fetched data.
     PeriodLevels,
-    HtfVwap,
+    Vwap,
     Scripted(ScriptKind),
     Overlay,
 }
 #[derive(Debug, Clone, Copy)]
 pub enum Editor {
     None,
+    PeriodLevels,
+    NakedLevels,
     Cvd,
     Period(ScriptKind),
     Macd,
@@ -77,7 +79,7 @@ macro_rules! define {
             editor: $editor,
             placement: if matches!(
                 $runtime,
-                Runtime::Overlay | Runtime::PeriodLevels | Runtime::HtfVwap
+                Runtime::Overlay | Runtime::PeriodLevels | Runtime::Vwap
             ) {
                 IndicatorPlacement::Overlay
             } else {
@@ -144,10 +146,10 @@ pub const DEFINITIONS: &[Definition] = &[
     define!(
         Vwap,
         "VWAP",
-        "Volume weighted average price with session anchors and optional deviation bands.",
+        "Volume weighted average price: session VWAP from trades, plus developing weekly and monthly VWAP from hourly candles; each line can be switched on separately, with optional deviation bands.",
         Profiles,
         Trend,
-        Runtime::Overlay,
+        Runtime::Vwap,
         Editor::Vwap
     ),
     define!(
@@ -211,7 +213,7 @@ pub const DEFINITIONS: &[Definition] = &[
         Profiles,
         Levels,
         Runtime::Overlay,
-        Editor::None
+        Editor::NakedLevels
     ),
     define!(
         SpotCvd,
@@ -229,16 +231,7 @@ pub const DEFINITIONS: &[Definition] = &[
         Profiles,
         Levels,
         Runtime::PeriodLevels,
-        Editor::None
-    ),
-    define!(
-        HtfVwap,
-        "VWAP week + month",
-        "Developing weekly (from Monday UTC) and monthly VWAP from hourly candles (typical price × volume), so they work on any timeframe without a month of trades.",
-        Profiles,
-        Trend,
-        Runtime::HtfVwap,
-        Editor::None
+        Editor::PeriodLevels
     ),
 ];
 

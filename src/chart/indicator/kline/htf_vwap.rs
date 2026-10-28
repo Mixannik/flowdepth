@@ -1,6 +1,8 @@
-//! Developing weekly (from Monday 00:00 UTC) and monthly VWAP. Built from the chart market's
-//! hourly candles with the typical price (H+L+C)/3, fetched separately, so both lines exist on
-//! any timeframe without a month of trades. Within a few dollars of the trade-based VWAP.
+//! Runtime of the VWAP indicator. The session VWAP (from trades) is drawn by `KlineChart`;
+//! this part adds the developing weekly (from Monday 00:00 UTC) and monthly VWAP, built from
+//! the chart market's hourly candles with the typical price (H+L+C)/3 and fetched separately,
+//! so both lines exist on any timeframe without a month of trades. Within a few dollars of
+//! the trade-based VWAP.
 use super::period_levels::{month_starts, week_start};
 use crate::chart::{
     Basis, Message, ViewState,
@@ -10,9 +12,10 @@ use crate::chart::{
 };
 use crate::connector::fetcher::FetchRange;
 
+use data::chart::kline::VwapConfig;
 use exchange::unit::Price;
 use exchange::{Kline, Timeframe, UnixMs};
-use iced::widget::canvas::{self, Frame, Stroke};
+use iced::widget::canvas::{self, Frame, LineDash, Stroke};
 use iced::{Alignment, Point};
 use std::collections::BTreeMap;
 
@@ -25,37 +28,53 @@ const MONTH_COLOR: iced::Color = iced::Color::from_rgba(0.92, 0.66, 0.38, 0.75);
 pub struct HtfVwapIndicator {
     /// Hourly candle open time → (typical price, volume).
     hourly: BTreeMap<u64, (f64, f64)>,
+    config: VwapConfig,
 }
 
 impl HtfVwapIndicator {
     pub fn new() -> Self {
         Self {
             hourly: BTreeMap::new(),
+            config: VwapConfig::default(),
         }
     }
 }
 
-/// VWAP points (candle open time, value), one run per anchor period.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct VwapPoint {
+    time: u64,
+    value: f64,
+    /// Volume-weighted standard deviation of price around the VWAP.
+    sigma: f64,
+}
+
+/// VWAP points, one run per anchor period.
 fn sessions(
     hourly: &BTreeMap<u64, (f64, f64)>,
     anchor: impl Fn(u64) -> u64,
-) -> Vec<Vec<(u64, f64)>> {
-    let mut runs: Vec<Vec<(u64, f64)>> = Vec::new();
+) -> Vec<Vec<VwapPoint>> {
+    let mut runs: Vec<Vec<VwapPoint>> = Vec::new();
     let mut current = None;
-    let (mut pv, mut v) = (0.0, 0.0);
+    let (mut pv, mut p2v, mut v) = (0.0, 0.0, 0.0);
     for (&time, &(price, volume)) in hourly {
         let start = anchor(time);
         if current != Some(start) {
             current = Some(start);
-            (pv, v) = (0.0, 0.0);
+            (pv, p2v, v) = (0.0, 0.0, 0.0);
             runs.push(Vec::new());
         }
         pv += price * volume;
+        p2v += price * price * volume;
         v += volume;
         if v > 0.0
             && let Some(run) = runs.last_mut()
         {
-            run.push((time, pv / v));
+            let value = pv / v;
+            run.push(VwapPoint {
+                time,
+                value,
+                sigma: (p2v / v - value * value).max(0.0).sqrt(),
+            });
         }
     }
     runs.retain(|run| !run.is_empty());
@@ -73,7 +92,7 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
         _data_labels_always_visible: bool,
         _visible_range: std::ops::RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
-        unreachable!("week/month VWAP renders on the main chart canvas")
+        unreachable!("VWAP renders on the main chart canvas")
     }
 
     fn availability(&self, chart: &ViewState) -> IndicatorAvailability {
@@ -85,7 +104,14 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
         }
     }
 
+    fn on_config_changed(&mut self, config: &data::chart::kline::Config) {
+        self.config = config.vwap;
+    }
+
     fn fetch_range(&mut self, _ctx: &FetchCtx) -> Option<FetchRange> {
+        if !self.config.weekly && !self.config.monthly {
+            return None;
+        }
         let now = chrono::Utc::now().timestamp_millis() as u64;
         let from = self
             .hourly
@@ -111,38 +137,61 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
     }
 
     fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
+        let cfg = self.config;
         let label_size = 10.0 / ctx.scaling;
-        let anchors: [(fn(u64) -> u64, iced::Color, &str); 2] = [
-            (week_start, WEEK_COLOR, "W VWAP"),
-            (|t| month_starts(t).0, MONTH_COLOR, "M VWAP"),
+        let width = cfg.line_width.clamp(0.5, 5.0) / ctx.scaling;
+        let multiplier = f64::from(cfg.band_multiplier.max(0.0));
+        let anchors: [(bool, fn(u64) -> u64, iced::Color, &str); 2] = [
+            (cfg.weekly, week_start, WEEK_COLOR, "W VWAP"),
+            (cfg.monthly, |t| month_starts(t).0, MONTH_COLOR, "M VWAP"),
         ];
-        for (anchor, color, name) in anchors {
+        for (enabled, anchor, color, name) in anchors {
+            if !enabled {
+                continue;
+            }
             let runs = sessions(&self.hourly, anchor);
             let last_run = runs.len().saturating_sub(1);
             for (i, run) in runs.iter().enumerate() {
-                let mut path = canvas::path::Builder::new();
-                for (j, &(time, value)) in run.iter().enumerate() {
-                    let point = Point::new((ctx.x)(time), (ctx.y)(Price::from_f64(value)));
-                    if j == 0 {
-                        path.move_to(point);
-                    } else {
-                        path.line_to(point);
+                let stroke_line = |frame: &mut Frame, offset: f64, stroke: Stroke| {
+                    let mut path = canvas::path::Builder::new();
+                    for (j, p) in run.iter().enumerate() {
+                        let price = Price::from_f64(p.value + offset * p.sigma * multiplier);
+                        let point = Point::new((ctx.x)(p.time), (ctx.y)(price));
+                        if j == 0 {
+                            path.move_to(point);
+                        } else {
+                            path.line_to(point);
+                        }
                     }
-                }
-                frame.stroke(
-                    &path.build(),
-                    Stroke::default()
-                        .with_color(color)
-                        .with_width(1.4 / ctx.scaling),
+                    frame.stroke(&path.build(), stroke);
+                };
+                stroke_line(
+                    frame,
+                    0.0,
+                    Stroke::default().with_color(color).with_width(width),
                 );
-                if i == last_run
-                    && let Some(&(time, value)) = run.last()
+                if cfg.show_bands {
+                    let band = Stroke {
+                        line_dash: LineDash {
+                            segments: &[4.0, 4.0],
+                            offset: 0,
+                        },
+                        ..Stroke::default()
+                            .with_color(color.scale_alpha(0.5))
+                            .with_width(1.0 / ctx.scaling)
+                    };
+                    stroke_line(frame, 1.0, band);
+                    stroke_line(frame, -1.0, band);
+                }
+                if cfg.show_labels
+                    && i == last_run
+                    && let Some(p) = run.last()
                 {
                     frame.fill_text(canvas::Text {
-                        content: format!("{name} {value:.0}"),
+                        content: format!("{name} {:.0}", p.value),
                         position: Point::new(
-                            (ctx.x)(time) + label_size * 0.5,
-                            (ctx.y)(Price::from_f64(value)),
+                            (ctx.x)(p.time) + label_size * 0.5,
+                            (ctx.y)(Price::from_f64(p.value)),
                         ),
                         size: iced::Pixels(label_size),
                         color,
@@ -171,7 +220,11 @@ mod tests {
         hourly.insert(10 * HOUR, (200.0, 2.0));
         let runs = sessions(&hourly, |t| t / (10 * HOUR) * (10 * HOUR));
         assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0], vec![(0, 100.0), (HOUR, 107.5)]);
-        assert_eq!(runs[1], vec![(10 * HOUR, 200.0)]);
+        let values: Vec<_> = runs[0].iter().map(|p| (p.time, p.value)).collect();
+        assert_eq!(values, vec![(0, 100.0), (HOUR, 107.5)]);
+        // sqrt((1·100² + 3·110²)/4 − 107.5²) = sqrt(18.75)
+        assert!((runs[0][1].sigma - 18.75_f64.sqrt()).abs() < 1e-9);
+        assert_eq!(runs[1][0].value, 200.0);
+        assert_eq!(runs[1][0].sigma, 0.0);
     }
 }

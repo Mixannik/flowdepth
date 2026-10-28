@@ -10,6 +10,7 @@ use crate::chart::{
 use crate::connector::fetcher::FetchRange;
 
 use chrono::{Datelike, TimeZone, Utc};
+use data::chart::kline::PeriodLevelsConfig;
 use exchange::unit::Price;
 use exchange::{Kline, Timeframe, UnixMs};
 use iced::widget::canvas::{self, Frame, LineDash, Path, Stroke};
@@ -120,12 +121,14 @@ pub fn compute(daily: &BTreeMap<u64, (f64, f64)>, now: u64) -> Vec<Level> {
 pub struct PeriodLevelsIndicator {
     /// Daily candle open time → (high, low).
     daily: BTreeMap<u64, (f64, f64)>,
+    config: PeriodLevelsConfig,
 }
 
 impl PeriodLevelsIndicator {
     pub fn new() -> Self {
         Self {
             daily: BTreeMap::new(),
+            config: PeriodLevelsConfig::default(),
         }
     }
 }
@@ -183,9 +186,21 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
         );
     }
 
+    fn on_config_changed(&mut self, config: &data::chart::kline::Config) {
+        self.config = config.indicator_configs.period_levels;
+    }
+
     fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
-        let levels = compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64);
-        draw(&levels, frame, ctx);
+        let cfg = self.config;
+        let levels: Vec<_> = compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64)
+            .into_iter()
+            .filter(|level| match level.period {
+                Period::Day => cfg.day,
+                Period::Week => cfg.week,
+                Period::Month => cfg.month,
+            })
+            .collect();
+        draw(&levels, frame, ctx, &cfg);
     }
 }
 
@@ -195,7 +210,8 @@ const MONTH_COLOR: iced::Color = iced::Color::from_rgb(0.86, 0.56, 0.70);
 
 /// Draws each level from the start of the current period to `right_x`, labelled at its
 /// left end so the labels stay clear of the right-edge naked-level labels.
-fn draw(levels: &[Level], frame: &mut Frame, ctx: &OverlayCtx) {
+fn draw(levels: &[Level], frame: &mut Frame, ctx: &OverlayCtx, cfg: &PeriodLevelsConfig) {
+    let opacity = cfg.opacity.clamp(0.1, 1.0);
     let OverlayCtx {
         x,
         y,
@@ -214,9 +230,9 @@ fn draw(levels: &[Level], frame: &mut Frame, ctx: &OverlayCtx) {
         let line_y = y(Price::from_f64(level.price));
         // Background references: thin, dashed and faint so candles and zones stay on top.
         let (color, dash): (_, &'static [f32]) = match level.period {
-            Period::Day => (text_color.scale_alpha(0.28), &[3.0, 4.0]),
-            Period::Week => (WEEK_COLOR.scale_alpha(0.38), &[6.0, 4.0]),
-            Period::Month => (MONTH_COLOR.scale_alpha(0.38), &[10.0, 4.0]),
+            Period::Day => (text_color.scale_alpha(opacity * 0.75), &[3.0, 4.0]),
+            Period::Week => (WEEK_COLOR.scale_alpha(opacity), &[6.0, 4.0]),
+            Period::Month => (MONTH_COLOR.scale_alpha(opacity), &[10.0, 4.0]),
         };
         let stroke = Stroke {
             line_dash: LineDash {
@@ -229,6 +245,9 @@ fn draw(levels: &[Level], frame: &mut Frame, ctx: &OverlayCtx) {
             &Path::line(Point::new(start, line_y), Point::new(right_x, line_y)),
             stroke,
         );
+        if !cfg.labels {
+            continue;
+        }
         frame.fill_text(canvas::Text {
             content: format!("{} {:.0}", level.name(), level.price),
             position: Point::new(start + label_size * 0.4, line_y - label_size * 0.15),
