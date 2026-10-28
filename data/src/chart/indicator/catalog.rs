@@ -218,7 +218,7 @@ pub const DEFINITIONS: &[Definition] = &[
     define!(
         SpotCvd,
         "CVD Futures + Spot",
-        "This perpetual's CVD together with the same pair's Binance spot CVD, each normalized to the visible range (as on Coinglass). Shows whether spot or futures drives the move. Replaces the plain CVD panel.",
+        "Binance perpetual and spot CVD of the pair in one panel, each normalized to the visible range (as on Coinglass); works on both the perp and the spot chart. Shows whether spot or futures drives the move. Replaces the plain CVD panel.",
         OrderFlow,
         Delta,
         Runtime::SpotCvd,
@@ -233,11 +233,20 @@ pub const DEFINITIONS: &[Definition] = &[
         Runtime::PeriodLevels,
         Editor::PeriodLevels
     ),
+    define!(
+        OiBars,
+        "OI + delta bars",
+        "Strip under footprint candles classifying each bar by open-interest change and delta: new longs, new shorts, short covering, long liquidation. Needs the Open Interest indicator.",
+        OrderFlow,
+        Bars,
+        Runtime::Overlay,
+        Editor::None
+    ),
 ];
 
 /// Indicators that need a perpetual chart.
 fn perps_only(kind: KlineIndicator) -> bool {
-    matches!(kind, KlineIndicator::OpenInterest | KlineIndicator::SpotCvd)
+    matches!(kind, KlineIndicator::OpenInterest | KlineIndicator::OiBars)
 }
 
 pub fn definition(kind: KlineIndicator) -> &'static Definition {
@@ -289,7 +298,7 @@ mod tests {
         let expected: Vec<_> = for_market(MarketKind::LinearPerps)
             .iter()
             .copied()
-            .filter(|kind| !matches!(kind, KlineIndicator::OpenInterest | KlineIndicator::SpotCvd))
+            .filter(|kind| !matches!(kind, KlineIndicator::OpenInterest | KlineIndicator::OiBars))
             .collect();
         assert_eq!(for_market(MarketKind::Spot), expected);
         assert_eq!(

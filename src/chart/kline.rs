@@ -3019,7 +3019,6 @@ impl canvas::Program<Message> for KlineChart {
                             exhaustion,
                             stacked,
                             unfinished,
-                            oi_bars,
                             near_levels,
                         } => Some((
                             signals::Enabled {
@@ -3031,12 +3030,11 @@ impl canvas::Program<Message> for KlineChart {
                                 stacked: *stacked,
                                 unfinished: *unfinished,
                             },
-                            *oi_bars,
                             *near_levels,
                         )),
                         _ => None,
                     });
-                    if let Some((_, _, true, _)) = signals
+                    if self.indicator_enabled(KlineIndicator::OiBars)
                         && let Some(oi) = self.indicators[KlineIndicator::OpenInterest]
                             .as_ref()
                             .and_then(|indi| indi.open_interest())
@@ -3054,7 +3052,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((_, zones_enabled, _, _)) = signals {
+                    if let Some((_, zones_enabled, _)) = signals {
                         // Stacks follow the Imbalance study's ratio when it is on.
                         let (threshold, _, ignore_zeros) = imbalance.unwrap_or((200, None, true));
                         zones::draw(
@@ -3075,7 +3073,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((enabled, _, _, near_levels)) = signals {
+                    if let Some((enabled, _, near_levels)) = signals {
                         let reference_levels = near_levels.then(|| self.reference_level_prices());
                         // Mirrors the summary block placement in `draw_clusters`.
                         let below_offset = if show_summary {
