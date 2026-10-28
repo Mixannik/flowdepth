@@ -243,7 +243,21 @@ thread_local! {
         Default::default();
 }
 
-fn bin_rows(dp: &KlineDataPoint, step: i64) -> Vec<Row> {
+/// Fixed analysis step (price units) for the series: from its recent candle ranges, so it does
+/// not follow the zoom-dependent footprint row size.
+pub(super) fn series_step(series: &data::aggr::time::TimeSeries<KlineDataPoint>) -> i64 {
+    analysis_step(
+        series
+            .datapoints
+            .values()
+            .rev()
+            .take(300)
+            .map(|dp| dp.kline.high.units - dp.kline.low.units)
+            .collect(),
+    )
+}
+
+pub(super) fn bin_rows(dp: &KlineDataPoint, step: i64) -> Vec<Row> {
     let mut by_index: rustc_hash::FxHashMap<i64, (f64, f64)> = Default::default();
     for trade in &dp.trade_sequence {
         // Nearest row, ties up, like the footprint's own binning.
@@ -268,15 +282,7 @@ fn collect_bars(source: &PlotData<KlineDataPoint>, with_ticks: bool) -> (i64, Ve
     let PlotData::TimeBased(series) = source else {
         return (1, Vec::new());
     };
-    let step = analysis_step(
-        series
-            .datapoints
-            .values()
-            .rev()
-            .take(300)
-            .map(|dp| dp.kline.high.units - dp.kline.low.units)
-            .collect(),
-    );
+    let step = series_step(series);
     let key = std::ptr::from_ref(series) as usize;
 
     let bars = CACHE.with_borrow_mut(|cache| {

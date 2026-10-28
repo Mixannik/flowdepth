@@ -250,26 +250,42 @@ pub(super) fn detect(bars: &[Bar], enabled: Enabled) -> Vec<Signal> {
 
 /// Converts the time-based footprint datapoints in `start..=end` (ms) into bars, oldest first,
 /// returning each bar's timestamp alongside.
+///
+/// Levels come from the bar's trades binned at the fixed analysis step shared with the zones,
+/// not from the on-screen footprint rows: auto row size changes those with zoom, and the
+/// top/bottom shares (and so the signals) must not change with it.
 fn collect_bars(source: &PlotData<KlineDataPoint>, start: u64, end: u64) -> Vec<(u64, Bar)> {
     let PlotData::TimeBased(series) = source else {
         return Vec::new();
     };
+    let step = super::zones::series_step(series);
 
     series
         .datapoints
         .iter()
         .filter(|(time, _)| (start..=end).contains(&time.as_u64()))
         .map(|(time, dp)| {
-            let mut levels: Vec<Level> = dp
-                .footprint
-                .trades
-                .iter()
-                .map(|(price, group)| Level {
-                    price: price.to_f64(),
-                    buy: group.buy_qty.to_f64(),
-                    sell: group.sell_qty.to_f64(),
-                })
-                .collect();
+            let mut levels: Vec<Level> = if dp.trade_sequence.is_empty() {
+                // No trade sequence (e.g. history from an aggregated cache): footprint rows.
+                dp.footprint
+                    .trades
+                    .iter()
+                    .map(|(price, group)| Level {
+                        price: price.to_f64(),
+                        buy: group.buy_qty.to_f64(),
+                        sell: group.sell_qty.to_f64(),
+                    })
+                    .collect()
+            } else {
+                super::zones::bin_rows(dp, step)
+                    .into_iter()
+                    .map(|row| Level {
+                        price: Price::from_units(row.index * step).to_f64(),
+                        buy: row.buy,
+                        sell: row.sell,
+                    })
+                    .collect()
+            };
             levels.sort_by(|a, b| a.price.total_cmp(&b.price));
             (
                 time.as_u64(),
