@@ -1691,7 +1691,7 @@ impl Dashboard {
                 FetchedData::BubbleSummary { req_id, .. } => *req_id,
                 FetchedData::Klines { req_id, .. } => *req_id,
                 FetchedData::OI { req_id, .. } => *req_id,
-                FetchedData::SpotKlines { req_id, .. } => *req_id,
+                FetchedData::RefKlines { req_id, .. } => *req_id,
             };
 
             if let Some(req_id) = req_id
@@ -1840,16 +1840,16 @@ impl Dashboard {
                     }
                 }
             }
-            FetchedData::SpotKlines { data, req_id } => {
+            FetchedData::RefKlines { data, spot, req_id } => {
                 log::debug!(
-                    "DATA SpotKlines Distribute | pane={} req={} count={}",
+                    "DATA RefKlines Distribute | pane={} req={} spot={spot} count={}",
                     fetcher::short_id(pane_id),
                     fetcher::format_req_id(req_id),
                     data.len()
                 );
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
-                    pane_state.insert_spot_klines(req_id, &data);
+                    pane_state.insert_ref_klines(req_id, spot, &data);
                 }
             }
         }
@@ -2011,9 +2011,9 @@ impl Dashboard {
                             data.len()
                         )
                     }
-                    FetchedData::SpotKlines { data, req_id } => {
+                    FetchedData::RefKlines { data, req_id, .. } => {
                         format!(
-                            "SpotKlines:req={}:count={}",
+                            "RefKlines:req={}:count={}",
                             fetcher::format_req_id(*req_id),
                             data.len()
                         )
@@ -2146,7 +2146,7 @@ impl Dashboard {
                 (from, to)
             }
             fetcher::FetchRange::OpenInterest { from, to, .. }
-            | fetcher::FetchRange::SpotKlines { from, to, .. } => (from, to),
+            | fetcher::FetchRange::RefKlines { from, to, .. } => (from, to),
             fetcher::FetchRange::BubbleSummary { from, to, .. } => (from, to),
         };
 
@@ -3404,7 +3404,7 @@ fn data_summary_type(data: &FetchedData) -> &'static str {
         FetchedData::BubbleSummary { .. } => "BubbleSummary",
         FetchedData::Klines { .. } => "Klines",
         FetchedData::OI { .. } => "OI",
-        FetchedData::SpotKlines { .. } => "SpotKlines",
+        FetchedData::RefKlines { .. } => "RefKlines",
     }
 }
 

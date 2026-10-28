@@ -36,6 +36,8 @@ pub enum Runtime {
     BarAnalysis,
     OpenInterest,
     SpotCvd,
+    /// Price-chart overlay that owns fetched data.
+    PeriodLevels,
     Scripted(ScriptKind),
     Overlay,
 }
@@ -72,7 +74,7 @@ macro_rules! define {
             icon: Icon::$icon,
             runtime: $runtime,
             editor: $editor,
-            placement: if matches!($runtime, Runtime::Overlay) {
+            placement: if matches!($runtime, Runtime::Overlay | Runtime::PeriodLevels) {
                 IndicatorPlacement::Overlay
             } else {
                 IndicatorPlacement::Panel
@@ -214,6 +216,15 @@ pub const DEFINITIONS: &[Definition] = &[
         OrderFlow,
         Delta,
         Runtime::SpotCvd,
+        Editor::None
+    ),
+    define!(
+        PeriodLevels,
+        "Previous day / week / month levels",
+        "PDH/PDL, PWH/PWL and PMH/PML: highs and lows of the previous UTC day, week (from Monday) and month, from daily candles, drawn through the current period.",
+        Profiles,
+        Levels,
+        Runtime::PeriodLevels,
         Editor::None
     ),
 ];

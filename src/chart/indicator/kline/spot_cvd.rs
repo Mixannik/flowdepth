@@ -214,28 +214,31 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         let (Some((&spot_first, _)), Some((&spot_last, _))) =
             (self.spot.first_key_value(), self.spot.last_key_value())
         else {
-            return Some(FetchRange::SpotKlines {
+            return Some(FetchRange::RefKlines {
                 from: ctx.prefetch_earliest,
                 to: ctx.kline_latest,
                 timeframe,
+                spot: true,
             });
         };
 
         if ctx.visible_earliest < spot_first {
-            return Some(FetchRange::SpotKlines {
+            return Some(FetchRange::RefKlines {
                 from: ctx.prefetch_earliest,
                 to: spot_first.saturating_sub(1),
                 timeframe,
+                spot: true,
             });
         }
 
         // Re-read the forming bar; `to` moves in POLL_MS steps, so the request
         // handler's cooldown on identical ranges limits the polling rate.
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        Some(FetchRange::SpotKlines {
+        Some(FetchRange::RefKlines {
             from: spot_last,
             to: UnixMs::new(now - now % POLL_MS).max(spot_last.saturating_add(1)),
             timeframe,
+            spot: true,
         })
     }
 
@@ -265,7 +268,7 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         self.sync_perp(source, 0);
     }
 
-    fn on_spot_klines(&mut self, klines: &[Kline]) {
+    fn on_ref_klines(&mut self, klines: &[Kline]) {
         self.spot.extend(klines.iter().map(|k| {
             let delta = k
                 .volume

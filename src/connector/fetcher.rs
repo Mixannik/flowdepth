@@ -125,13 +125,14 @@ pub fn format_fetch_range(fetch: &FetchRange) -> String {
         } => {
             format!("OI {} source={timeframe}", format_time_range(*from, *to))
         }
-        FetchRange::SpotKlines {
+        FetchRange::RefKlines {
             from,
             to,
             timeframe,
+            spot,
         } => {
             format!(
-                "SpotKlines {} tf={timeframe}",
+                "RefKlines {} tf={timeframe} spot={spot}",
                 format_time_range(*from, *to)
             )
         }
@@ -309,9 +310,11 @@ pub enum FetchedData {
         data: Vec<OpenInterest>,
         req_id: Option<uuid::Uuid>,
     },
-    /// Klines of the spot counterpart of a perpetual chart (Spot vs Perp CVD).
-    SpotKlines {
+    /// Reference klines for indicators: the spot counterpart of a perpetual
+    /// (CVD Futures + Spot) or the chart's own market at another timeframe (period levels).
+    RefKlines {
         data: Vec<Kline>,
+        spot: bool,
         req_id: Option<uuid::Uuid>,
     },
 }
@@ -1064,10 +1067,13 @@ pub enum FetchRange {
         to: UnixMs,
         timeframe: Timeframe,
     },
-    SpotKlines {
+    /// Klines for an indicator; `spot` selects the spot counterpart instead of the
+    /// chart's own market.
+    RefKlines {
         from: UnixMs,
         to: UnixMs,
         timeframe: Timeframe,
+        spot: bool,
     },
     Trades(UnixMs, UnixMs),
     BubbleSummary {
@@ -1085,7 +1091,7 @@ impl FetchRange {
     fn is_valid(&self) -> bool {
         match *self {
             FetchRange::Kline(from, to) | FetchRange::Trades(from, to) => from < to,
-            FetchRange::OpenInterest { from, to, .. } | FetchRange::SpotKlines { from, to, .. } => {
+            FetchRange::OpenInterest { from, to, .. } | FetchRange::RefKlines { from, to, .. } => {
                 from < to
             }
             FetchRange::BubbleSummary { from, to, .. } => from < to,
@@ -1131,17 +1137,19 @@ impl FetchRequest {
                 },
             ) => e1 == e2 && s1 == s2 && t1 == t2,
             (
-                FetchRange::SpotKlines {
+                FetchRange::RefKlines {
                     from: s1,
                     to: e1,
                     timeframe: t1,
+                    spot: m1,
                 },
-                FetchRange::SpotKlines {
+                FetchRange::RefKlines {
                     from: s2,
                     to: e2,
                     timeframe: t2,
+                    spot: m2,
                 },
-            ) => e1 == e2 && s1 == s2 && t1 == t2,
+            ) => e1 == e2 && s1 == s2 && t1 == t2 && m1 == m2,
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
             (
                 FetchRange::BubbleSummary {
@@ -1412,24 +1420,30 @@ pub fn request_fetch(
                 format_streams(ready_streams)
             );
         }
-        FetchRange::SpotKlines {
+        FetchRange::RefKlines {
             from,
             to,
             timeframe,
+            spot,
         } => {
-            let perp_stream = stream
+            let chart_stream = stream
                 .into_iter()
                 .chain(ready_streams.iter().copied())
                 .find(|stream| matches!(stream, StreamKind::Kline { .. }));
 
-            if let Some(perp_stream @ StreamKind::Kline { ticker_info, .. }) = perp_stream
-                && let Some(spot) = spot_counterpart(ticker_info)
+            if let Some(chart_stream @ StreamKind::Kline { ticker_info, .. }) = chart_stream
+                && let Some(source) = if spot {
+                    spot_counterpart(ticker_info)
+                } else {
+                    Some(ticker_info)
+                }
             {
-                return spot_klines_fetch_task(
+                return ref_klines_fetch_task(
                     handles.clone(),
                     layout_id,
                     pane_id,
-                    perp_stream,
+                    chart_stream,
+                    source,
                     spot,
                     timeframe,
                     req_id,
@@ -1438,7 +1452,7 @@ pub fn request_fetch(
             }
 
             log::warn!(
-                "SPOT Skip | pane={} req={} reason=no_spot_counterpart ready_streams={}",
+                "REFKLINES Skip | pane={} req={} reason=no_source ready_streams={}",
                 short_id(pane_id),
                 short_id(req_id),
                 format_streams(ready_streams)
@@ -2177,16 +2191,17 @@ pub fn spot_counterpart(perp: TickerInfo) -> Option<TickerInfo> {
     ))
 }
 
-/// Upper bound of kline pages per spot request (1000 bars each).
-const SPOT_KLINE_MAX_PAGES: usize = 30;
+/// Upper bound of kline pages per reference request (1000 bars each).
+const REF_KLINE_MAX_PAGES: usize = 30;
 
 #[allow(clippy::too_many_arguments)]
-fn spot_klines_fetch_task(
+fn ref_klines_fetch_task(
     handles: AdapterHandles,
     layout_id: Uuid,
     pane_id: Uuid,
-    perp_stream: StreamKind,
-    spot: TickerInfo,
+    chart_stream: StreamKind,
+    source: TickerInfo,
+    spot: bool,
     timeframe: Timeframe,
     req_id: Uuid,
     (from, to): (UnixMs, UnixMs),
@@ -2196,12 +2211,12 @@ fn spot_klines_fetch_task(
         let end = to.saturating_add(1);
         let mut cursor = from;
         let mut klines = Vec::new();
-        for _ in 0..SPOT_KLINE_MAX_PAGES {
+        for _ in 0..REF_KLINE_MAX_PAGES {
             if cursor >= end {
                 break;
             }
             let page = handles
-                .fetch_klines_page(spot, timeframe, cursor, end)
+                .fetch_klines_page(source, timeframe, cursor, end)
                 .await?;
             klines.extend(page.data);
             if page.next_from <= cursor {
@@ -2210,10 +2225,11 @@ fn spot_klines_fetch_task(
             cursor = page.next_from;
         }
         log::info!(
-            "SPOT Done | pane={} req={} symbol={} tf={timeframe} range={} bars={} duration={}",
+            "REFKLINES Done | pane={} req={} venue={} symbol={} tf={timeframe} range={} bars={} duration={}",
             short_id(pane_id),
             short_id(req_id),
-            format_symbol(&spot),
+            format_venue(&source),
+            format_symbol(&source),
             format_time_range(from, to),
             klines.len(),
             format_duration_ms(started.elapsed().as_millis() as u64)
@@ -2227,20 +2243,22 @@ fn spot_klines_fetch_task(
             Ok(data) => FetchUpdate::Data {
                 layout_id,
                 pane_id,
-                data: FetchedData::SpotKlines {
+                data: FetchedData::RefKlines {
                     data,
+                    spot,
                     req_id: Some(req_id),
                 },
-                stream: perp_stream,
+                stream: chart_stream,
             },
             Err(error) => FetchUpdate::Error {
                 pane_id,
                 error,
                 req_id: Some(req_id),
-                fetch: Some(FetchRange::SpotKlines {
+                fetch: Some(FetchRange::RefKlines {
                     from,
                     to,
                     timeframe,
+                    spot,
                 }),
             },
         },

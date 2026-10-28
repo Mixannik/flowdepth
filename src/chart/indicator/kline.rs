@@ -11,6 +11,7 @@ use super::plot::AnySeries;
 
 pub mod bar_analysis;
 pub mod open_interest;
+pub mod period_levels;
 pub mod scripted;
 pub mod spot_cvd;
 pub mod volume;
@@ -125,8 +126,13 @@ pub trait KlineIndicatorImpl {
 
     fn on_open_interest(&mut self, _pairs: &[exchange::OpenInterest]) {}
 
-    /// Klines of the spot counterpart (Spot vs Perp CVD).
-    fn on_spot_klines(&mut self, _klines: &[Kline]) {}
+    /// Reference klines requested through `FetchRange::RefKlines`.
+    fn on_ref_klines(&mut self, _klines: &[Kline]) {}
+
+    /// Previous day/week/month highs and lows, for indicators that hold them.
+    fn period_levels(&self) -> Vec<period_levels::Level> {
+        Vec::new()
+    }
 
     /// Open interest samples by time, for indicators that hold them.
     fn open_interest(&self) -> Option<&std::collections::BTreeMap<UnixMs, f64>> {
@@ -149,6 +155,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         Runtime::BarAnalysis => Box::new(bar_analysis::BarAnalysisIndicator::new()),
         Runtime::OpenInterest => Box::new(open_interest::OpenInterestIndicator::new()),
         Runtime::SpotCvd => Box::new(spot_cvd::SpotCvdIndicator::new()),
+        Runtime::PeriodLevels => Box::new(period_levels::PeriodLevelsIndicator::new()),
         Runtime::Scripted(kind) => Box::new(scripted::ScriptedIndicator::new(kind)),
         Runtime::Overlay => Box::new(OverlayIndicator),
     }

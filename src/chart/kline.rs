@@ -2255,7 +2255,34 @@ impl KlineChart {
         }
     }
 
-    pub fn insert_spot_klines(&mut self, req_id: Option<uuid::Uuid>, klines: &[Kline]) {
+    fn draw_period_levels(
+        &self,
+        frame: &mut canvas::Frame,
+        region: iced::Rectangle,
+        scaling: f32,
+        palette: &iced::theme::Palette,
+        x: impl Fn(u64) -> f32,
+        y: impl Fn(Price) -> f32,
+    ) {
+        if !self.indicator_enabled(KlineIndicator::PeriodLevels) {
+            return;
+        }
+        let Some(indi) = self.indicators[KlineIndicator::PeriodLevels].as_ref() else {
+            return;
+        };
+        indicator::kline::period_levels::draw(
+            &indi.period_levels(),
+            frame,
+            x,
+            y,
+            region.x,
+            region.x + region.width,
+            scaling,
+            palette.background.base.text,
+        );
+    }
+
+    pub fn insert_ref_klines(&mut self, req_id: Option<uuid::Uuid>, spot: bool, klines: &[Kline]) {
         if let Some(req_id) = req_id {
             if klines.is_empty() {
                 self.request_handler.mark_no_data(req_id);
@@ -2264,8 +2291,13 @@ impl KlineChart {
             }
         }
 
-        if let Some(indi) = self.indicators[KlineIndicator::SpotCvd].as_mut() {
-            indi.on_spot_klines(klines);
+        let target = if spot {
+            KlineIndicator::SpotCvd
+        } else {
+            KlineIndicator::PeriodLevels
+        };
+        if let Some(indi) = self.indicators[target].as_mut() {
+            indi.on_ref_klines(klines);
         }
     }
 
@@ -2794,6 +2826,14 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
+                    self.draw_period_levels(
+                        frame,
+                        region,
+                        chart.scaling,
+                        palette,
+                        |t| interval_to_x(t),
+                        |p| price_to_y(p),
+                    );
 
                     render_data_source(
                         &self.data_source,
@@ -2959,6 +2999,14 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
+                    self.draw_period_levels(
+                        frame,
+                        region,
+                        chart.scaling,
+                        palette,
+                        |t| interval_to_x(t),
+                        |p| price_to_y(p),
+                    );
                     if self.indicator_enabled(KlineIndicator::Tpo) {
                         self::tpo::draw(
                             &self.data_source,

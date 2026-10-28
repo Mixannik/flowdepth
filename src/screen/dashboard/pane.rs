@@ -823,12 +823,12 @@ impl State {
         }
     }
 
-    pub fn insert_spot_klines(&mut self, req_id: Option<uuid::Uuid>, klines: &[Kline]) {
+    pub fn insert_ref_klines(&mut self, req_id: Option<uuid::Uuid>, spot: bool, klines: &[Kline]) {
         if let Content::Kline {
             chart: Some(chart), ..
         } = &mut self.content
         {
-            chart.insert_spot_klines(req_id, klines);
+            chart.insert_ref_klines(req_id, spot, klines);
         }
     }
 
@@ -2633,7 +2633,7 @@ impl State {
             | FetchedData::BubbleSummary { .. }
             | FetchedData::Klines { .. }
             | FetchedData::OI { .. }
-            | FetchedData::SpotKlines { .. } => {
+            | FetchedData::RefKlines { .. } => {
                 matches!(self.content, Content::Kline { chart: Some(_), .. })
             }
         }
@@ -2647,7 +2647,7 @@ impl State {
             | FetchRange::BubbleSummary { .. }
             | FetchRange::Kline(_, _)
             | FetchRange::OpenInterest { .. }
-            | FetchRange::SpotKlines { .. } => {
+            | FetchRange::RefKlines { .. } => {
                 matches!(self.content, Content::Kline { chart: Some(_), .. })
             }
         }
