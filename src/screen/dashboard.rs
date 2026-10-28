@@ -1250,7 +1250,8 @@ impl Dashboard {
             .collect()
     }
 
-    /// Hands every chart the profile levels drawn on other charts of its ticker.
+    /// Hands every chart the profile levels drawn on other charts of its symbol. Markets are
+    /// not told apart: spot BTCUSDT shows the levels drawn on the perp, prices are close enough.
     pub fn set_shared_range_levels(
         &mut self,
         main_window: window::Id,
@@ -1261,12 +1262,16 @@ impl Dashboard {
         )],
     ) {
         for (_, _, state) in self.iter_all_panes_mut(main_window) {
-            let (id, ticker) = (state.unique_id(), state.stream_pair().map(|t| t.ticker));
+            let id = state.unique_id();
+            let symbol = state
+                .stream_pair()
+                .map(|t| t.ticker.to_full_symbol_and_type().0);
             if let pane::Content::Kline { chart: Some(c), .. } = &mut state.content {
                 let shared = all
                     .iter()
                     .filter(|(source, source_ticker, _)| {
-                        *source != id && Some(*source_ticker) == ticker
+                        *source != id
+                            && symbol.as_ref() == Some(&source_ticker.to_full_symbol_and_type().0)
                     })
                     .flat_map(|(_, _, levels)| levels.iter().copied())
                     .collect();

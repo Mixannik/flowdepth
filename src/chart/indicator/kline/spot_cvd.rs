@@ -3,6 +3,9 @@
 //! first bar present in both series. Spot volume is several times smaller than perp
 //! volume, so each line is normalized to the visible span; the axis shows futures
 //! values, the legend and tooltip show both exactly.
+//!
+//! On a spot chart the roles swap: the chart's own bars are the spot line and the
+//! perpetual's klines are fetched as the reference (`market_counterpart`).
 use crate::chart::{
     Basis, Caches, Message, ViewState,
     indicator::{
@@ -11,7 +14,7 @@ use crate::chart::{
         plot::{AnySeries, Plot, PlotTooltip, Series, TooltipFn, YScale},
     },
 };
-use crate::connector::fetcher::{FetchRange, spot_counterpart};
+use crate::connector::fetcher::{FetchRange, market_counterpart};
 
 use data::chart::{PlotData, kline::KlineDataPoint};
 use data::util::format_with_commas;
@@ -28,22 +31,24 @@ const POLL_MS: u64 = 10_000;
 const FUTURES_COLOR: iced::Color = iced::Color::from_rgb(0.31, 0.56, 0.97);
 const SPOT_COLOR: iced::Color = iced::Color::from_rgb(0.97, 0.62, 0.25);
 
-/// Cumulative values at one bar.
+/// Cumulative values at one bar: `own` is the chart's market, `other` the reference one.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CvdPoint {
-    spot: f32,
-    perp: f32,
-    /// False when the spot bar is not loaded yet (the spot line holds its value).
-    has_spot: bool,
+    other: f32,
+    own: f32,
+    /// False when the reference bar is not loaded yet (its line holds its value).
+    has_other: bool,
 }
 
 pub struct SpotCvdIndicator {
     cache: Caches,
     timeframe: Option<Timeframe>,
-    /// Per-bar delta of the spot pair.
-    spot: BTreeMap<UnixMs, f64>,
-    /// Per-bar delta of the chart (perp) bars.
-    perp: BTreeMap<UnixMs, f64>,
+    /// The chart shows spot, so the reference series is the perpetual.
+    chart_is_spot: bool,
+    /// Per-bar delta of the reference market's klines.
+    other: BTreeMap<UnixMs, f64>,
+    /// Per-bar delta of the chart's own bars.
+    own: BTreeMap<UnixMs, f64>,
     series: BTreeMap<UnixMs, CvdPoint>,
 }
 
@@ -52,16 +57,26 @@ impl SpotCvdIndicator {
         Self {
             cache: Caches::default(),
             timeframe: None,
-            spot: BTreeMap::new(),
-            perp: BTreeMap::new(),
+            chart_is_spot: false,
+            other: BTreeMap::new(),
+            own: BTreeMap::new(),
             series: BTreeMap::new(),
+        }
+    }
+
+    /// (futures, spot) values of a point.
+    fn futures_spot(&self, p: &CvdPoint) -> (f32, f32) {
+        if self.chart_is_spot {
+            (p.other, p.own)
+        } else {
+            (p.own, p.other)
         }
     }
 
     fn availability_for(basis: Basis, ticker_info: exchange::TickerInfo) -> IndicatorAvailability {
         match basis {
             Basis::Tick(_) => IndicatorAvailability::Unavailable(AvailabilityCause::Basis(basis)),
-            Basis::Time(_) if spot_counterpart(ticker_info).is_none() => {
+            Basis::Time(_) if market_counterpart(ticker_info).is_none() => {
                 IndicatorAvailability::Unavailable(AvailabilityCause::Exchange(
                     ticker_info.exchange(),
                 ))
@@ -81,42 +96,42 @@ impl SpotCvdIndicator {
             .sum()
     }
 
-    /// Refreshes perp deltas from bar `from_index` on.
-    fn sync_perp(&mut self, source: &PlotData<KlineDataPoint>, from_index: usize) {
+    /// Refreshes the chart's own deltas from bar `from_index` on.
+    fn sync_own(&mut self, source: &PlotData<KlineDataPoint>, from_index: usize) {
         let PlotData::TimeBased(series) = source else {
-            self.perp.clear();
+            self.own.clear();
             self.rebuild_series();
             return;
         };
         if from_index == 0 {
-            self.perp.clear();
+            self.own.clear();
         }
         for (time, dp) in series.datapoints.iter().skip(from_index) {
-            self.perp.insert(*time, Self::bar_delta(dp));
+            self.own.insert(*time, Self::bar_delta(dp));
         }
         self.rebuild_series();
     }
 
     fn rebuild_series(&mut self) {
         self.series.clear();
-        let (Some((&spot_first, _)), Some((&perp_first, _))) =
-            (self.spot.first_key_value(), self.perp.first_key_value())
+        let (Some((&other_first, _)), Some((&own_first, _))) =
+            (self.other.first_key_value(), self.own.first_key_value())
         else {
             self.clear_all_caches();
             return;
         };
-        let start = spot_first.max(perp_first);
-        let (mut spot_cum, mut perp_cum) = (0.0_f64, 0.0_f64);
-        for (time, perp_delta) in self.perp.range(start..) {
-            perp_cum += perp_delta;
-            let spot_delta = self.spot.get(time);
-            spot_cum += spot_delta.copied().unwrap_or(0.0);
+        let start = other_first.max(own_first);
+        let (mut other_cum, mut own_cum) = (0.0_f64, 0.0_f64);
+        for (time, own_delta) in self.own.range(start..) {
+            own_cum += own_delta;
+            let other_delta = self.other.get(time);
+            other_cum += other_delta.copied().unwrap_or(0.0);
             self.series.insert(
                 *time,
                 CvdPoint {
-                    spot: spot_cum as f32,
-                    perp: perp_cum as f32,
-                    has_spot: spot_delta.is_some(),
+                    other: other_cum as f32,
+                    own: own_cum as f32,
+                    has_other: other_delta.is_some(),
                 },
             );
         }
@@ -145,18 +160,29 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         if visible_range.end() < visible_range.start() {
             return row![].into();
         }
+        let chart_is_spot = self.chart_is_spot;
+        let (own_color, other_color) = if chart_is_spot {
+            (SPOT_COLOR, FUTURES_COLOR)
+        } else {
+            (FUTURES_COLOR, SPOT_COLOR)
+        };
         let plot = DualCvdPlot {
-            tooltip: Box::new(|p: &CvdPoint, _next: Option<&CvdPoint>| {
-                let spot = if p.has_spot {
-                    format_with_commas(f64::from(p.spot))
+            tooltip: Box::new(move |p: &CvdPoint, _next: Option<&CvdPoint>| {
+                let own = format_with_commas(f64::from(p.own));
+                let other = if p.has_other {
+                    format_with_commas(f64::from(p.other))
                 } else {
                     "loading".to_string()
                 };
-                PlotTooltip::new(format!(
-                    "Futures CVD: {}\nSpot CVD: {spot}",
-                    format_with_commas(f64::from(p.perp))
-                ))
+                let (futures, spot) = if chart_is_spot {
+                    (other, own)
+                } else {
+                    (own, other)
+                };
+                PlotTooltip::new(format!("Futures CVD: {futures}\nSpot CVD: {spot}"))
             }),
+            own_color,
+            other_color,
         };
         let plot = indicator_row(
             chart,
@@ -177,17 +203,20 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
             )
         };
         let size = crate::style::text_size::TINY;
+        let futures = last
+            .filter(|p| !chart_is_spot || p.has_other)
+            .map(|p| self.futures_spot(&p).0);
+        let spot = last
+            .filter(|p| chart_is_spot || p.has_other)
+            .map(|p| self.futures_spot(&p).1);
         let legend = row![
             text("CVD").size(size),
-            text(format!("━ Futures {}", value(last.map(|p| p.perp))))
+            text(format!("━ Futures {}", value(futures)))
                 .size(size)
                 .color(FUTURES_COLOR),
-            text(format!(
-                "━ Spot {}",
-                value(last.filter(|p| p.has_spot).map(|p| p.spot))
-            ))
-            .size(size)
-            .color(SPOT_COLOR),
+            text(format!("━ Spot {}", value(spot)))
+                .size(size)
+                .color(SPOT_COLOR),
             text("normalized").size(size),
         ]
         .spacing(10);
@@ -205,14 +234,17 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
             return None;
         }
         let timeframe = ctx.timeframe;
-        if self.timeframe != Some(timeframe) {
+        let chart_is_spot =
+            ctx.main_chart.ticker_info.exchange() == exchange::adapter::Exchange::BinanceSpot;
+        if self.timeframe != Some(timeframe) || self.chart_is_spot != chart_is_spot {
             self.timeframe = Some(timeframe);
-            self.spot.clear();
+            self.chart_is_spot = chart_is_spot;
+            self.other.clear();
             self.rebuild_series();
         }
 
-        let (Some((&spot_first, _)), Some((&spot_last, _))) =
-            (self.spot.first_key_value(), self.spot.last_key_value())
+        let (Some((&other_first, _)), Some((&other_last, _))) =
+            (self.other.first_key_value(), self.other.last_key_value())
         else {
             return Some(FetchRange::RefKlines {
                 from: ctx.prefetch_earliest,
@@ -222,10 +254,10 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
             });
         };
 
-        if ctx.visible_earliest < spot_first {
+        if ctx.visible_earliest < other_first {
             return Some(FetchRange::RefKlines {
                 from: ctx.prefetch_earliest,
-                to: spot_first.saturating_sub(1),
+                to: other_first.saturating_sub(1),
                 timeframe,
                 spot: true,
             });
@@ -235,19 +267,19 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         // handler's cooldown on identical ranges limits the polling rate.
         let now = chrono::Utc::now().timestamp_millis() as u64;
         Some(FetchRange::RefKlines {
-            from: spot_last,
-            to: UnixMs::new(now - now % POLL_MS).max(spot_last.saturating_add(1)),
+            from: other_last,
+            to: UnixMs::new(now - now % POLL_MS).max(other_last.saturating_add(1)),
             timeframe,
             spot: true,
         })
     }
 
     fn rebuild_from_source(&mut self, source: &PlotData<KlineDataPoint>) {
-        self.sync_perp(source, 0);
+        self.sync_own(source, 0);
     }
 
     fn on_insert_klines(&mut self, _klines: &[Kline], source: &PlotData<KlineDataPoint>) {
-        self.sync_perp(source, 0);
+        self.sync_own(source, 0);
     }
 
     fn on_insert_trades(
@@ -256,23 +288,23 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         old_dp_len: usize,
         source: &PlotData<KlineDataPoint>,
     ) {
-        self.sync_perp(source, old_dp_len.saturating_sub(1));
+        self.sync_own(source, old_dp_len.saturating_sub(1));
     }
 
     fn on_ticksize_change(&mut self, source: &PlotData<KlineDataPoint>) {
-        self.sync_perp(source, 0);
+        self.sync_own(source, 0);
     }
 
     fn on_basis_change(&mut self, source: &PlotData<KlineDataPoint>) {
-        self.spot.clear();
-        self.sync_perp(source, 0);
+        self.other.clear();
+        self.sync_own(source, 0);
     }
 
     fn on_ref_klines(&mut self, spot: bool, timeframe: Timeframe, klines: &[Kline]) {
         if !spot || self.timeframe != Some(timeframe) {
             return;
         }
-        self.spot.extend(klines.iter().map(|k| {
+        self.other.extend(klines.iter().map(|k| {
             let delta = k
                 .volume
                 .buy_sell()
@@ -283,9 +315,12 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
     }
 }
 
-/// Perp line on the panel's axis, spot line rescaled to the same vertical span.
+/// The chart's own line on the panel's axis, the reference line rescaled to the same
+/// vertical span.
 struct DualCvdPlot {
     tooltip: TooltipFn<CvdPoint>,
+    own_color: iced::Color,
+    other_color: iced::Color,
 }
 
 /// Inner share of the panel height used by the lines.
@@ -298,8 +333,8 @@ where
     fn y_extents(&self, s: &S, range: RangeInclusive<u64>) -> Option<(f32, f32)> {
         let mut extents: Option<(f32, f32)> = None;
         s.for_each_in(range, |_, p| {
-            let (lo, hi) = extents.unwrap_or((p.perp, p.perp));
-            extents = Some((lo.min(p.perp), hi.max(p.perp)));
+            let (lo, hi) = extents.unwrap_or((p.own, p.own));
+            extents = Some((lo.min(p.own), hi.max(p.own)));
         });
         extents
     }
@@ -318,20 +353,20 @@ where
         range: RangeInclusive<u64>,
         scale: &YScale,
     ) {
-        let mut spot_extents: Option<(f32, f32)> = None;
+        let mut other_extents: Option<(f32, f32)> = None;
         s.for_each_in(range.clone(), |_, p| {
-            if p.has_spot {
-                let (lo, hi) = spot_extents.unwrap_or((p.spot, p.spot));
-                spot_extents = Some((lo.min(p.spot), hi.max(p.spot)));
+            if p.has_other {
+                let (lo, hi) = other_extents.unwrap_or((p.other, p.other));
+                other_extents = Some((lo.min(p.other), hi.max(p.other)));
             }
         });
-        // Map spot values onto the unpadded perp span of the axis.
+        // Map reference values onto the unpadded span of the axis.
         let span = scale.max - scale.min;
         let (target_lo, target_hi) = (
             scale.min + span * PAD / (1.0 + 2.0 * PAD),
             scale.max - span * PAD / (1.0 + 2.0 * PAD),
         );
-        let spot_to_axis = |v: f32| match spot_extents {
+        let other_to_axis = |v: f32| match other_extents {
             Some((lo, hi)) if hi > lo => target_lo + (v - lo) / (hi - lo) * (target_hi - target_lo),
             _ => (target_lo + target_hi) / 2.0,
         };
@@ -339,35 +374,37 @@ where
         let half_bar = ctx.cell_width * 0.45;
         let x_for = |x: u64| ctx.interval_to_x(x) + half_bar;
 
-        let mut perp_path = canvas::path::Builder::new();
-        let mut spot_path = canvas::path::Builder::new();
-        let (mut perp_started, mut spot_started) = (false, false);
+        let mut own_path = canvas::path::Builder::new();
+        let mut other_path = canvas::path::Builder::new();
+        let (mut own_started, mut other_started) = (false, false);
         s.for_each_in(range, |x, p| {
             let px = x_for(x);
-            let perp_pt = iced::Point::new(px, scale.to_y(p.perp));
-            if perp_started {
-                perp_path.line_to(perp_pt);
+            let own_pt = iced::Point::new(px, scale.to_y(p.own));
+            if own_started {
+                own_path.line_to(own_pt);
             } else {
-                perp_path.move_to(perp_pt);
-                perp_started = true;
+                own_path.move_to(own_pt);
+                own_started = true;
             }
-            if p.has_spot {
-                let spot_pt = iced::Point::new(px, scale.to_y(spot_to_axis(p.spot)));
-                if spot_started {
-                    spot_path.line_to(spot_pt);
+            if p.has_other {
+                let other_pt = iced::Point::new(px, scale.to_y(other_to_axis(p.other)));
+                if other_started {
+                    other_path.line_to(other_pt);
                 } else {
-                    spot_path.move_to(spot_pt);
-                    spot_started = true;
+                    other_path.move_to(other_pt);
+                    other_started = true;
                 }
             }
         });
         frame.stroke(
-            &perp_path.build(),
-            Stroke::default().with_width(1.5).with_color(FUTURES_COLOR),
+            &own_path.build(),
+            Stroke::default().with_width(1.5).with_color(self.own_color),
         );
         frame.stroke(
-            &spot_path.build(),
-            Stroke::default().with_width(1.5).with_color(SPOT_COLOR),
+            &other_path.build(),
+            Stroke::default()
+                .with_width(1.5)
+                .with_color(self.other_color),
         );
     }
 
@@ -384,15 +421,19 @@ mod tests {
     fn cumulates_from_first_common_bar() {
         let mut indicator = SpotCvdIndicator::new();
         for (t, d) in [(0, 5.0), (60_000, 1.0), (120_000, -2.0)] {
-            indicator.perp.insert(UnixMs::new(t), d);
+            indicator.own.insert(UnixMs::new(t), d);
         }
-        indicator.spot.insert(UnixMs::new(60_000), 3.0);
+        indicator.other.insert(UnixMs::new(60_000), 3.0);
         indicator.rebuild_series();
 
         assert_eq!(indicator.series.len(), 2);
         let first = indicator.series[&UnixMs::new(60_000)];
-        assert_eq!((first.spot, first.perp, first.has_spot), (3.0, 1.0, true));
+        assert_eq!((first.other, first.own, first.has_other), (3.0, 1.0, true));
         let last = indicator.series[&UnixMs::new(120_000)];
-        assert_eq!((last.spot, last.perp, last.has_spot), (3.0, -1.0, false));
+        assert_eq!((last.other, last.own, last.has_other), (3.0, -1.0, false));
+
+        // On a spot chart the own line is spot.
+        indicator.chart_is_spot = true;
+        assert_eq!(indicator.futures_spot(&last), (3.0, -1.0));
     }
 }

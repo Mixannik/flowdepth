@@ -1068,8 +1068,8 @@ pub enum FetchRange {
         to: UnixMs,
         timeframe: Timeframe,
     },
-    /// Klines for an indicator; `spot` selects the spot counterpart instead of the
-    /// chart's own market.
+    /// Klines for an indicator; `spot` selects the other market of the pair (spot for a
+    /// perpetual chart, the perpetual for a spot chart) instead of the chart's own market.
     RefKlines {
         from: UnixMs,
         to: UnixMs,
@@ -1434,7 +1434,7 @@ pub fn request_fetch(
 
             if let Some(chart_stream @ StreamKind::Kline { ticker_info, .. }) = chart_stream
                 && let Some(source) = if spot {
-                    spot_counterpart(ticker_info)
+                    market_counterpart(ticker_info)
                 } else {
                     Some(ticker_info)
                 }
@@ -2175,6 +2175,21 @@ pub fn oi_fetch_task(
 }
 
 /// Binance spot market with the same symbol as a Binance USDв“€-M perpetual.
+/// The other market of a Binance USDT pair: spot for a perpetual, the perpetual for spot.
+/// `FetchRange::RefKlines { spot: true }` fetches from it.
+pub fn market_counterpart(ticker_info: TickerInfo) -> Option<TickerInfo> {
+    if ticker_info.exchange() != Exchange::BinanceSpot {
+        return spot_counterpart(ticker_info);
+    }
+    let (symbol, _) = ticker_info.ticker.to_full_symbol_and_type();
+    Some(TickerInfo::new(
+        exchange::Ticker::new(&symbol, Exchange::BinanceLinear),
+        0.1,
+        0.001,
+        None,
+    ))
+}
+
 pub fn spot_counterpart(perp: TickerInfo) -> Option<TickerInfo> {
     if perp.exchange() != Exchange::BinanceLinear {
         return None;
