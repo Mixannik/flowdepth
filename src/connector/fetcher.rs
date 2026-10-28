@@ -19,7 +19,7 @@ use crate::connector::client::{DataSources, ServerClient};
 
 pub use data::TradeFetchMode;
 
-// ── Human-readable log helpers ──────────────────────────────────────────────
+// в”Ђв”Ђ Human-readable log helpers в”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђв”Ђ
 
 /// Format a ticker symbol for display (e.g., "BTCUSDT")
 pub fn format_symbol(ticker_info: &TickerInfo) -> String {
@@ -92,9 +92,9 @@ pub fn format_time_short(ms: UnixMs) -> String {
     dt.format("%H:%M:%S%.3f").to_string()
 }
 
-/// Format a time range as HH:MM:SS.mmm → HH:MM:SS.mmm
+/// Format a time range as HH:MM:SS.mmm в†’ HH:MM:SS.mmm
 pub fn format_time_range(from: UnixMs, to: UnixMs) -> String {
-    format!("{} → {}", format_time_short(from), format_time_short(to))
+    format!("{} в†’ {}", format_time_short(from), format_time_short(to))
 }
 
 /// Format a duration in milliseconds as human-readable (e.g., "3.7s" or "625ms")
@@ -124,6 +124,16 @@ pub fn format_fetch_range(fetch: &FetchRange) -> String {
             timeframe,
         } => {
             format!("OI {} source={timeframe}", format_time_range(*from, *to))
+        }
+        FetchRange::SpotKlines {
+            from,
+            to,
+            timeframe,
+        } => {
+            format!(
+                "SpotKlines {} tf={timeframe}",
+                format_time_range(*from, *to)
+            )
         }
         FetchRange::Trades(from, to) => {
             format!("Trades {}", format_time_range(*from, *to))
@@ -171,7 +181,7 @@ pub fn set_trade_fetch_mode(mode: TradeFetchMode) {
     if let Ok(mut guard) = TRADE_FETCH_MODE.write() {
         *guard = mode;
     } else {
-        log::error!("Trade fetch mode lock poisoned — resetting to Off");
+        log::error!("Trade fetch mode lock poisoned вЂ” resetting to Off");
     }
 }
 
@@ -297,6 +307,11 @@ pub enum FetchedData {
     },
     OI {
         data: Vec<OpenInterest>,
+        req_id: Option<uuid::Uuid>,
+    },
+    /// Klines of the spot counterpart of a perpetual chart (Spot vs Perp CVD).
+    SpotKlines {
+        data: Vec<Kline>,
         req_id: Option<uuid::Uuid>,
     },
 }
@@ -1049,6 +1064,11 @@ pub enum FetchRange {
         to: UnixMs,
         timeframe: Timeframe,
     },
+    SpotKlines {
+        from: UnixMs,
+        to: UnixMs,
+        timeframe: Timeframe,
+    },
     Trades(UnixMs, UnixMs),
     BubbleSummary {
         from: UnixMs,
@@ -1065,7 +1085,9 @@ impl FetchRange {
     fn is_valid(&self) -> bool {
         match *self {
             FetchRange::Kline(from, to) | FetchRange::Trades(from, to) => from < to,
-            FetchRange::OpenInterest { from, to, .. } => from < to,
+            FetchRange::OpenInterest { from, to, .. } | FetchRange::SpotKlines { from, to, .. } => {
+                from < to
+            }
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
     }
@@ -1103,6 +1125,18 @@ impl FetchRequest {
                     timeframe: t1,
                 },
                 FetchRange::OpenInterest {
+                    from: s2,
+                    to: e2,
+                    timeframe: t2,
+                },
+            ) => e1 == e2 && s1 == s2 && t1 == t2,
+            (
+                FetchRange::SpotKlines {
+                    from: s1,
+                    to: e1,
+                    timeframe: t1,
+                },
+                FetchRange::SpotKlines {
                     from: s2,
                     to: e2,
                     timeframe: t2,
@@ -1373,6 +1407,38 @@ pub fn request_fetch(
 
             log::warn!(
                 "OI Skip | pane={} req={} reason=no_kline_stream ready_streams={}",
+                short_id(pane_id),
+                short_id(req_id),
+                format_streams(ready_streams)
+            );
+        }
+        FetchRange::SpotKlines {
+            from,
+            to,
+            timeframe,
+        } => {
+            let perp_stream = stream
+                .into_iter()
+                .chain(ready_streams.iter().copied())
+                .find(|stream| matches!(stream, StreamKind::Kline { .. }));
+
+            if let Some(perp_stream @ StreamKind::Kline { ticker_info, .. }) = perp_stream
+                && let Some(spot) = spot_counterpart(ticker_info)
+            {
+                return spot_klines_fetch_task(
+                    handles.clone(),
+                    layout_id,
+                    pane_id,
+                    perp_stream,
+                    spot,
+                    timeframe,
+                    req_id,
+                    (from, to),
+                );
+            }
+
+            log::warn!(
+                "SPOT Skip | pane={} req={} reason=no_spot_counterpart ready_streams={}",
                 short_id(pane_id),
                 short_id(req_id),
                 format_streams(ready_streams)
@@ -2091,6 +2157,94 @@ pub fn oi_fetch_task(
     };
 
     update_status.chain(fetch_task)
+}
+
+/// Binance spot market with the same symbol as a Binance USDв“€-M perpetual.
+pub fn spot_counterpart(perp: TickerInfo) -> Option<TickerInfo> {
+    if perp.exchange() != Exchange::BinanceLinear {
+        return None;
+    }
+    let (symbol, _) = perp.ticker.to_full_symbol_and_type();
+    // Delivery contracts (BTCUSDT_251226) have no spot twin.
+    if symbol.contains('_') {
+        return None;
+    }
+    Some(TickerInfo::new(
+        exchange::Ticker::new(&symbol, Exchange::BinanceSpot),
+        0.01,
+        0.00001,
+        None,
+    ))
+}
+
+/// Upper bound of kline pages per spot request (1000 bars each).
+const SPOT_KLINE_MAX_PAGES: usize = 30;
+
+#[allow(clippy::too_many_arguments)]
+fn spot_klines_fetch_task(
+    handles: AdapterHandles,
+    layout_id: Uuid,
+    pane_id: Uuid,
+    perp_stream: StreamKind,
+    spot: TickerInfo,
+    timeframe: Timeframe,
+    req_id: Uuid,
+    (from, to): (UnixMs, UnixMs),
+) -> Task<FetchUpdate> {
+    let fetch = async move {
+        let started = Instant::now();
+        let end = to.saturating_add(1);
+        let mut cursor = from;
+        let mut klines = Vec::new();
+        for _ in 0..SPOT_KLINE_MAX_PAGES {
+            if cursor >= end {
+                break;
+            }
+            let page = handles
+                .fetch_klines_page(spot, timeframe, cursor, end)
+                .await?;
+            klines.extend(page.data);
+            if page.next_from <= cursor {
+                break;
+            }
+            cursor = page.next_from;
+        }
+        log::info!(
+            "SPOT Done | pane={} req={} symbol={} tf={timeframe} range={} bars={} duration={}",
+            short_id(pane_id),
+            short_id(req_id),
+            format_symbol(&spot),
+            format_time_range(from, to),
+            klines.len(),
+            format_duration_ms(started.elapsed().as_millis() as u64)
+        );
+        Ok::<_, AdapterError>(klines)
+    };
+
+    Task::perform(
+        iced::futures::TryFutureExt::map_err(fetch, |err| err.ui_message()),
+        move |result| match result {
+            Ok(data) => FetchUpdate::Data {
+                layout_id,
+                pane_id,
+                data: FetchedData::SpotKlines {
+                    data,
+                    req_id: Some(req_id),
+                },
+                stream: perp_stream,
+            },
+            Err(error) => FetchUpdate::Error {
+                pane_id,
+                error,
+                req_id: Some(req_id),
+                fetch: Some(FetchRange::SpotKlines {
+                    from,
+                    to,
+                    timeframe,
+                }),
+            },
+        },
+    )
 }
 
 pub fn kline_fetch_task(

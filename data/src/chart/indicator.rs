@@ -34,6 +34,7 @@ pub enum KlineIndicator {
     Adx,
     Tpo,
     NakedLevels,
+    SpotCvd,
 }
 
 impl Indicator for KlineIndicator {

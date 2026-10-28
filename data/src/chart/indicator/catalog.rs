@@ -35,6 +35,7 @@ pub enum Runtime {
     Volume,
     BarAnalysis,
     OpenInterest,
+    SpotCvd,
     Scripted(ScriptKind),
     Overlay,
 }
@@ -206,7 +207,21 @@ pub const DEFINITIONS: &[Definition] = &[
         Runtime::Overlay,
         Editor::None
     ),
+    define!(
+        SpotCvd,
+        "Spot vs Perp CVD",
+        "Spot CVD of the same pair on Binance spot next to this perpetual's CVD, both from the first common bar. Shows whether spot or perp drives the move.",
+        OrderFlow,
+        Delta,
+        Runtime::SpotCvd,
+        Editor::None
+    ),
 ];
+
+/// Indicators that need a perpetual chart.
+fn perps_only(kind: KlineIndicator) -> bool {
+    matches!(kind, KlineIndicator::OpenInterest | KlineIndicator::SpotCvd)
+}
 
 pub fn definition(kind: KlineIndicator) -> &'static Definition {
     &DEFINITIONS[kind as usize]
@@ -214,7 +229,7 @@ pub fn definition(kind: KlineIndicator) -> &'static Definition {
 static SPOT: LazyLock<Vec<KlineIndicator>> = LazyLock::new(|| {
     DEFINITIONS
         .iter()
-        .filter(|entry| entry.kind != KlineIndicator::OpenInterest)
+        .filter(|entry| !perps_only(entry.kind))
         .map(|entry| entry.kind)
         .collect()
 });
@@ -253,11 +268,11 @@ mod tests {
         }
     }
     #[test]
-    fn spot_excludes_only_open_interest_and_preserves_relative_order() {
+    fn spot_excludes_perp_only_indicators_and_preserves_relative_order() {
         let expected: Vec<_> = for_market(MarketKind::LinearPerps)
             .iter()
             .copied()
-            .filter(|kind| *kind != KlineIndicator::OpenInterest)
+            .filter(|kind| !matches!(kind, KlineIndicator::OpenInterest | KlineIndicator::SpotCvd))
             .collect();
         assert_eq!(for_market(MarketKind::Spot), expected);
         assert_eq!(

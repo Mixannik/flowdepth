@@ -12,6 +12,7 @@ use super::plot::AnySeries;
 pub mod bar_analysis;
 pub mod open_interest;
 pub mod scripted;
+pub mod spot_cvd;
 pub mod volume;
 
 /// UI adapter methods for converting domain `BasisSeries` into plot-ready series.
@@ -124,6 +125,9 @@ pub trait KlineIndicatorImpl {
 
     fn on_open_interest(&mut self, _pairs: &[exchange::OpenInterest]) {}
 
+    /// Klines of the spot counterpart (Spot vs Perp CVD).
+    fn on_spot_klines(&mut self, _klines: &[Kline]) {}
+
     /// Open interest samples by time, for indicators that hold them.
     fn open_interest(&self) -> Option<&std::collections::BTreeMap<UnixMs, f64>> {
         None
@@ -144,6 +148,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         Runtime::Volume => Box::new(volume::VolumeIndicator::new()),
         Runtime::BarAnalysis => Box::new(bar_analysis::BarAnalysisIndicator::new()),
         Runtime::OpenInterest => Box::new(open_interest::OpenInterestIndicator::new()),
+        Runtime::SpotCvd => Box::new(spot_cvd::SpotCvdIndicator::new()),
         Runtime::Scripted(kind) => Box::new(scripted::ScriptedIndicator::new(kind)),
         Runtime::Overlay => Box::new(OverlayIndicator),
     }

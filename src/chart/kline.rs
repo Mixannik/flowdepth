@@ -2255,6 +2255,20 @@ impl KlineChart {
         }
     }
 
+    pub fn insert_spot_klines(&mut self, req_id: Option<uuid::Uuid>, klines: &[Kline]) {
+        if let Some(req_id) = req_id {
+            if klines.is_empty() {
+                self.request_handler.mark_no_data(req_id);
+            } else {
+                self.request_handler.mark_completed(req_id);
+            }
+        }
+
+        if let Some(indi) = self.indicators[KlineIndicator::SpotCvd].as_mut() {
+            indi.on_spot_klines(klines);
+        }
+    }
+
     fn calc_qty_scales(
         &self,
         earliest: u64,
