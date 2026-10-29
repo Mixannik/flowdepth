@@ -139,10 +139,27 @@ pub trait KlineIndicatorImpl {
         Vec::new()
     }
 
+    /// Levels a failed auction can form at, as they stood over `from..=to` (ms).
+    fn auction_levels(&self, _from: u64, _to: u64) -> Vec<AuctionLevel> {
+        Vec::new()
+    }
+
     /// Open interest samples by time, for indicators that hold them.
     fn open_interest(&self) -> Option<&std::collections::BTreeMap<UnixMs, f64>> {
         None
     }
+}
+
+/// A reference level (PDH, VAH, a drawn line…) valid over `from..to` (ms), for failed
+/// auctions.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AuctionLevel {
+    pub price: f64,
+    pub from: u64,
+    pub to: u64,
+    pub name: &'static str,
+    /// Longest stay beyond the level that still counts as failing: longer means accepted.
+    pub max_outside_ms: u64,
 }
 
 /// Chart-space mapping for `KlineIndicatorImpl::draw_overlay`.

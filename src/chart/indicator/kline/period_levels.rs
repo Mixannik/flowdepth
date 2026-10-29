@@ -4,7 +4,8 @@
 use crate::chart::{
     Basis, Message, ViewState,
     indicator::kline::{
-        AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl, OverlayCtx,
+        AuctionLevel, AvailabilityCause, FetchCtx, IndicatorAvailability, KlineIndicatorImpl,
+        OverlayCtx,
     },
 };
 use crate::connector::fetcher::FetchRange;
@@ -200,12 +201,38 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
             .map(|level| level.price)
             .collect()
     }
+
+    /// Each day's own levels (yesterday's high on that day, and so on), so history shows
+    /// failed auctions at the levels of its time.
+    fn auction_levels(&self, from: u64, to: u64) -> Vec<AuctionLevel> {
+        let mut out = Vec::new();
+        let mut day = day_start(from);
+        while day <= to {
+            out.extend(self.levels_at(day).into_iter().map(|level| AuctionLevel {
+                price: level.price,
+                from: day,
+                to: day + DAY_MS,
+                name: level.name(),
+                max_outside_ms: match level.period {
+                    Period::Day => 4 * 60 * 60_000,
+                    Period::Week => DAY_MS,
+                    Period::Month => 3 * DAY_MS,
+                },
+            }));
+            day += DAY_MS;
+        }
+        out
+    }
 }
 
 impl PeriodLevelsIndicator {
     fn shown_levels(&self) -> Vec<Level> {
+        self.levels_at(chrono::Utc::now().timestamp_millis() as u64)
+    }
+
+    fn levels_at(&self, now: u64) -> Vec<Level> {
         let cfg = self.config;
-        compute(&self.daily, chrono::Utc::now().timestamp_millis() as u64)
+        compute(&self.daily, now)
             .into_iter()
             .filter(|level| match level.period {
                 Period::Day => cfg.day,

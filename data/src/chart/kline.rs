@@ -2100,6 +2100,10 @@ pub enum FootprintStudy {
         /// profile levels, period levels, naked levels, weekly/monthly VWAP).
         #[serde(default)]
         near_levels: bool,
+        /// Breakout of a reference level (PDH/PDL…, FRVP VAH/VAL, drawn lines) that returns
+        /// inside before it is accepted.
+        #[serde(default = "enabled_by_default")]
+        failed_auctions: bool,
     },
 }
 
@@ -2128,6 +2132,7 @@ impl FootprintStudy {
             stacked: true,
             unfinished: true,
             near_levels: false,
+            failed_auctions: true,
         },
     ];
 }

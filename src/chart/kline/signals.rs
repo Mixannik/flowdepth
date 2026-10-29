@@ -635,7 +635,7 @@ fn draw_hatched_zone(
 }
 
 /// Draws `text` centered on `center_x` on a dark backing so it stays readable over cells.
-fn draw_label(
+pub(super) fn draw_label(
     frame: &mut Frame,
     text: &str,
     center_x: f32,

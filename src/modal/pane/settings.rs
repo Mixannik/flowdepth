@@ -1462,6 +1462,7 @@ pub mod study {
                     stacked,
                     unfinished,
                     near_levels,
+                    failed_auctions,
                 } => {
                     let flags = [
                         absorption,
@@ -1469,6 +1470,7 @@ pub mod study {
                         exhaustion,
                         stacked,
                         unfinished,
+                        failed_auctions,
                         near_levels,
                     ];
                     let labels = [
@@ -1477,6 +1479,7 @@ pub mod study {
                         "Exhaustion",
                         "Stacked imbalances",
                         "Unfinished auctions",
+                        "Failed auctions (PDH/PDL, PWH/PWL, PMH/PML, FRVP VAH/VAL, lines)",
                         "Only near levels (FRVP, period, naked, W/M VWAP; 0.3%)",
                     ];
                     let toggles = labels.into_iter().enumerate().map(|(i, label)| {
@@ -1491,7 +1494,8 @@ pub mod study {
                                     exhaustion: f[2],
                                     stacked: f[3],
                                     unfinished: f[4],
-                                    near_levels: f[5],
+                                    failed_auctions: f[5],
+                                    near_levels: f[6],
                                 })
                             })
                             .into()

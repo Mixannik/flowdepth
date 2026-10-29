@@ -37,6 +37,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, sync::Arc, time::Instant};
 
 mod drawing;
+mod failed_auction;
 mod naked_levels;
 mod oi_bars;
 pub mod range_levels;
@@ -2425,6 +2426,52 @@ impl KlineChart {
         prices
     }
 
+    /// Levels for failed auctions over `from..=to`: period levels as they stood each day,
+    /// FRVP value area edges from the range end on, visible drawn horizontal lines. Not POC,
+    /// naked levels (untouched by definition) or VWAP (moves with price).
+    fn auction_levels(
+        &self,
+        from: u64,
+        to: u64,
+    ) -> Vec<crate::chart::indicator::kline::AuctionLevel> {
+        use crate::chart::indicator::kline::AuctionLevel;
+        const DAY_MS: u64 = 24 * 60 * 60_000;
+
+        let mut levels = Vec::new();
+        if self.indicator_enabled(KlineIndicator::PeriodLevels)
+            && let Some(indi) = self.indicators[KlineIndicator::PeriodLevels].as_ref()
+        {
+            levels.extend(indi.auction_levels(from, to));
+        }
+        for range in self.range_levels().iter().chain(&self.shared_range_levels) {
+            for (price, name) in [(range.vah, "VAH"), (range.val, "VAL")] {
+                levels.push(AuctionLevel {
+                    price,
+                    from: range.to,
+                    to: u64::MAX,
+                    name,
+                    max_outside_ms: DAY_MS,
+                });
+            }
+        }
+        if self.drawings.visible {
+            for drawing in self.drawings.drawings.iter().filter(|d| d.visible) {
+                if let data::chart::kline::drawing::DrawingGeometry::HorizontalLine { price } =
+                    &drawing.geometry
+                {
+                    levels.push(AuctionLevel {
+                        price: price.to_f64(),
+                        from: 0,
+                        to: u64::MAX,
+                        name: "line",
+                        max_outside_ms: 4 * 60 * 60_000,
+                    });
+                }
+            }
+        }
+        levels
+    }
+
     pub fn time_view(&self) -> Option<super::TimeView> {
         self.chart.time_view()
     }
@@ -3044,6 +3091,7 @@ impl canvas::Program<Message> for KlineChart {
                             stacked,
                             unfinished,
                             near_levels,
+                            failed_auctions,
                         } => Some((
                             signals::Enabled {
                                 absorption: *absorption,
@@ -3055,6 +3103,7 @@ impl canvas::Program<Message> for KlineChart {
                                 unfinished: *unfinished,
                             },
                             *near_levels,
+                            *failed_auctions,
                         )),
                         _ => None,
                     });
@@ -3076,7 +3125,26 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((_, zones_enabled, _)) = signals {
+                    if let Some((_, _, _, true)) = signals {
+                        // Bars before the view whose excursion reaches into it, plus the quiet
+                        // stretch before their breakout (the longest stay beyond, monthly: 3 d).
+                        let bars_from = earliest.saturating_sub(4 * 24 * 60 * 60_000);
+                        let levels = self.auction_levels(bars_from, latest);
+                        failed_auction::draw(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            chart.cell_width,
+                            chart.scaling,
+                            &levels,
+                            bars_from,
+                            palette,
+                        );
+                    }
+                    if let Some((_, zones_enabled, _, _)) = signals {
                         // Stacks follow the Imbalance study's ratio when it is on.
                         let (threshold, _, ignore_zeros) = imbalance.unwrap_or((200, None, true));
                         zones::draw(
@@ -3097,7 +3165,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if let Some((enabled, _, near_levels)) = signals {
+                    if let Some((enabled, _, near_levels, _)) = signals {
                         let reference_levels = if near_levels {
                             self.reference_level_prices()
                         } else {
