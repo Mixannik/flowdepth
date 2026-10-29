@@ -28,7 +28,7 @@ pub(super) fn spot_view(pane: pane_grid::Pane, cfg: Config) -> Element<'static, 
                     ..cfg
                 },
             )),
-        text("Per-bar delta of the chart's own market behind the lines, on its own scale.")
+        text("Per-bar delta of futures (left, blue) and spot (right, orange) behind the lines: up = net buying, down = net selling. Each market on its own scale.")
             .size(12),
     ]
     .spacing(12)

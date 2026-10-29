@@ -39,8 +39,9 @@ const SPOT_COLOR: iced::Color = iced::Color::from_rgb(0.97, 0.62, 0.25);
 pub struct CvdPoint {
     other: f32,
     own: f32,
-    /// The chart's own delta of this bar alone.
+    /// Delta of this bar alone, the chart's market and the reference one.
     own_delta: f32,
+    other_delta: f32,
     /// False when the reference bar is not loaded yet (its line holds its value).
     has_other: bool,
 }
@@ -139,6 +140,7 @@ impl SpotCvdIndicator {
                     other: other_cum as f32,
                     own: own_cum as f32,
                     own_delta: *own_delta as f32,
+                    other_delta: other_delta.copied().unwrap_or(0.0) as f32,
                     has_other: other_delta.is_some(),
                 },
             );
@@ -192,6 +194,7 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
             own_color,
             other_color,
             delta_bars: self.config.delta_bars,
+            own_bar_left: !chart_is_spot,
         };
         let plot = indicator_row(
             chart,
@@ -338,6 +341,8 @@ struct DualCvdPlot {
     own_color: iced::Color,
     other_color: iced::Color,
     delta_bars: bool,
+    /// Futures bars always take the left half of the bar slot, spot the right one.
+    own_bar_left: bool,
 }
 
 /// Inner share of the panel height used by the lines.
@@ -367,13 +372,37 @@ where
         &self,
         frame: &mut canvas::Frame,
         ctx: &ViewState,
-        theme: &iced::Theme,
+        _theme: &iced::Theme,
         s: &S,
         range: RangeInclusive<u64>,
         scale: &YScale,
     ) {
         if self.delta_bars {
-            draw_delta_bars(frame, ctx, theme, s, range.clone(), scale);
+            let (own_side, other_side) = if self.own_bar_left {
+                (BarSide::Left, BarSide::Right)
+            } else {
+                (BarSide::Right, BarSide::Left)
+            };
+            draw_delta_bars(
+                frame,
+                ctx,
+                s,
+                range.clone(),
+                scale,
+                own_side,
+                self.own_color,
+                |p| Some(p.own_delta),
+            );
+            draw_delta_bars(
+                frame,
+                ctx,
+                s,
+                range.clone(),
+                scale,
+                other_side,
+                self.other_color,
+                |p| p.has_other.then_some(p.other_delta),
+            );
         }
         let mut other_extents: Option<(f32, f32)> = None;
         s.for_each_in(range.clone(), |_, p| {
@@ -435,19 +464,31 @@ where
     }
 }
 
-/// Per-bar delta around the middle of the panel, scaled to the largest visible bar
-/// (independent of the CVD lines), drawn faint so the lines stay readable.
+#[derive(Clone, Copy)]
+enum BarSide {
+    Left,
+    Right,
+}
+
+/// One market's per-bar delta in its line colour, up for buying and down for selling
+/// from the middle of the panel, in its half of the bar slot. Each market is scaled to
+/// its own largest visible bar (spot volume is far smaller), independent of the lines.
+#[allow(clippy::too_many_arguments)]
 fn draw_delta_bars<S: Series<Y = CvdPoint>>(
     frame: &mut canvas::Frame,
     ctx: &ViewState,
-    theme: &iced::Theme,
     s: &S,
     range: RangeInclusive<u64>,
     scale: &YScale,
+    side: BarSide,
+    color: iced::Color,
+    delta: impl Fn(&CvdPoint) -> Option<f32>,
 ) {
     let mut max_abs = 0.0_f32;
     s.for_each_in(range.clone(), |_, p| {
-        max_abs = max_abs.max(p.own_delta.abs())
+        if let Some(d) = delta(p) {
+            max_abs = max_abs.max(d.abs());
+        }
     });
     if max_abs <= f32::EPSILON {
         return;
@@ -455,23 +496,22 @@ fn draw_delta_bars<S: Series<Y = CvdPoint>>(
     let (top, bottom) = (scale.to_y(scale.max), scale.to_y(scale.min));
     let mid = (top + bottom) / 2.0;
     let reach = (bottom - top).abs() * DELTA_BAR_REACH;
-    let palette = theme.palette();
-    let (up, down) = (
-        palette.success.base.color.scale_alpha(0.45),
-        palette.danger.base.color.scale_alpha(0.45),
-    );
-    let width = (ctx.cell_width * 0.7).max(1.0);
+    let color = color.scale_alpha(0.55);
+    let width = (ctx.cell_width * 0.38).max(1.0);
+    let offset = match side {
+        BarSide::Left => -width,
+        BarSide::Right => 0.0,
+    };
     s.for_each_in(range, |x, p| {
-        let height = p.own_delta.abs() / max_abs * reach;
+        let Some(d) = delta(p) else {
+            return;
+        };
+        let height = d.abs() / max_abs * reach;
         if height < 0.5 {
             return;
         }
-        let left = ctx.interval_to_x(x) + ctx.cell_width * 0.45 - width / 2.0;
-        let (y, color) = if p.own_delta >= 0.0 {
-            (mid - height, up)
-        } else {
-            (mid, down)
-        };
+        let left = ctx.interval_to_x(x) + ctx.cell_width * 0.45 + offset;
+        let y = if d >= 0.0 { mid - height } else { mid };
         frame.fill_rectangle(
             iced::Point::new(left, y),
             iced::Size::new(width, height),
