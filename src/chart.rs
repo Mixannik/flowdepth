@@ -733,6 +733,31 @@ pub struct ViewState {
     layout: ViewConfig,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct TimeView {
+    timeframe_ms: u64,
+    latest_x: u64,
+    translation_x: f32,
+    scaling: f32,
+    cell_width: f32,
+    width: f32,
+    autoscale: Option<Autoscale>,
+}
+
+impl Message {
+    /// Messages that move or zoom the time axis.
+    pub fn changes_time_view(&self) -> bool {
+        matches!(
+            self,
+            Message::Translated(_)
+                | Message::Scaled(..)
+                | Message::XScaling(..)
+                | Message::AutoscaleToggled
+                | Message::DoubleClick(AxisScaleClicked::X)
+        )
+    }
+}
+
 impl ViewState {
     pub fn new(
         basis: Basis,
@@ -758,6 +783,50 @@ impl ViewState {
             ticker_info,
             layout,
         }
+    }
+
+    /// The horizontal (time) view, for keeping same-timeframe charts of one symbol in step.
+    pub fn time_view(&self) -> Option<TimeView> {
+        let Basis::Time(timeframe) = self.basis else {
+            return None;
+        };
+        Some(TimeView {
+            timeframe_ms: timeframe.to_milliseconds(),
+            latest_x: self.latest_x,
+            translation_x: self.translation.x,
+            scaling: self.scaling,
+            cell_width: self.cell_width,
+            width: self.bounds.width,
+            autoscale: self.layout.autoscale,
+        })
+    }
+
+    /// Shows the same times at the same screen x as `view`. The y axis and the own
+    /// fit-to-visible price scaling stay as they are.
+    pub fn follow_time_view(&mut self, view: &TimeView) -> bool {
+        let Basis::Time(timeframe) = self.basis else {
+            return false;
+        };
+        if timeframe.to_milliseconds() != view.timeframe_ms || view.scaling <= f32::EPSILON {
+            return false;
+        }
+
+        // screen x = width / 2 + (x + translation.x) * scaling, x = (time - latest_x) / tf * cell_width
+        let latest_shift = (self.latest_x as f64 - view.latest_x as f64) / view.timeframe_ms as f64
+            * f64::from(view.cell_width);
+        self.translation.x = view.translation_x
+            + latest_shift as f32
+            + (view.width - self.bounds.width) / 2.0 / view.scaling;
+        self.scaling = view.scaling;
+        self.cell_width = view.cell_width;
+
+        if view.autoscale == Some(Autoscale::CenterLatest) {
+            self.layout.autoscale = Some(Autoscale::CenterLatest);
+        } else if self.layout.autoscale == Some(Autoscale::CenterLatest) {
+            // Centering would pull the chart back to the latest bar.
+            self.layout.autoscale = view.autoscale;
+        }
+        true
     }
 
     fn effective_tick_size(&self) -> PriceStep {

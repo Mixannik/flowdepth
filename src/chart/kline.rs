@@ -2425,6 +2425,16 @@ impl KlineChart {
         prices
     }
 
+    pub fn time_view(&self) -> Option<super::TimeView> {
+        self.chart.time_view()
+    }
+
+    pub fn follow_time_view(&mut self, view: &super::TimeView) {
+        if self.chart.follow_time_view(view) {
+            self.invalidate(None);
+        }
+    }
+
     pub fn set_shared_range_levels(&mut self, levels: Vec<range_levels::RangeLevels>) {
         if self.shared_range_levels != levels {
             self.shared_range_levels = levels;

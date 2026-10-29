@@ -909,6 +909,14 @@ impl Dashboard {
                             }
                         }
                     }
+                    if matches!(&local, pane::Event::ChartInteraction(msg) if msg.changes_time_view())
+                    {
+                        if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
+                            state.update(local);
+                        }
+                        self.sync_time_view(main_window.id, window, pane);
+                        return (Task::none(), None);
+                    }
                     if let Some(state) = self.get_mut_pane(main_window.id, window, pane) {
                         let Some(effect) = state.update(local) else {
                             return (Task::none(), None);
@@ -1276,6 +1284,42 @@ impl Dashboard {
                     .flat_map(|(_, _, levels)| levels.iter().copied())
                     .collect();
                 c.set_shared_range_levels(shared);
+            }
+        }
+    }
+
+    /// Scrolling or zooming one chart moves the other charts of the same symbol and
+    /// timeframe in this layout (spot above perp), so the same bars line up.
+    fn sync_time_view(
+        &mut self,
+        main_window: window::Id,
+        window: window::Id,
+        pane: pane_grid::Pane,
+    ) {
+        let Some((view, symbol, source_id)) =
+            self.get_pane(main_window, window, pane).and_then(|state| {
+                let pane::Content::Kline { chart: Some(c), .. } = &state.content else {
+                    return None;
+                };
+                let symbol = state.stream_pair()?.ticker.to_full_symbol_and_type().0;
+                Some((c.time_view()?, symbol, state.unique_id()))
+            })
+        else {
+            return;
+        };
+
+        for (_, _, state) in self.iter_all_panes_mut(main_window) {
+            if state.unique_id() == source_id
+                || state
+                    .stream_pair()
+                    .map(|t| t.ticker.to_full_symbol_and_type().0)
+                    .as_ref()
+                    != Some(&symbol)
+            {
+                continue;
+            }
+            if let pane::Content::Kline { chart: Some(c), .. } = &mut state.content {
+                c.follow_time_view(&view);
             }
         }
     }
