@@ -16,7 +16,10 @@ use crate::chart::{
 };
 use crate::connector::fetcher::{FetchRange, market_counterpart};
 
-use data::chart::{PlotData, kline::KlineDataPoint};
+use data::chart::{
+    PlotData,
+    kline::{KlineDataPoint, SpotCvdConfig},
+};
 use data::util::format_with_commas;
 use exchange::{Kline, Timeframe, Trade, UnixMs};
 
@@ -36,6 +39,8 @@ const SPOT_COLOR: iced::Color = iced::Color::from_rgb(0.97, 0.62, 0.25);
 pub struct CvdPoint {
     other: f32,
     own: f32,
+    /// The chart's own delta of this bar alone.
+    own_delta: f32,
     /// False when the reference bar is not loaded yet (its line holds its value).
     has_other: bool,
 }
@@ -50,11 +55,13 @@ pub struct SpotCvdIndicator {
     /// Per-bar delta of the chart's own bars.
     own: BTreeMap<UnixMs, f64>,
     series: BTreeMap<UnixMs, CvdPoint>,
+    config: SpotCvdConfig,
 }
 
 impl SpotCvdIndicator {
     pub fn new() -> Self {
         Self {
+            config: SpotCvdConfig::default(),
             cache: Caches::default(),
             timeframe: None,
             chart_is_spot: false,
@@ -131,6 +138,7 @@ impl SpotCvdIndicator {
                 CvdPoint {
                     other: other_cum as f32,
                     own: own_cum as f32,
+                    own_delta: *own_delta as f32,
                     has_other: other_delta.is_some(),
                 },
             );
@@ -183,6 +191,7 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
             }),
             own_color,
             other_color,
+            delta_bars: self.config.delta_bars,
         };
         let plot = indicator_row(
             chart,
@@ -300,6 +309,13 @@ impl KlineIndicatorImpl for SpotCvdIndicator {
         self.sync_own(source, 0);
     }
 
+    fn on_config_changed(&mut self, config: &data::chart::kline::Config) {
+        if self.config != config.indicator_configs.spot_cvd {
+            self.config = config.indicator_configs.spot_cvd;
+            self.clear_all_caches();
+        }
+    }
+
     fn on_ref_klines(&mut self, spot: bool, timeframe: Timeframe, klines: &[Kline]) {
         if !spot || self.timeframe != Some(timeframe) {
             return;
@@ -321,10 +337,13 @@ struct DualCvdPlot {
     tooltip: TooltipFn<CvdPoint>,
     own_color: iced::Color,
     other_color: iced::Color,
+    delta_bars: bool,
 }
 
 /// Inner share of the panel height used by the lines.
 const PAD: f32 = 0.08;
+/// The largest visible delta bar reaches this share of the panel height from the middle.
+const DELTA_BAR_REACH: f32 = 0.35;
 
 impl<S> Plot<S> for DualCvdPlot
 where
@@ -348,11 +367,14 @@ where
         &self,
         frame: &mut canvas::Frame,
         ctx: &ViewState,
-        _theme: &iced::Theme,
+        theme: &iced::Theme,
         s: &S,
         range: RangeInclusive<u64>,
         scale: &YScale,
     ) {
+        if self.delta_bars {
+            draw_delta_bars(frame, ctx, theme, s, range.clone(), scale);
+        }
         let mut other_extents: Option<(f32, f32)> = None;
         s.for_each_in(range.clone(), |_, p| {
             if p.has_other {
@@ -411,6 +433,51 @@ where
     fn tooltip_fn(&self) -> Option<&TooltipFn<CvdPoint>> {
         Some(&self.tooltip)
     }
+}
+
+/// Per-bar delta around the middle of the panel, scaled to the largest visible bar
+/// (independent of the CVD lines), drawn faint so the lines stay readable.
+fn draw_delta_bars<S: Series<Y = CvdPoint>>(
+    frame: &mut canvas::Frame,
+    ctx: &ViewState,
+    theme: &iced::Theme,
+    s: &S,
+    range: RangeInclusive<u64>,
+    scale: &YScale,
+) {
+    let mut max_abs = 0.0_f32;
+    s.for_each_in(range.clone(), |_, p| {
+        max_abs = max_abs.max(p.own_delta.abs())
+    });
+    if max_abs <= f32::EPSILON {
+        return;
+    }
+    let (top, bottom) = (scale.to_y(scale.max), scale.to_y(scale.min));
+    let mid = (top + bottom) / 2.0;
+    let reach = (bottom - top).abs() * DELTA_BAR_REACH;
+    let palette = theme.palette();
+    let (up, down) = (
+        palette.success.base.color.scale_alpha(0.45),
+        palette.danger.base.color.scale_alpha(0.45),
+    );
+    let width = (ctx.cell_width * 0.7).max(1.0);
+    s.for_each_in(range, |x, p| {
+        let height = p.own_delta.abs() / max_abs * reach;
+        if height < 0.5 {
+            return;
+        }
+        let left = ctx.interval_to_x(x) + ctx.cell_width * 0.45 - width / 2.0;
+        let (y, color) = if p.own_delta >= 0.0 {
+            (mid - height, up)
+        } else {
+            (mid, down)
+        };
+        frame.fill_rectangle(
+            iced::Point::new(left, y),
+            iced::Size::new(width, height),
+            color,
+        );
+    });
 }
 
 #[cfg(test)]

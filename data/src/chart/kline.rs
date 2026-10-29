@@ -1150,6 +1150,21 @@ pub struct IndicatorConfigs {
     pub gex_levels: crate::chart::gex::GexLevelsConfig,
     pub period_levels: PeriodLevelsConfig,
     pub naked_levels: NakedLevelsConfig,
+    pub spot_cvd: SpotCvdConfig,
+}
+
+/// CVD Futures + Spot panel.
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SpotCvdConfig {
+    /// Per-bar delta of the chart's own market as bars behind the lines.
+    pub delta_bars: bool,
+}
+
+impl Default for SpotCvdConfig {
+    fn default() -> Self {
+        Self { delta_bars: true }
+    }
 }
 
 /// Previous day/week/month high-low levels.

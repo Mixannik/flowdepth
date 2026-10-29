@@ -48,6 +48,7 @@ pub enum Editor {
     PeriodLevels,
     NakedLevels,
     Cvd,
+    SpotCvd,
     Period(ScriptKind),
     Macd,
     Tpo,
@@ -222,7 +223,7 @@ pub const DEFINITIONS: &[Definition] = &[
         OrderFlow,
         Delta,
         Runtime::SpotCvd,
-        Editor::None
+        Editor::SpotCvd
     ),
     define!(
         PeriodLevels,

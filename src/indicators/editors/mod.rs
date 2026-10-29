@@ -36,6 +36,7 @@ pub(super) fn view<'a>(
         Editor::PeriodLevels => levels::period_levels(pane, cfg),
         Editor::NakedLevels => levels::naked_levels(pane, cfg),
         Editor::Cvd => cvd::view(pane, cfg),
+        Editor::SpotCvd => cvd::spot_view(pane, cfg),
         Editor::Period(kind) => scripted::view(pane, cfg, kind),
         Editor::Macd => scripted::view(pane, cfg, ScriptKind::Macd),
         Editor::Tpo => tpo::view(pane, cfg),
