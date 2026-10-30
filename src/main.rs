@@ -633,15 +633,14 @@ impl Flowsurface {
                     return self.apply_connectivity_transition(transition);
                 }
 
+                // Detectors serve heatmaps in every layout, like the other live streams, so
+                // markers keep collecting while another tab is open.
                 if let exchange::Event::OrderFlow(orderflow) = &event {
-                    let requirements = self.active_dashboard().iceberg_requirements(main_window_id);
+                    let requirements = self.iceberg_requirements(main_window_id);
                     self.iceberg_detectors
                         .sync_requirements(requirements, exchange::UnixMs::now());
                     let visible_updates = self.iceberg_detectors.ingest(orderflow.clone());
-                    if !visible_updates.is_empty() {
-                        self.active_dashboard_mut()
-                            .ingest_iceberg_events(&visible_updates, main_window_id);
-                    }
+                    self.ingest_iceberg_events(&visible_updates, main_window_id);
                     return Task::none();
                 }
 
@@ -650,7 +649,7 @@ impl Flowsurface {
                     // timestamps and IDs remain intact for deterministic detector ordering.
                     // Syncing pane requirements once per batch also avoids traversing the
                     // dashboard for every market trade on busy symbols.
-                    let requirements = self.active_dashboard().iceberg_requirements(main_window_id);
+                    let requirements = self.iceberg_requirements(main_window_id);
                     self.iceberg_detectors
                         .sync_requirements(requirements, exchange::UnixMs::now());
                     let visible_updates = trades
@@ -660,10 +659,7 @@ impl Flowsurface {
                                 .ingest(exchange::orderflow::OrderFlowEvent::Trade(*trade))
                         })
                         .collect::<Vec<_>>();
-                    if !visible_updates.is_empty() {
-                        self.active_dashboard_mut()
-                            .ingest_iceberg_events(&visible_updates, main_window_id);
-                    }
+                    self.ingest_iceberg_events(&visible_updates, main_window_id);
                     return Task::none();
                 }
 
@@ -2361,6 +2357,33 @@ impl Flowsurface {
             }
         }
         all
+    }
+
+    /// Iceberg detectors wanted by heatmaps in every layout.
+    fn iceberg_requirements(
+        &self,
+        main_window: window::Id,
+    ) -> Vec<(
+        connector::iceberg::DetectorKey,
+        data::orderflow::iceberg::IcebergDetectorConfig,
+    )> {
+        self.layout_manager
+            .iter_dashboards()
+            .flat_map(|dashboard| dashboard.iceberg_requirements(main_window))
+            .collect()
+    }
+
+    fn ingest_iceberg_events(
+        &mut self,
+        events: &[data::orderflow::iceberg::IcebergEvent],
+        main_window: window::Id,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        for dashboard in self.layout_manager.iter_dashboards_mut() {
+            dashboard.ingest_iceberg_events(events, main_window);
+        }
     }
 
     fn active_dashboard(&self) -> &Dashboard {

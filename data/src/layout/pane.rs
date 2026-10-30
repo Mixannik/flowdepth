@@ -413,6 +413,47 @@ mod tests {
         ));
     }
 
+    /// The heatmap pane `tools\iceberg-layout.mjs` writes: BTCUSDT perp, depth and trades,
+    /// iceberg markers on. Prints the JSON for the script.
+    #[test]
+    fn iceberg_heatmap_pane_round_trips() {
+        let ticker = Ticker::new("BTCUSDT", Exchange::BinanceLinear);
+        let config = heatmap::Config {
+            iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig {
+                enabled: true,
+                retention_seconds: 900,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pane = Pane::ShaderHeatmap {
+            studies: Vec::new(),
+            stream_type: vec![
+                PersistStreamKind::Depth(crate::stream::PersistDepth {
+                    ticker,
+                    depth_aggr: exchange::adapter::StreamTicksize::Client,
+                    push_freq: exchange::PushFrequency::ServerDefault,
+                }),
+                PersistStreamKind::Trades { ticker },
+            ],
+            settings: Settings {
+                tick_multiply: Some(exchange::TickMultiplier(10)),
+                visual_config: Some(VisualConfig::Heatmap(config)),
+                selected_basis: None,
+            },
+            indicators: Vec::new(),
+            link_group: None,
+        };
+        let encoded = serde_json::to_string(&pane).expect("serialize");
+        println!("PANE_JSON {encoded}");
+        let decoded: Pane = serde_json::from_str(&encoded).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            Pane::ShaderHeatmap { settings: Settings { visual_config: Some(VisualConfig::Heatmap(c)), .. }, .. }
+                if c.iceberg_detector.enabled && c.iceberg_detector.retention_seconds == 900
+        ));
+    }
+
     #[test]
     fn gex_liquidity_reference_round_trips() {
         let reference = TickerInfo::new(
