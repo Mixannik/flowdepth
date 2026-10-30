@@ -223,6 +223,9 @@ pub struct KlineDataPoint {
     /// Stats of the raw executions, saved by [`KlineDataPoint::compact_trades`] before
     /// they are folded away.
     pub intrabar: Option<IntrabarStats>,
+    /// Size split of the cached aggregates in this candle (and of raw trades folded at
+    /// compaction beside them); NaN once an aggregate without a split arrived.
+    pub cached_size_delta: Option<[f64; SIZE_BUCKETS]>,
 }
 
 /// What only the raw executions in time order can tell about a candle (or a stretch of
@@ -259,9 +262,12 @@ pub fn size_bucket(notional_usd: f64) -> usize {
         .count()
 }
 
-/// Delta per size bucket. A taker order sweeping several price levels prints as several
-/// trades with the same timestamp and side, so those are summed into one order first.
-/// `sequence` is in time order.
+fn signed_qty(trade: &Trade) -> f64 {
+    let qty = trade.qty.to_f64();
+    if trade.is_sell { -qty } else { qty }
+}
+
+/// Delta per size bucket. `sequence` is in time order.
 fn size_delta(sequence: &[&Trade]) -> [f64; SIZE_BUCKETS] {
     size_delta_in(sequence, volume_size_unit() == SizeUnit::Quote)
 }
@@ -269,26 +275,45 @@ fn size_delta(sequence: &[&Trade]) -> [f64; SIZE_BUCKETS] {
 /// `quote_qty`: trade sizes are already in USD.
 fn size_delta_in(sequence: &[&Trade], quote_qty: bool) -> [f64; SIZE_BUCKETS] {
     let mut out = [0.0; SIZE_BUCKETS];
+    for (trade, bucket) in sequence.iter().zip(order_buckets(sequence, quote_qty)) {
+        out[bucket] += signed_qty(trade);
+    }
+    out
+}
+
+/// Size bucket of the taker order each trade belongs to. A taker order sweeping several
+/// price levels prints as several trades with the same timestamp and side, so those are
+/// summed into one order. `sequence` is in time order.
+fn order_buckets(sequence: &[&Trade], quote_qty: bool) -> Vec<usize> {
+    let mut out = Vec::with_capacity(sequence.len());
     for order in sequence.chunk_by(|a, b| a.time == b.time) {
-        // (qty, notional) for buys, then sells.
-        let mut sides = [(0.0_f64, 0.0_f64); 2];
+        // Notional of the buys, then the sells.
+        let mut notional = [0.0_f64; 2];
         for trade in order {
             let qty = trade.qty.to_f64();
-            let side = &mut sides[usize::from(trade.is_sell)];
-            side.0 += qty;
-            side.1 += if quote_qty {
+            notional[usize::from(trade.is_sell)] += if quote_qty {
                 qty
             } else {
                 qty * trade.price.to_f64()
             };
         }
-        for (is_sell, (qty, notional)) in sides.into_iter().enumerate() {
-            if qty > 0.0 {
-                out[size_bucket(notional)] += if is_sell == 1 { -qty } else { qty };
-            }
-        }
+        let buckets = notional.map(size_bucket);
+        out.extend(order.iter().map(|t| buckets[usize::from(t.is_sell)]));
     }
     out
+}
+
+/// Cache aggregates written since the size split carry this flag and their bucket (two bits
+/// below it); older ones carry neither.
+const AGGREGATE_SPLIT_FLAG: u64 = 1 << 58;
+const AGGREGATE_BUCKET_SHIFT: u32 = 56;
+
+/// Size bucket of a cached aggregate, `None` for raw trades and older aggregates.
+pub fn aggregate_size_bucket(trade: &Trade) -> Option<usize> {
+    let id = trade
+        .id
+        .filter(|id| id & AGGREGATE_ID_BIT != 0 && id & AGGREGATE_SPLIT_FLAG != 0)?;
+    Some(((id >> AGGREGATE_BUCKET_SHIFT) & 0b11) as usize)
 }
 
 impl IntrabarStats {
@@ -374,12 +399,16 @@ pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade
             .or_default()
             .push(trade);
     }
-    for (minute, group) in minutes {
+    let quote_qty = volume_size_unit() == SizeUnit::Quote;
+    for (minute, mut group) in minutes {
         // Already aggregated (re-store of a cached range): keep as is.
         if group.iter().all(|t| is_aggregate_trade(t)) {
             out.extend(group.into_iter().copied());
             continue;
         }
+        group.sort_by_key(|t| t.time);
+        // Rows are split by order size too, so the size split survives aggregation.
+        let order_bucket = order_buckets(&group, quote_qty);
         let (Some(high), Some(low)) = (
             group.iter().map(|t| t.price).max(),
             group.iter().map(|t| t.price).min(),
@@ -391,8 +420,9 @@ pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade
         while step * 10 <= target {
             step *= 10;
         }
-        let mut bins: std::collections::BTreeMap<(i64, bool), Trade> = Default::default();
-        for trade in group {
+        let mut bins: std::collections::BTreeMap<(i64, bool, usize), Trade> = Default::default();
+        for (trade, computed_bucket) in group.into_iter().zip(order_bucket) {
+            let bucket = aggregate_size_bucket(trade).unwrap_or(computed_bucket);
             // kind: 0 = row center, 1 = exact high, 2 = exact low.
             let (units, kind) = if trade.price == high {
                 (trade.price.units, 1)
@@ -402,7 +432,7 @@ pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade
                 let center = trade.price.units.div_euclid(step) * step + step / 2;
                 (center.clamp(low.units + 1, high.units - 1), 0)
             };
-            bins.entry((units, trade.is_sell))
+            bins.entry((units, trade.is_sell, bucket))
                 .and_modify(|agg| {
                     agg.qty += trade.qty;
                     agg.time = agg.time.max(trade.time);
@@ -411,6 +441,8 @@ pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade
                     // Deterministic, so re-storing the same minute deduplicates.
                     id: Some(
                         AGGREGATE_ID_BIT
+                            | AGGREGATE_SPLIT_FLAG
+                            | ((bucket as u64) << AGGREGATE_BUCKET_SHIFT)
                             | (minute << 24)
                             | (((units / step).unsigned_abs() & 0x1F_FFFF) << 3)
                             | (kind << 1)
@@ -477,6 +509,13 @@ impl KlineDataPoint {
             if id & AGGREGATE_ID_BIT != 0 && self.compacted_ids.is_none() {
                 self.compacted_ids = Some((u64::MAX, 0));
             }
+            if id & AGGREGATE_ID_BIT != 0 {
+                let split = self.cached_size_delta.get_or_insert([0.0; SIZE_BUCKETS]);
+                match aggregate_size_bucket(trade) {
+                    Some(bucket) => split[bucket] += signed_qty(trade),
+                    None => *split = [f64::NAN; SIZE_BUCKETS],
+                }
+            }
         }
         self.footprint.add_trade_to_nearest_bin(trade, step);
         self.trade_sequence.push(*trade);
@@ -499,6 +538,31 @@ impl KlineDataPoint {
         self.trade_ids.clear();
         self.compacted_ids = None;
         self.intrabar = None;
+        self.cached_size_delta = None;
+    }
+
+    /// Raw executions still held beside cached aggregates or compacted bins.
+    fn raw_trades(&self) -> impl Iterator<Item = &Trade> {
+        self.trade_sequence
+            .iter()
+            .filter(|t| t.id.is_some_and(|id| id & AGGREGATE_ID_BIT == 0))
+    }
+
+    /// Delta by taker order size: from the raw executions (or the stats saved from them),
+    /// else from cached aggregates written with a split plus raw trades beside them.
+    /// `None` for aggregates cached before the split existed.
+    pub fn size_delta(&self) -> Option<[f64; SIZE_BUCKETS]> {
+        if let Some(stats) = self.intrabar_stats() {
+            return Some(stats.size_delta);
+        }
+        let cached = self.cached_size_delta?;
+        if cached.iter().any(|v| v.is_nan()) {
+            return None;
+        }
+        let mut raw: Vec<&Trade> = self.raw_trades().collect();
+        raw.sort_by_key(|t| t.time);
+        let beside = size_delta(&raw);
+        Some(std::array::from_fn(|i| cached[i] + beside[i]))
     }
 
     /// Intrabar stats from the raw executions while they are kept, else the ones saved at
@@ -536,6 +600,20 @@ impl KlineDataPoint {
         }
         let step = compact_step(high.units - low.units);
         self.intrabar = self.intrabar_stats();
+        if self.intrabar.is_none()
+            && let Some(split) = self.cached_size_delta.as_mut()
+        {
+            // Raw trades beside cached aggregates lose their ids below: keep their split.
+            let mut raw: Vec<&Trade> = self
+                .trade_sequence
+                .iter()
+                .filter(|t| t.id.is_some_and(|id| id & AGGREGATE_ID_BIT == 0))
+                .collect();
+            raw.sort_by_key(|t| t.time);
+            for (total, part) in split.iter_mut().zip(size_delta(&raw)) {
+                *total += part;
+            }
+        }
 
         let mut first_id = self.compacted_ids.map(|(first, _)| first);
         let mut last_id = self.compacted_ids.map(|(_, last)| last);
@@ -2293,6 +2371,86 @@ mod volume_bubble_tests {
         assert!((split[3] - 12.0).abs() < 1e-9);
         assert_eq!(size_bucket(999_999.0), 2);
         assert_eq!(size_bucket(1_000_000.0), 3);
+    }
+
+    fn empty_candle() -> KlineDataPoint {
+        let price = Price::from_f64(100_000.0);
+        KlineDataPoint {
+            kline: Kline {
+                time: UnixMs::new(60_000),
+                open: price,
+                high: price,
+                low: price,
+                close: price,
+                volume: exchange::Volume::empty_buy_sell(),
+            },
+            footprint: KlineTrades::new(),
+            bubble_summary: BubbleVolumeSummary::default(),
+            trade_coverage: TradeCoverage::Unknown,
+            trade_sequence: Vec::new(),
+            trade_ids: Default::default(),
+            compacted_ids: None,
+            intrabar: None,
+            cached_size_delta: None,
+        }
+    }
+
+    #[test]
+    fn size_split_survives_cache_aggregation() {
+        // A 12 BTC sweep (whales) and small trades, both sides, inside one minute.
+        let mut trades = vec![
+            trade(1, 61_000, 100_000.0, 4.0, false),
+            trade(2, 61_000, 100_010.0, 4.0, false),
+            trade(3, 61_000, 100_020.0, 4.0, false),
+        ];
+        for i in 0..50 {
+            trades.push(trade(10 + i, 62_000 + i, 100_005.0, 0.02, i % 2 == 0));
+        }
+        trades.push(trade(100, 70_000, 99_995.0, 0.5, true));
+        let mut raw = empty_candle();
+        for t in &trades {
+            raw.add_trade(t, step());
+        }
+        let expected = raw.size_delta().unwrap();
+
+        let cached = aggregate_trades_for_cache(&trades, UnixMs::new(u64::MAX));
+        assert!(cached.len() < trades.len());
+        let mut candle = empty_candle();
+        for t in &cached {
+            candle.add_trade(t, step());
+        }
+        let split = candle.size_delta().unwrap();
+        for (a, b) in split.iter().zip(expected) {
+            assert!((a - b).abs() < 1e-9, "{split:?} vs {expected:?}");
+        }
+        // Re-storing the aggregates keeps them, and the split.
+        let ids = |v: &[Trade]| v.iter().map(|t| (t.id, t.qty)).collect::<Vec<_>>();
+        assert_eq!(
+            ids(&aggregate_trades_for_cache(&cached, UnixMs::new(u64::MAX))),
+            ids(&cached)
+        );
+
+        // Raw trades beside the aggregates count too, also after compaction.
+        let late: Vec<Trade> = (0..300)
+            .map(|i| trade(1_000 + i, 80_000 + i, 100_000.0, 0.01, false))
+            .collect();
+        for t in &late {
+            candle.add_trade(t, step());
+        }
+        let before = candle.size_delta().unwrap();
+        assert!((before[0] - split[0] - 3.0).abs() < 1e-9);
+        candle.compact_trades();
+        let after = candle.size_delta().unwrap();
+        for (a, b) in after.iter().zip(before) {
+            assert!((a - b).abs() < 1e-9);
+        }
+
+        // An aggregate cached before the split existed: no split for the candle.
+        let mut old = empty_candle();
+        let mut legacy = cached[0];
+        legacy.id = legacy.id.map(|id| id & !AGGREGATE_SPLIT_FLAG);
+        old.add_trade(&legacy, step());
+        assert!(old.size_delta().is_none());
     }
 
     fn cluster(trades: &[Trade], config: &VolumeBubbleConfig) -> Vec<VolumeBubbleCluster> {

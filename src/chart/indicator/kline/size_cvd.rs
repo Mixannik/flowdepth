@@ -62,7 +62,7 @@ impl SizeCvdIndicator {
     }
 
     fn bar_split(dp: &KlineDataPoint) -> Option<[f64; SIZE_BUCKETS]> {
-        dp.intrabar_stats().map(|s| s.size_delta)
+        dp.size_delta()
     }
 
     fn sync_all(&mut self, source: &PlotData<KlineDataPoint>) {

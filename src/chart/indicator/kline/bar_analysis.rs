@@ -576,6 +576,7 @@ mod tests {
             trade_ids: Default::default(),
             compacted_ids: None,
             intrabar: None,
+            cached_size_delta: None,
         };
         let step = PriceStep {
             units: Price::from_f64(0.1).units,

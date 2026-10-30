@@ -264,6 +264,7 @@ impl TimeSeries<KlineDataPoint> {
                     trade_ids: Default::default(),
                     compacted_ids: None,
                     intrabar: None,
+                    cached_size_delta: None,
                 });
 
             entry.kline = *kline;
@@ -304,6 +305,7 @@ impl TimeSeries<KlineDataPoint> {
                     trade_ids: Default::default(),
                     compacted_ids: None,
                     intrabar: None,
+                    cached_size_delta: None,
                 });
 
             entry.add_trade(trade, self.tick_size);

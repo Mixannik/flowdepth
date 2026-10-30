@@ -8101,6 +8101,7 @@ mod tests {
             trade_ids: Default::default(),
             compacted_ids: None,
             intrabar: None,
+            cached_size_delta: None,
         };
         candle.add_trade(&previously_aggregated, price_step);
 
