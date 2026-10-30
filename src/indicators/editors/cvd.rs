@@ -1,8 +1,14 @@
 use super::config_message;
 use crate::screen::dashboard::pane::Message;
-use data::chart::kline::{
-    Config, CvdConfig, IndicatorConfigs, SIZE_BUCKET_LABELS, SizeCvdConfig, SpotCvdConfig,
-};
+use data::chart::kline::{Config, CvdConfig, IndicatorConfigs, SizeCvdConfig, SpotCvdConfig};
+
+/// Group checkboxes: perp edges, then spot edges (ten times lower).
+const SIZE_GROUP_LABELS: [&str; 4] = [
+    "Retail: perp < $10K, spot < $1K",
+    "Medium: perp $10K–100K, spot $1K–10K",
+    "Large: perp $100K–1M, spot $10K–100K",
+    "Whales: perp > $1M, spot > $100K",
+];
 use iced::{
     Element,
     widget::{checkbox, column, pane_grid, text},
@@ -40,7 +46,7 @@ pub(super) fn spot_view(pane: pane_grid::Pane, cfg: Config) -> Element<'static, 
 pub(super) fn size_view(pane: pane_grid::Pane, cfg: Config) -> Element<'static, Message> {
     let size_cvd = cfg.indicator_configs.size_cvd;
     let mut items = column![].spacing(12);
-    for (i, label) in SIZE_BUCKET_LABELS.into_iter().enumerate() {
+    for (i, label) in SIZE_GROUP_LABELS.into_iter().enumerate() {
         items = items.push(
             checkbox(size_cvd.buckets[i])
                 .label(label)
@@ -62,7 +68,7 @@ pub(super) fn size_view(pane: pane_grid::Pane, cfg: Config) -> Element<'static, 
     }
     items
         .push(
-            text("Size of one taker order: trades with the same timestamp and side are summed. The axis shows the largest enabled bucket; the other lines are rescaled to the same height.")
+            text("Size of one taker order: trades with the same timestamp and side are summed. Spot orders run about ten times smaller than perp ones for the same share of volume, hence the lower spot edges. The axis shows the largest enabled group; the other lines are rescaled to the same height.")
                 .size(12),
         )
         .push(

@@ -245,15 +245,51 @@ pub struct IntrabarStats {
     pub size_delta: [f64; SIZE_BUCKETS],
 }
 
-/// Order size buckets in USD: retail < 10K, medium < 100K, large < 1M, whales above.
-pub const SIZE_BUCKET_USD: [f64; SIZE_BUCKETS - 1] = [10_000.0, 100_000.0, 1_000_000.0];
-pub const SIZE_BUCKETS: usize = 4;
-pub const SIZE_BUCKET_LABELS: [&str; SIZE_BUCKETS] = [
-    "Retail < $10K",
-    "Medium $10K–100K",
-    "Large $100K–1M",
-    "Whales > $1M",
+/// Fine order size buckets in USD (1-3-10 steps), kept in the data so the displayed groups
+/// can differ per market without refetching: bucket `i` starts at `SIZE_BUCKET_USD[i - 1]`.
+pub const SIZE_BUCKET_USD: [f64; SIZE_BUCKETS - 1] = [
+    300.0,
+    1_000.0,
+    3_000.0,
+    10_000.0,
+    30_000.0,
+    100_000.0,
+    300_000.0,
+    1_000_000.0,
+    3_000_000.0,
 ];
+pub const SIZE_BUCKETS: usize = 10;
+
+/// Displayed groups: retail, medium, large, whales.
+pub const SIZE_GROUPS: usize = 4;
+pub const SIZE_GROUP_NAMES: [&str; SIZE_GROUPS] = ["Retail", "Medium", "Large", "Whales"];
+
+/// Lower USD edges of medium, large and whales. Spot orders run about ten times smaller
+/// than perp ones for the same share of volume (BTCUSDT, Binance, 30.10.2026: perp
+/// <10K / 10K–100K / 100K–1M / >1M = 6 / 26 / 48 / 20 % of volume, spot with edges ten
+/// times lower = 4 / 28 / 44 / 24 %).
+pub fn size_group_edges(spot: bool) -> [f64; SIZE_GROUPS - 1] {
+    if spot {
+        [1_000.0, 10_000.0, 100_000.0]
+    } else {
+        [10_000.0, 100_000.0, 1_000_000.0]
+    }
+}
+
+/// Sums the fine split into the displayed groups.
+pub fn size_groups(split: &[f64; SIZE_BUCKETS], spot: bool) -> [f64; SIZE_GROUPS] {
+    let edges = size_group_edges(spot);
+    let mut out = [0.0; SIZE_GROUPS];
+    for (bucket, value) in split.iter().enumerate() {
+        let lower = if bucket == 0 {
+            0.0
+        } else {
+            SIZE_BUCKET_USD[bucket - 1]
+        };
+        out[edges.iter().filter(|&&edge| lower >= edge).count()] += value;
+    }
+    out
+}
 
 pub fn size_bucket(notional_usd: f64) -> usize {
     SIZE_BUCKET_USD
@@ -303,17 +339,19 @@ fn order_buckets(sequence: &[&Trade], quote_qty: bool) -> Vec<usize> {
     out
 }
 
-/// Cache aggregates written since the size split carry this flag and their bucket (two bits
-/// below it); older ones carry neither.
-const AGGREGATE_SPLIT_FLAG: u64 = 1 << 58;
-const AGGREGATE_BUCKET_SHIFT: u32 = 56;
+/// Cache aggregates written with the fine size split carry this flag and their bucket (four
+/// bits at the shift); older ones carry neither. Bit 58 marked a first four-bucket split
+/// (30.10.2026, a few hours): those count as having no split.
+const AGGREGATE_SPLIT_FLAG: u64 = 1 << 59;
+const AGGREGATE_BUCKET_SHIFT: u32 = 52;
 
 /// Size bucket of a cached aggregate, `None` for raw trades and older aggregates.
 pub fn aggregate_size_bucket(trade: &Trade) -> Option<usize> {
     let id = trade
         .id
         .filter(|id| id & AGGREGATE_ID_BIT != 0 && id & AGGREGATE_SPLIT_FLAG != 0)?;
-    Some(((id >> AGGREGATE_BUCKET_SHIFT) & 0b11) as usize)
+    let bucket = ((id >> AGGREGATE_BUCKET_SHIFT) & 0xF) as usize;
+    (bucket < SIZE_BUCKETS).then_some(bucket)
 }
 
 impl IntrabarStats {
@@ -1285,18 +1323,18 @@ pub struct IndicatorConfigs {
     pub size_cvd: SizeCvdConfig,
 }
 
-/// CVD by order size: which size buckets get a line.
+/// CVD by order size: which size groups get a line.
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct SizeCvdConfig {
-    /// Retail, medium, large, whales (see `SIZE_BUCKET_USD`).
-    pub buckets: [bool; SIZE_BUCKETS],
+    /// Retail, medium, large, whales (see `size_group_edges`).
+    pub buckets: [bool; SIZE_GROUPS],
 }
 
 impl Default for SizeCvdConfig {
     fn default() -> Self {
         Self {
-            buckets: [true; SIZE_BUCKETS],
+            buckets: [true; SIZE_GROUPS],
         }
     }
 }
@@ -2364,13 +2402,21 @@ mod volume_bubble_tests {
             trade(6, 3_000, 99_990.0, 0.01, true),
         ];
         let refs: Vec<&Trade> = trades.iter().collect();
-        let split = size_delta_in(&refs, false);
+        let fine = size_delta_in(&refs, false);
+        let split = size_groups(&fine, false);
         assert!((split[0] - (0.05 - 0.01)).abs() < 1e-9);
         assert!((split[1] + 0.1).abs() < 1e-9);
         assert_eq!(split[2], 0.0);
         assert!((split[3] - 12.0).abs() < 1e-9);
-        assert_eq!(size_bucket(999_999.0), 2);
-        assert_eq!(size_bucket(1_000_000.0), 3);
+        // Spot edges are ten times lower: $5K is medium, $10K large.
+        let spot = size_groups(&fine, true);
+        assert!((spot[0] + 0.01).abs() < 1e-9);
+        assert!((spot[1] - 0.05).abs() < 1e-9);
+        assert!((spot[2] + 0.1).abs() < 1e-9);
+        assert!((spot[3] - 12.0).abs() < 1e-9);
+        assert_eq!(size_bucket(999_999.0), 7);
+        assert_eq!(size_bucket(1_000_000.0), 8);
+        assert_eq!(size_bucket(5e7), SIZE_BUCKETS - 1);
     }
 
     fn empty_candle() -> KlineDataPoint {
@@ -2432,13 +2478,15 @@ mod volume_bubble_tests {
 
         // Raw trades beside the aggregates count too, also after compaction.
         let late: Vec<Trade> = (0..300)
-            .map(|i| trade(1_000 + i, 80_000 + i, 100_000.0, 0.01, false))
+            .map(|i| trade(1_000 + i, 80_000 + i, 100_000.0, 0.02, false))
             .collect();
         for t in &late {
             candle.add_trade(t, step());
         }
         let before = candle.size_delta().unwrap();
-        assert!((before[0] - split[0] - 3.0).abs() < 1e-9);
+        // The bucket depends on the global size unit; the total does not.
+        let sum = |s: &[f64; SIZE_BUCKETS]| s.iter().sum::<f64>();
+        assert!((sum(&before) - sum(&split) - 6.0).abs() < 1e-9);
         candle.compact_trades();
         let after = candle.size_delta().unwrap();
         for (a, b) in after.iter().zip(before) {
