@@ -132,6 +132,17 @@ pub trait KlineIndicatorImpl {
     /// every batch and keeps only its own (by market and timeframe).
     fn on_ref_klines(&mut self, _spot: bool, _timeframe: Timeframe, _klines: &[Kline]) {}
 
+    /// All trades of a `FetchRange::RefTrades` request over `range` (`to` inclusive);
+    /// `complete` is false when part of the range is still missing.
+    fn on_ref_trades(
+        &mut self,
+        _spot: bool,
+        _range: (UnixMs, UnixMs),
+        _complete: bool,
+        _trades: &[Trade],
+    ) {
+    }
+
     /// Draws on the price chart, for overlays that own fetched data.
     fn draw_overlay(&self, _frame: &mut iced::widget::canvas::Frame, _ctx: &OverlayCtx) {}
 

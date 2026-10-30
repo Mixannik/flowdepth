@@ -1788,6 +1788,7 @@ impl Dashboard {
                 FetchedData::Klines { req_id, .. } => *req_id,
                 FetchedData::OI { req_id, .. } => *req_id,
                 FetchedData::RefKlines { req_id, .. } => *req_id,
+                FetchedData::RefTrades { req_id, .. } => *req_id,
             };
 
             if let Some(req_id) = req_id
@@ -1951,6 +1952,24 @@ impl Dashboard {
                 if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
                     pane_state.status = pane::Status::Ready;
                     pane_state.insert_ref_klines(req_id, spot, timeframe, &data);
+                }
+            }
+            FetchedData::RefTrades {
+                data,
+                spot,
+                range,
+                complete,
+                req_id,
+            } => {
+                log::debug!(
+                    "DATA RefTrades Distribute | pane={} req={} spot={spot} complete={complete} count={}",
+                    fetcher::short_id(pane_id),
+                    fetcher::format_req_id(req_id),
+                    data.len()
+                );
+                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                    pane_state.status = pane::Status::Ready;
+                    pane_state.insert_ref_trades(req_id, spot, range, complete, &data);
                 }
             }
         }
@@ -2119,6 +2138,13 @@ impl Dashboard {
                             data.len()
                         )
                     }
+                    FetchedData::RefTrades { data, req_id, .. } => {
+                        format!(
+                            "RefTrades:req={}:count={}",
+                            fetcher::format_req_id(*req_id),
+                            data.len()
+                        )
+                    }
                 };
                 log::debug!(
                     "BACKFILL Update | kind=Data stream={} pane_ids={} data={}",
@@ -2247,7 +2273,8 @@ impl Dashboard {
                 (from, to)
             }
             fetcher::FetchRange::OpenInterest { from, to, .. }
-            | fetcher::FetchRange::RefKlines { from, to, .. } => (from, to),
+            | fetcher::FetchRange::RefKlines { from, to, .. }
+            | fetcher::FetchRange::RefTrades { from, to, .. } => (from, to),
             fetcher::FetchRange::BubbleSummary { from, to, .. } => (from, to),
         };
 
@@ -3506,6 +3533,7 @@ fn data_summary_type(data: &FetchedData) -> &'static str {
         FetchedData::Klines { .. } => "Klines",
         FetchedData::OI { .. } => "OI",
         FetchedData::RefKlines { .. } => "RefKlines",
+        FetchedData::RefTrades { .. } => "RefTrades",
     }
 }
 

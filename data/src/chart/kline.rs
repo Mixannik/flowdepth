@@ -317,6 +317,26 @@ fn size_delta_in(sequence: &[&Trade], quote_qty: bool) -> [f64; SIZE_BUCKETS] {
     out
 }
 
+/// Fine size split of any set of trades: raw ones grouped into taker orders, cached
+/// aggregates by the bucket in their id. `None` when an aggregate cached before the split
+/// existed is among them.
+pub fn trades_size_split(trades: &[Trade]) -> Option<[f64; SIZE_BUCKETS]> {
+    let mut out = [0.0; SIZE_BUCKETS];
+    let mut raw: Vec<&Trade> = Vec::with_capacity(trades.len());
+    for trade in trades {
+        if is_aggregate_trade(trade) {
+            out[aggregate_size_bucket(trade)?] += signed_qty(trade);
+        } else {
+            raw.push(trade);
+        }
+    }
+    raw.sort_by_key(|t| t.time);
+    for (total, part) in out.iter_mut().zip(size_delta(&raw)) {
+        *total += part;
+    }
+    Some(out)
+}
+
 /// Size bucket of the taker order each trade belongs to. A taker order sweeping several
 /// price levels prints as several trades with the same timestamp and side, so those are
 /// summed into one order. `sequence` is in time order.

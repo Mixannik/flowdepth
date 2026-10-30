@@ -2337,6 +2337,22 @@ impl KlineChart {
         range_levels::draw(&levels, frame, &ctx);
     }
 
+    pub fn insert_ref_trades(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        spot: bool,
+        range: (UnixMs, UnixMs),
+        complete: bool,
+        trades: &[Trade],
+    ) {
+        if let Some(req_id) = req_id {
+            self.request_handler.mark_completed(req_id);
+        }
+        for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
+            indi.on_ref_trades(spot, range, complete, trades);
+        }
+    }
+
     pub fn insert_ref_klines(
         &mut self,
         req_id: Option<uuid::Uuid>,

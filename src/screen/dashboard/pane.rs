@@ -838,6 +838,22 @@ impl State {
         }
     }
 
+    pub fn insert_ref_trades(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        spot: bool,
+        range: (exchange::UnixMs, exchange::UnixMs),
+        complete: bool,
+        trades: &[exchange::Trade],
+    ) {
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut self.content
+        {
+            chart.insert_ref_trades(req_id, spot, range, complete, trades);
+        }
+    }
+
     pub fn insert_hist_klines(
         &mut self,
         req_id: Option<uuid::Uuid>,
@@ -2639,7 +2655,8 @@ impl State {
             | FetchedData::BubbleSummary { .. }
             | FetchedData::Klines { .. }
             | FetchedData::OI { .. }
-            | FetchedData::RefKlines { .. } => {
+            | FetchedData::RefKlines { .. }
+            | FetchedData::RefTrades { .. } => {
                 matches!(self.content, Content::Kline { chart: Some(_), .. })
             }
         }
@@ -2653,7 +2670,8 @@ impl State {
             | FetchRange::BubbleSummary { .. }
             | FetchRange::Kline(_, _)
             | FetchRange::OpenInterest { .. }
-            | FetchRange::RefKlines { .. } => {
+            | FetchRange::RefKlines { .. }
+            | FetchRange::RefTrades { .. } => {
                 matches!(self.content, Content::Kline { chart: Some(_), .. })
             }
         }

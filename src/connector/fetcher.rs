@@ -136,6 +136,9 @@ pub fn format_fetch_range(fetch: &FetchRange) -> String {
                 format_time_range(*from, *to)
             )
         }
+        FetchRange::RefTrades { from, to, spot } => {
+            format!("RefTrades {} spot={spot}", format_time_range(*from, *to))
+        }
         FetchRange::Trades(from, to) => {
             format!("Trades {}", format_time_range(*from, *to))
         }
@@ -316,6 +319,15 @@ pub enum FetchedData {
         data: Vec<Kline>,
         spot: bool,
         timeframe: Timeframe,
+        req_id: Option<uuid::Uuid>,
+    },
+    /// All trades of a `FetchRange::RefTrades` request, with the range it asked for;
+    /// `complete` is false when the worker left part of it unfetched.
+    RefTrades {
+        data: Vec<Trade>,
+        spot: bool,
+        range: (UnixMs, UnixMs),
+        complete: bool,
         req_id: Option<uuid::Uuid>,
     },
 }
@@ -1076,6 +1088,12 @@ pub enum FetchRange {
         timeframe: Timeframe,
         spot: bool,
     },
+    /// Trades for an indicator, delivered in one piece; `spot` as for `RefKlines`.
+    RefTrades {
+        from: UnixMs,
+        to: UnixMs,
+        spot: bool,
+    },
     Trades(UnixMs, UnixMs),
     BubbleSummary {
         from: UnixMs,
@@ -1092,9 +1110,9 @@ impl FetchRange {
     fn is_valid(&self) -> bool {
         match *self {
             FetchRange::Kline(from, to) | FetchRange::Trades(from, to) => from < to,
-            FetchRange::OpenInterest { from, to, .. } | FetchRange::RefKlines { from, to, .. } => {
-                from < to
-            }
+            FetchRange::OpenInterest { from, to, .. }
+            | FetchRange::RefKlines { from, to, .. }
+            | FetchRange::RefTrades { from, to, .. } => from < to,
             FetchRange::BubbleSummary { from, to, .. } => from < to,
         }
     }
@@ -1151,6 +1169,18 @@ impl FetchRequest {
                     spot: m2,
                 },
             ) => e1 == e2 && s1 == s2 && t1 == t2 && m1 == m2,
+            (
+                FetchRange::RefTrades {
+                    from: s1,
+                    to: e1,
+                    spot: m1,
+                },
+                FetchRange::RefTrades {
+                    from: s2,
+                    to: e2,
+                    spot: m2,
+                },
+            ) => e1 == e2 && s1 == s2 && m1 == m2,
             (FetchRange::Trades(s1, e1), FetchRange::Trades(s2, e2)) => e1 == e2 && s1 == s2,
             (
                 FetchRange::BubbleSummary {
@@ -1454,6 +1484,40 @@ pub fn request_fetch(
 
             log::warn!(
                 "REFKLINES Skip | pane={} req={} reason=no_source ready_streams={}",
+                short_id(pane_id),
+                short_id(req_id),
+                format_streams(ready_streams)
+            );
+        }
+        FetchRange::RefTrades { from, to, spot } => {
+            let chart_stream = stream
+                .into_iter()
+                .chain(ready_streams.iter().copied())
+                .find(|stream| matches!(stream, StreamKind::Kline { .. }));
+
+            if let Some(chart_stream @ StreamKind::Kline { ticker_info, .. }) = chart_stream
+                && let Some(source) = if spot {
+                    market_counterpart(ticker_info)
+                } else {
+                    Some(ticker_info)
+                }
+                && supports_exchange_trade_fetch(source.exchange())
+            {
+                return ref_trades_fetch_task(
+                    server,
+                    handles.clone(),
+                    layout_id,
+                    pane_id,
+                    chart_stream,
+                    source,
+                    spot,
+                    req_id,
+                    (from, to),
+                );
+            }
+
+            log::warn!(
+                "REFTRADES Skip | pane={} req={} reason=no_source ready_streams={}",
                 short_id(pane_id),
                 short_id(req_id),
                 format_streams(ready_streams)
@@ -2277,6 +2341,73 @@ fn ref_klines_fetch_task(
                     timeframe,
                     spot,
                 }),
+            },
+        },
+    )
+}
+
+/// Trades of `source` over `from..=to` through the usual trade path (cache, archives, REST),
+/// collected and delivered in one piece.
+#[allow(clippy::too_many_arguments)]
+fn ref_trades_fetch_task(
+    server: Option<ServerClient>,
+    handles: AdapterHandles,
+    layout_id: Uuid,
+    pane_id: Uuid,
+    chart_stream: StreamKind,
+    source: TickerInfo,
+    spot: bool,
+    req_id: Uuid,
+    (from, to): (UnixMs, UnixMs),
+) -> Task<FetchUpdate> {
+    use iced::task::Sipper;
+
+    let fetch = async move {
+        let started = Instant::now();
+        let data_path = exchange_trade_data_path(source.exchange());
+        let mut straw =
+            fetch_trades_batched(server, handles, source, from, to, data_path, req_id).pin();
+        let mut trades = Vec::new();
+        while let Some(batch) = straw.sip().await {
+            trades.extend(batch);
+        }
+        let outcome = straw.await?;
+        // A worker that ran out of time leaves a tail; the caller asks again (what was
+        // fetched is cached by then).
+        let complete = outcome.unfilled_tail.is_none();
+        log::info!(
+            "REFTRADES Done | pane={} req={} venue={} symbol={} range={} trades={} complete={complete} duration={}",
+            short_id(pane_id),
+            short_id(req_id),
+            format_venue(&source),
+            format_symbol(&source),
+            format_time_range(from, to),
+            trades.len(),
+            format_duration_ms(started.elapsed().as_millis() as u64)
+        );
+        Ok::<_, AdapterError>((trades, complete))
+    };
+
+    Task::perform(
+        iced::futures::TryFutureExt::map_err(fetch, |err| err.ui_message()),
+        move |result| match result {
+            Ok((data, complete)) => FetchUpdate::Data {
+                layout_id,
+                pane_id,
+                data: FetchedData::RefTrades {
+                    data,
+                    spot,
+                    range: (from, to),
+                    complete,
+                    req_id: Some(req_id),
+                },
+                stream: chart_stream,
+            },
+            Err(error) => FetchUpdate::Error {
+                pane_id,
+                error,
+                req_id: Some(req_id),
+                fetch: Some(FetchRange::RefTrades { from, to, spot }),
             },
         },
     )
