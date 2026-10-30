@@ -24,7 +24,7 @@ use data::util::format_with_commas;
 use exchange::{Timeframe, Trade, UnixMs, adapter::MarketKind};
 
 use iced::widget::canvas::{self, Stroke};
-use iced::widget::{center, column, row, text};
+use iced::widget::{center, column, container, row, text};
 use std::{collections::BTreeMap, ops::RangeInclusive};
 
 /// History fetched for both markets, independent of the zoom.
@@ -176,7 +176,7 @@ impl SizeCvdIndicator {
         data_labels_always_visible: bool,
         visible_range: RangeInclusive<u64>,
     ) -> iced::Element<'a, Message> {
-        let size = crate::style::text_size::TINY;
+        let size = crate::style::text_size::SECTION;
         let title = if spot { "Spot by size" } else { "Perp by size" };
         if side.series.is_empty() {
             let status = if side.in_flight.is_some() {
@@ -184,7 +184,11 @@ impl SizeCvdIndicator {
             } else {
                 "no trades yet"
             };
-            return column![text(title).size(size), center(text(status).size(size))].into();
+            return column![
+                container(text(title).size(size)).padding(LEGEND_PADDING),
+                center(text(status).size(size))
+            ]
+            .into();
         }
         let enabled = self.config.buckets;
         let plot = SizeCvdPlot {
@@ -242,9 +246,12 @@ impl SizeCvdIndicator {
         }
         legend =
             legend.push(text(format!("axis: {}, normalized", SIZE_GROUP_NAMES[axis])).size(size));
-        column![legend, plot].into()
+        column![container(legend).padding(LEGEND_PADDING), plot].into()
     }
 }
+
+/// Keeps the legend off the panel's left edge.
+const LEGEND_PADDING: [u16; 2] = [2, 8];
 
 impl KlineIndicatorImpl for SizeCvdIndicator {
     fn clear_all_caches(&mut self) {
@@ -279,14 +286,14 @@ impl KlineIndicatorImpl for SizeCvdIndicator {
         }
         let chart_is_spot = chart.ticker_info.market_type() == MarketKind::Spot;
         let has_pair = market_counterpart(chart.ticker_info).is_some();
-        // Perp on top, spot below, whichever market the chart shows.
+        // Spot on top, perp below, whichever market the chart shows.
         let (perp, spot) = if chart_is_spot {
             (has_pair.then_some(&self.sides[1]), Some(&self.sides[0]))
         } else {
             (Some(&self.sides[0]), has_pair.then_some(&self.sides[1]))
         };
         let mut panels = column![].spacing(4);
-        for (side, is_spot) in [(perp, false), (spot, true)] {
+        for (side, is_spot) in [(spot, true), (perp, false)] {
             if let Some(side) = side {
                 panels = panels.push(self.market_view(
                     side,
