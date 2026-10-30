@@ -36,6 +36,7 @@ pub enum Runtime {
     BarAnalysis,
     OpenInterest,
     SpotCvd,
+    SizeCvd,
     /// Price-chart overlays that own fetched data.
     PeriodLevels,
     Vwap,
@@ -49,6 +50,7 @@ pub enum Editor {
     NakedLevels,
     Cvd,
     SpotCvd,
+    SizeCvd,
     Period(ScriptKind),
     Macd,
     Tpo,
@@ -242,6 +244,15 @@ pub const DEFINITIONS: &[Definition] = &[
         Bars,
         Runtime::Overlay,
         Editor::None
+    ),
+    define!(
+        SizeCvd,
+        "CVD by order size",
+        "CVD split by taker order size in USD (one market order sweeping several levels counts once): retail < $10K, medium $10K–100K, large $100K–1M, whales > $1M. Each line normalized to the visible range. Needs raw trades: bars from cached history older than 2 days have no split.",
+        OrderFlow,
+        Delta,
+        Runtime::SizeCvd,
+        Editor::SizeCvd
     ),
 ];
 

@@ -57,6 +57,7 @@
 - **Синхронная ось времени**: скролл/зум графика двигает другие графики того же символа и таймфрейма в раскладке (спот и перп), `Dashboard::sync_time_view` → `ViewState::follow_time_view`; ось цены у каждого своя.
 - **OI + delta bars** — отдельный индикатор `KlineIndicator::OiBars` (перп, нужен Open Interest); из Signals убран.
 - Signals → **Failed auctions** (`src/chart/kline/failed_auction.rs`): выход за уровень и возврат закрытием, уровни из `KlineChart::auction_levels` (period levels по дням через `KlineIndicatorImpl::auction_levels`, FRVP VAH/VAL, линии); пороги — константы в начале файла.
+- **CVD by order size** (`src/chart/indicator/kline/size_cvd.rs`, `KlineIndicator::SizeCvd`): линия CVD на корзину размера заявки в USD (`SIZE_BUCKET_USD`, ретейл/средние/крупные/киты), части одной заявки = сделки одной стороны в одну мс. Считается из сырых сделок в `IntrabarStats::size_delta`, нормировка по видимому участку, ось — самая крупная включённая корзина; галочки корзин — `IndicatorConfigs::size_cvd`.
 - Ловушка iced: `Frame::with_clip` теряет трансформ графика — не использовать в chart-space.
 - Шкала времени у пользователя — в UTC (лог пишется по МСК, UTC+3): сверять свечи по числу сделок в Bar Stats.
 - У Binance бывают дыры в `aggTrades` (27.10 00:03–00:30 UTC: в REST нет сделок, а в klines они есть). Кэш при чтении считает долгую тишину дырой (`trade_integrity_gaps`) и докачивает; дыру на стороне биржи закроет только дневной архив, когда выйдет.

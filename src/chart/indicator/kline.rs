@@ -14,6 +14,7 @@ pub mod htf_vwap;
 pub mod open_interest;
 pub mod period_levels;
 pub mod scripted;
+pub mod size_cvd;
 pub mod spot_cvd;
 pub mod volume;
 
@@ -187,6 +188,7 @@ pub fn make_empty(which: KlineIndicator) -> Box<dyn KlineIndicatorImpl> {
         Runtime::BarAnalysis => Box::new(bar_analysis::BarAnalysisIndicator::new()),
         Runtime::OpenInterest => Box::new(open_interest::OpenInterestIndicator::new()),
         Runtime::SpotCvd => Box::new(spot_cvd::SpotCvdIndicator::new()),
+        Runtime::SizeCvd => Box::new(size_cvd::SizeCvdIndicator::new()),
         Runtime::PeriodLevels => Box::new(period_levels::PeriodLevelsIndicator::new()),
         Runtime::Vwap => Box::new(htf_vwap::HtfVwapIndicator::new()),
         Runtime::Scripted(kind) => Box::new(scripted::ScriptedIndicator::new(kind)),

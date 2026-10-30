@@ -2,7 +2,7 @@ use crate::{aggr::time::DataPoint, chart::indicator::KlineIndicator};
 use exchange::{
     Kline, Trade, UnixMs,
     unit::price::{Price, PriceStep},
-    unit::qty::Qty,
+    unit::qty::{Qty, SizeUnit, volume_size_unit},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -238,6 +238,57 @@ pub struct IntrabarStats {
     pub net_delta: f64,
     pub first_time: UnixMs,
     pub last_time: UnixMs,
+    /// Delta split by taker order size, see [`size_bucket`].
+    pub size_delta: [f64; SIZE_BUCKETS],
+}
+
+/// Order size buckets in USD: retail < 10K, medium < 100K, large < 1M, whales above.
+pub const SIZE_BUCKET_USD: [f64; SIZE_BUCKETS - 1] = [10_000.0, 100_000.0, 1_000_000.0];
+pub const SIZE_BUCKETS: usize = 4;
+pub const SIZE_BUCKET_LABELS: [&str; SIZE_BUCKETS] = [
+    "Retail < $10K",
+    "Medium $10K–100K",
+    "Large $100K–1M",
+    "Whales > $1M",
+];
+
+pub fn size_bucket(notional_usd: f64) -> usize {
+    SIZE_BUCKET_USD
+        .iter()
+        .take_while(|&&edge| notional_usd >= edge)
+        .count()
+}
+
+/// Delta per size bucket. A taker order sweeping several price levels prints as several
+/// trades with the same timestamp and side, so those are summed into one order first.
+/// `sequence` is in time order.
+fn size_delta(sequence: &[&Trade]) -> [f64; SIZE_BUCKETS] {
+    size_delta_in(sequence, volume_size_unit() == SizeUnit::Quote)
+}
+
+/// `quote_qty`: trade sizes are already in USD.
+fn size_delta_in(sequence: &[&Trade], quote_qty: bool) -> [f64; SIZE_BUCKETS] {
+    let mut out = [0.0; SIZE_BUCKETS];
+    for order in sequence.chunk_by(|a, b| a.time == b.time) {
+        // (qty, notional) for buys, then sells.
+        let mut sides = [(0.0_f64, 0.0_f64); 2];
+        for trade in order {
+            let qty = trade.qty.to_f64();
+            let side = &mut sides[usize::from(trade.is_sell)];
+            side.0 += qty;
+            side.1 += if quote_qty {
+                qty
+            } else {
+                qty * trade.price.to_f64()
+            };
+        }
+        for (is_sell, (qty, notional)) in sides.into_iter().enumerate() {
+            if qty > 0.0 {
+                out[size_bucket(notional)] += if is_sell == 1 { -qty } else { qty };
+            }
+        }
+    }
+    out
 }
 
 impl IntrabarStats {
@@ -266,6 +317,7 @@ impl IntrabarStats {
             net_delta: running,
             first_time: first,
             last_time: last,
+            size_delta: size_delta(&sequence),
         })
     }
 
@@ -278,6 +330,7 @@ impl IntrabarStats {
             net_delta: self.net_delta + later.net_delta,
             first_time: self.first_time,
             last_time: later.last_time,
+            size_delta: std::array::from_fn(|i| self.size_delta[i] + later.size_delta[i]),
         }
     }
 
@@ -1151,6 +1204,23 @@ pub struct IndicatorConfigs {
     pub period_levels: PeriodLevelsConfig,
     pub naked_levels: NakedLevelsConfig,
     pub spot_cvd: SpotCvdConfig,
+    pub size_cvd: SizeCvdConfig,
+}
+
+/// CVD by order size: which size buckets get a line.
+#[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct SizeCvdConfig {
+    /// Retail, medium, large, whales (see `SIZE_BUCKET_USD`).
+    pub buckets: [bool; SIZE_BUCKETS],
+}
+
+impl Default for SizeCvdConfig {
+    fn default() -> Self {
+        Self {
+            buckets: [true; SIZE_BUCKETS],
+        }
+    }
 }
 
 /// CVD Futures + Spot panel.
@@ -2202,6 +2272,27 @@ mod volume_bubble_tests {
             price: Price::from_f64(price),
             qty: Qty::from_f64(qty),
         }
+    }
+
+    #[test]
+    fn size_delta_sums_one_sweep_into_one_order() {
+        // 0.1 BTC at 100K = $10K: medium. A sweep of 3 × 4 BTC in one ms = $1.2M: whales.
+        let trades = [
+            trade(1, 1_000, 100_000.0, 0.05, false),
+            trade(2, 2_000, 100_000.0, 0.1, true),
+            trade(3, 3_000, 100_000.0, 4.0, false),
+            trade(4, 3_000, 100_010.0, 4.0, false),
+            trade(5, 3_000, 100_020.0, 4.0, false),
+            trade(6, 3_000, 99_990.0, 0.01, true),
+        ];
+        let refs: Vec<&Trade> = trades.iter().collect();
+        let split = size_delta_in(&refs, false);
+        assert!((split[0] - (0.05 - 0.01)).abs() < 1e-9);
+        assert!((split[1] + 0.1).abs() < 1e-9);
+        assert_eq!(split[2], 0.0);
+        assert!((split[3] - 12.0).abs() < 1e-9);
+        assert_eq!(size_bucket(999_999.0), 2);
+        assert_eq!(size_bucket(1_000_000.0), 3);
     }
 
     fn cluster(trades: &[Trade], config: &VolumeBubbleConfig) -> Vec<VolumeBubbleCluster> {

@@ -1,6 +1,8 @@
 use super::config_message;
 use crate::screen::dashboard::pane::Message;
-use data::chart::kline::{Config, CvdConfig, IndicatorConfigs, SpotCvdConfig};
+use data::chart::kline::{
+    Config, CvdConfig, IndicatorConfigs, SIZE_BUCKET_LABELS, SizeCvdConfig, SpotCvdConfig,
+};
 use iced::{
     Element,
     widget::{checkbox, column, pane_grid, text},
@@ -33,4 +35,39 @@ pub(super) fn spot_view(pane: pane_grid::Pane, cfg: Config) -> Element<'static, 
     ]
     .spacing(12)
     .into()
+}
+
+pub(super) fn size_view(pane: pane_grid::Pane, cfg: Config) -> Element<'static, Message> {
+    let size_cvd = cfg.indicator_configs.size_cvd;
+    let mut items = column![].spacing(12);
+    for (i, label) in SIZE_BUCKET_LABELS.into_iter().enumerate() {
+        items = items.push(
+            checkbox(size_cvd.buckets[i])
+                .label(label)
+                .on_toggle(move |on| {
+                    let mut buckets = size_cvd.buckets;
+                    buckets[i] = on;
+                    config_message(
+                        pane,
+                        Config {
+                            indicator_configs: IndicatorConfigs {
+                                size_cvd: SizeCvdConfig { buckets },
+                                ..cfg.indicator_configs
+                            },
+                            ..cfg
+                        },
+                    )
+                }),
+        );
+    }
+    items
+        .push(
+            text("Size of one taker order: trades with the same timestamp and side are summed. The axis shows the largest enabled bucket; the other lines are rescaled to the same height.")
+                .size(12),
+        )
+        .push(
+            text("Needs raw trades: bars rebuilt from cached history older than 2 days carry no split and hold the lines flat.")
+                .size(12),
+        )
+        .into()
 }

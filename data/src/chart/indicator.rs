@@ -37,6 +37,7 @@ pub enum KlineIndicator {
     SpotCvd,
     PeriodLevels,
     OiBars,
+    SizeCvd,
 }
 
 impl Indicator for KlineIndicator {
