@@ -2,6 +2,7 @@ use super::persistent_cache::{MarketDataCache, market_cache, merge_bubble_summar
 use data::chart::kline::{BubbleVolumeSummary, VolumeBubbleConfig, cluster_volume_bubble_trades};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
 use exchange::unit::PriceStep;
+use exchange::unit::quantity_context::QuantityContext;
 use exchange::{Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs};
 use iced::{
     Task,
@@ -1306,6 +1307,10 @@ fn interrupted_trade_fetch(
 
 #[derive(Debug, Clone)]
 pub enum FetchUpdate {
+    Scoped {
+        context: QuantityContext,
+        update: Box<FetchUpdate>,
+    },
     Status {
         pane_id: Uuid,
         status: FetchTaskStatus,
@@ -1324,7 +1329,59 @@ pub enum FetchUpdate {
     },
 }
 
+fn scope_fetch_task(task: Task<FetchUpdate>, context: QuantityContext) -> Task<FetchUpdate> {
+    task.map(move |update| {
+        if matches!(&update, FetchUpdate::Scoped { context: existing, .. } if *existing == context)
+        {
+            update
+        } else {
+            FetchUpdate::Scoped {
+                context,
+                update: Box::new(update),
+            }
+        }
+    })
+}
+
+fn in_quantity_context<T>(
+    context: QuantityContext,
+    action: impl FnOnce() -> T,
+) -> Result<T, AdapterError> {
+    context
+        .with_current(action)
+        .map_err(|error| AdapterError::InvalidRequest(error.to_string()))
+}
+
 pub fn request_fetch(
+    sources: &DataSources,
+    pane_id: Uuid,
+    ready_streams: &[StreamKind],
+    layout_id: Uuid,
+    req_id: Uuid,
+    fetch: FetchRange,
+    stream: Option<StreamKind>,
+    on_trade_handle: &mut impl FnMut(Handle),
+    chart_generation: u64,
+) -> Task<FetchUpdate> {
+    let context = sources.exchange.quantity_context();
+    scope_fetch_task(
+        request_fetch_inner(
+            sources,
+            pane_id,
+            ready_streams,
+            layout_id,
+            req_id,
+            fetch,
+            stream,
+            on_trade_handle,
+            chart_generation,
+        ),
+        context,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn request_fetch_inner(
     sources: &DataSources,
     pane_id: Uuid,
     ready_streams: &[StreamKind],
@@ -1895,6 +1952,8 @@ async fn fetch_klines_cached(
     timeframe: Timeframe,
     range: Option<(UnixMs, UnixMs)>,
 ) -> Result<Vec<Kline>, AdapterError> {
+    let context = handles.quantity_context();
+    in_quantity_context(context, || ())?;
     let Some((from, to)) = range else {
         return handles.fetch_klines(ticker_info, timeframe, None).await;
     };
@@ -1902,11 +1961,13 @@ async fn fetch_klines_cached(
         return Err(AdapterError::InvalidRequest("Invalid kline range".into()));
     }
     let to_exclusive = to.saturating_add(1);
-    let Some(cache) = market_cache() else {
+    let Some(cache) = in_quantity_context(context, market_cache)? else {
         return fetch_paged_klines(handles, ticker_info, timeframe, from, to_exclusive).await;
     };
 
-    let cached = cache.read_klines(ticker_info, timeframe, from, to_exclusive);
+    let cached = in_quantity_context(context, || {
+        cache.read_klines(ticker_info, timeframe, from, to_exclusive)
+    })?;
     let cache_complete = cached.is_complete();
     let mut combined = cached.records;
     for (gap_from, gap_to_exclusive) in cached.gaps {
@@ -1914,14 +1975,16 @@ async fn fetch_klines_cached(
             fetch_paged_klines(handles, ticker_info, timeframe, gap_from, gap_to_exclusive).await?;
         fetched.sort_by_key(|kline| kline.time);
         fetched.dedup_by_key(|kline| kline.time);
-        store_contiguous_klines(
-            cache,
-            ticker_info,
-            timeframe,
-            gap_from,
-            gap_to_exclusive,
-            &fetched,
-        );
+        in_quantity_context(context, || {
+            store_contiguous_klines(
+                cache,
+                ticker_info,
+                timeframe,
+                gap_from,
+                gap_to_exclusive,
+                &fetched,
+            )
+        })?;
         combined.extend(fetched);
     }
     combined.sort_by_key(|kline| kline.time);
@@ -2135,6 +2198,21 @@ async fn fetch_open_interest_cached(
 }
 
 pub fn oi_fetch_task(
+    handles: AdapterHandles,
+    layout_id: Uuid,
+    pane_id: Uuid,
+    stream: StreamKind,
+    req_id: Option<Uuid>,
+    range: Option<(UnixMs, UnixMs)>,
+) -> Task<FetchUpdate> {
+    let context = handles.quantity_context();
+    scope_fetch_task(
+        oi_fetch_task_inner(handles, layout_id, pane_id, stream, req_id, range),
+        context,
+    )
+}
+
+fn oi_fetch_task_inner(
     handles: AdapterHandles,
     layout_id: Uuid,
     pane_id: Uuid,
@@ -2421,6 +2499,21 @@ pub fn kline_fetch_task(
     req_id: Option<Uuid>,
     range: Option<(UnixMs, UnixMs)>,
 ) -> Task<FetchUpdate> {
+    let context = handles.quantity_context();
+    scope_fetch_task(
+        kline_fetch_task_inner(handles, layout_id, pane_id, stream, req_id, range),
+        context,
+    )
+}
+
+fn kline_fetch_task_inner(
+    handles: AdapterHandles,
+    layout_id: Uuid,
+    pane_id: Uuid,
+    stream: StreamKind,
+    req_id: Option<Uuid>,
+    range: Option<(UnixMs, UnixMs)>,
+) -> Task<FetchUpdate> {
     let update_status = Task::done(FetchUpdate::Status {
         pane_id,
         status: FetchTaskStatus::Loading(InfoKind::FetchingKlines),
@@ -2563,6 +2656,7 @@ pub fn fetch_trades_batched(
     data_path: PathBuf,
     req_id: Uuid,
 ) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
+    let context = handles.quantity_context();
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
 
@@ -2572,12 +2666,14 @@ pub fn fetch_trades_batched(
         let mut request_count = 0usize;
         let mut last_progress_log = Instant::now();
         let to_exclusive = to_time.saturating_add(1);
-        let (cached_trades, gaps) = if let Some(cache) = market_cache() {
-            let cached = cache.read_trades(ticker_info, from_time, to_exclusive);
-            (cached.records, cached.gaps)
-        } else {
-            (Vec::new(), vec![(from_time, to_exclusive)])
-        };
+        let (cached_trades, gaps) = in_quantity_context(context, || {
+            if let Some(cache) = market_cache() {
+                let cached = cache.read_trades(ticker_info, from_time, to_exclusive);
+                (cached.records, cached.gaps)
+            } else {
+                (Vec::new(), vec![(from_time, to_exclusive)])
+            }
+        })?;
 
         log::info!(
             "TRADE Worker | {venue} {symbol} req={} range={} path={} cached={} gaps={}",
@@ -2679,6 +2775,7 @@ pub fn fetch_trades_batched(
                 })
                 .await;
 
+                in_quantity_context(context, || ())?;
                 match fetch_result {
                     Err(_) => {
                         let elapsed = request_started.elapsed().as_millis() as u64;
@@ -2741,16 +2838,18 @@ pub fn fetch_trades_batched(
                                 cache_batch.len()
                             );
                         }
-                        if let Some(cache) = market_cache()
-                            && request_from < covered_to_exclusive
-                        {
-                            cache.store_trades(
-                                ticker_info,
-                                request_from,
-                                covered_to_exclusive,
-                                &cache_batch,
-                            );
-                        }
+                        in_quantity_context(context, || {
+                            if let Some(cache) = market_cache()
+                                && request_from < covered_to_exclusive
+                            {
+                                cache.store_trades(
+                                    ticker_info,
+                                    request_from,
+                                    covered_to_exclusive,
+                                    &cache_batch,
+                                );
+                            }
+                        })?;
 
                         if latest_trade_t <= prev_latest_trade_t {
                             consecutive_no_progress += 1;
@@ -2844,8 +2943,9 @@ async fn fetch_bubble_summaries_cached(
     cluster_price_ticks: u32,
     data_path: PathBuf,
 ) -> Result<(Vec<BubbleVolumeSummary>, usize, usize), AdapterError> {
+    let context = handles.quantity_context();
     let to_exclusive = to_time.saturating_add(1);
-    let Some(cache) = market_cache() else {
+    let Some(cache) = in_quantity_context(context, market_cache)? else {
         let (summaries, trades_seen, raw_discarded, _) = fetch_bubble_summaries(
             handles,
             ticker_info,
@@ -2862,16 +2962,18 @@ async fn fetch_bubble_summaries_cached(
         return Ok((summaries, trades_seen, raw_discarded));
     };
 
-    let cached = cache.read_bubble_summaries(
-        ticker_info,
-        timeframe_ms,
-        price_step.units,
-        max_candidates_per_candle,
-        cluster_window_ms,
-        cluster_price_ticks,
-        from_time,
-        to_exclusive,
-    );
+    let cached = in_quantity_context(context, || {
+        cache.read_bubble_summaries(
+            ticker_info,
+            timeframe_ms,
+            price_step.units,
+            max_candidates_per_candle,
+            cluster_window_ms,
+            cluster_price_ticks,
+            from_time,
+            to_exclusive,
+        )
+    })?;
     let cache_complete = cached.is_complete();
     let mut summaries = cached.records;
     let mut trades_seen = summaries
@@ -2916,17 +3018,19 @@ async fn fetch_bubble_summaries_cached(
             })
             .cloned()
             .collect::<Vec<_>>();
-        cache.store_bubble_summaries(
-            ticker_info,
-            timeframe_ms,
-            price_step.units,
-            max_candidates_per_candle,
-            cluster_window_ms,
-            cluster_price_ticks,
-            verified_from,
-            verified_to_exclusive,
-            &verified_summaries,
-        );
+        in_quantity_context(context, || {
+            cache.store_bubble_summaries(
+                ticker_info,
+                timeframe_ms,
+                price_step.units,
+                max_candidates_per_candle,
+                cluster_window_ms,
+                cluster_price_ticks,
+                verified_from,
+                verified_to_exclusive,
+                &verified_summaries,
+            )
+        })?;
     }
     if cache_complete {
         log::debug!(
@@ -2951,6 +3055,7 @@ async fn fetch_bubble_summaries(
     cluster_price_ticks: u32,
     data_path: PathBuf,
 ) -> Result<(Vec<BubbleVolumeSummary>, usize, usize, UnixMs), AdapterError> {
+    let context = handles.quantity_context();
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
     let started = Instant::now();
@@ -3000,15 +3105,17 @@ async fn fetch_bubble_summaries(
         }
 
         trades_seen += batch.len();
-        if let Some(cache) = market_cache() {
-            let cache_to_exclusive = latest_trade_t.min(to_time).saturating_add(1);
-            let cache_batch = batch
-                .iter()
-                .copied()
-                .filter(|trade| trade.time >= request_from && trade.time < cache_to_exclusive)
-                .collect::<Vec<_>>();
-            cache.store_trades(ticker_info, request_from, cache_to_exclusive, &cache_batch);
-        }
+        in_quantity_context(context, || {
+            if let Some(cache) = market_cache() {
+                let cache_to_exclusive = latest_trade_t.min(to_time).saturating_add(1);
+                let cache_batch = batch
+                    .iter()
+                    .copied()
+                    .filter(|trade| trade.time >= request_from && trade.time < cache_to_exclusive)
+                    .collect::<Vec<_>>();
+                cache.store_trades(ticker_info, request_from, cache_to_exclusive, &cache_batch);
+            }
+        })?;
         log::debug!(
             "BUBBLE Summary Batch | trades_seen={trades_seen} buckets={} retained_candidates={} request_idx={request_count} first={} last={} duration={}",
             buckets.len(),
@@ -3034,13 +3141,15 @@ async fn fetch_bubble_summaries(
         ..VolumeBubbleConfig::default()
     };
     bubble_config.max_candidates_per_candle = max_candidates_per_candle;
-    let summaries = bubble_summaries_from_buckets(
-        buckets,
-        timeframe_ms,
-        price_step,
-        max_candidates_per_candle,
-        &bubble_config,
-    );
+    let summaries = in_quantity_context(context, || {
+        bubble_summaries_from_buckets(
+            buckets,
+            timeframe_ms,
+            price_step,
+            max_candidates_per_candle,
+            &bubble_config,
+        )
+    })?;
     let candidate_count = summaries
         .iter()
         .map(|summary| summary.candidates.len())
@@ -3453,5 +3562,100 @@ mod tests {
         // Unknown request should be treated as stale
         assert!(handler.is_stale_generation(random_id));
         assert_eq!(handler.request_generation(random_id), None);
+    }
+}
+
+#[cfg(test)]
+mod quantity_context_tests {
+    use super::*;
+    use exchange::unit::qty::{Qty, SizeUnit, set_preferred_currency};
+    use std::hash::{Hash, Hasher};
+
+    #[test]
+    fn stale_source_cannot_relabel_cached_data_in_another_unit() {
+        let root =
+            std::env::temp_dir().join(format!("flowdepth-quantity-context-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "connector::fetcher::quantity_context_tests::stale_source_child",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("FLOWSURFACE_DATA_PATH", &root)
+            .env("FLOWDEPTH_CONTEXT_TEST_CHILD", "1")
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(root);
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("context-child-checked"));
+    }
+
+    #[test]
+    #[ignore = "subprocess helper; exercised by stale_source test"]
+    fn stale_source_child() {
+        assert_eq!(std::env::var("FLOWDEPTH_CONTEXT_TEST_CHILD").unwrap(), "1");
+        set_preferred_currency(SizeUnit::Quote);
+        let context = QuantityContext::capture();
+        let client = reqwest::Client::new();
+        let old_handles = AdapterHandles::spawn_venues(&client, std::iter::empty(), None);
+        let ticker = TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", Exchange::BinanceLinear),
+            0.1,
+            0.001,
+            None,
+        );
+        let from = UnixMs::new(1_000);
+        let to = UnixMs::new(2_000);
+        let trade = Trade {
+            id: Some(1),
+            time: from,
+            price: exchange::unit::Price::from_f64(100.0),
+            qty: Qty::from_f64(2.0),
+            is_sell: false,
+        };
+        let cache = market_cache().unwrap();
+        in_quantity_context(context, || cache.store_trades(ticker, from, to, &[trade])).unwrap();
+        let delayed = iced::futures::executor::block_on(context.check_future(async {
+            set_preferred_currency(SizeUnit::Base);
+            vec![trade]
+        }));
+        assert!(delayed.is_err());
+        assert!(
+            in_quantity_context(context, || cache.store_trades(ticker, from, to, &[trade]))
+                .is_err()
+        );
+        assert!(cache.read_trades(ticker, from, to).records.is_empty());
+        let obsolete = iced::futures::executor::block_on(old_handles.fetch_klines(
+            ticker,
+            Timeframe::M1,
+            None,
+        ));
+        assert!(
+            obsolete
+                .unwrap_err()
+                .to_string()
+                .contains("Quantity context changed")
+        );
+        let current_handles = AdapterHandles::spawn_venues(&client, std::iter::empty(), None);
+        let hash = |handles: &AdapterHandles| {
+            let mut hash = std::collections::hash_map::DefaultHasher::new();
+            handles.hash(&mut hash);
+            hash.finish()
+        };
+        assert_eq!(hash(&old_handles), hash(&old_handles.clone()));
+        assert_ne!(hash(&old_handles), hash(&current_handles));
+        set_preferred_currency(SizeUnit::Quote);
+        assert!(!context.is_current());
+        let records = cache.read_trades(ticker, from, to).records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].qty, trade.qty);
+        println!("context-child-checked");
     }
 }

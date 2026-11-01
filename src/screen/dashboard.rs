@@ -44,6 +44,10 @@ use std::{collections::HashMap, sync::Arc, time::Instant, vec};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    ScopedFetch {
+        context: exchange::unit::quantity_context::QuantityContext,
+        update: Box<fetcher::FetchUpdate>,
+    },
     Pane(window::Id, pane::Message),
     ChangePaneStatus(uuid::Uuid, pane::Status),
     FetchCompleted {
@@ -715,6 +719,18 @@ impl Dashboard {
     ) -> (Task<Message>, Option<Event>) {
         let handles = &data_sources.exchange;
         match message {
+            Message::ScopedFetch { context, update } => {
+                if context.is_current() {
+                    return self.update(
+                        (*update).into(),
+                        main_window,
+                        layout_id,
+                        data_sources,
+                        windowing_mode,
+                    );
+                }
+                return (Task::none(), None);
+            }
             Message::SavePopoutSpecs(specs) => {
                 for (window_id, new_spec) in specs {
                     if let Some((_, spec)) = self.popout.get_mut(&window_id) {
@@ -2025,6 +2041,17 @@ impl Dashboard {
         update: fetcher::FetchUpdate,
     ) {
         match update {
+            fetcher::FetchUpdate::Scoped { context, update } => {
+                if context.is_current() {
+                    self.apply_backfill_update(
+                        main_window,
+                        pane_ids,
+                        stream,
+                        show_activity,
+                        *update,
+                    );
+                }
+            }
             fetcher::FetchUpdate::Status { status, .. } => match status {
                 fetcher::FetchTaskStatus::Loading(info) => {
                     log::debug!(
@@ -3480,6 +3507,9 @@ fn all_unique_streams(streams: &UniqueStreams) -> Vec<StreamKind> {
 impl From<fetcher::FetchUpdate> for Message {
     fn from(update: fetcher::FetchUpdate) -> Self {
         match update {
+            fetcher::FetchUpdate::Scoped { context, update } => {
+                Message::ScopedFetch { context, update }
+            }
             fetcher::FetchUpdate::Status { pane_id, status } => match status {
                 fetcher::FetchTaskStatus::Loading(info) => Message::ChangePaneStatus(
                     pane_id,

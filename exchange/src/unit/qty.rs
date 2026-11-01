@@ -3,7 +3,6 @@ use crate::{TickerInfo, adapter::MarketKind};
 
 use super::MinQtySize;
 use serde::{Deserialize, Serialize};
-use std::sync::atomic::{AtomicU8, Ordering};
 
 /// Unit for displaying volume/quantity size values.
 ///
@@ -45,18 +44,12 @@ impl QuantityUnit {
     }
 }
 
-static SIZE_CALC_UNIT: AtomicU8 = AtomicU8::new(SizeUnit::Quote as u8);
-
 pub fn set_preferred_currency(v: SizeUnit) {
-    SIZE_CALC_UNIT.store(v as u8, Ordering::Relaxed);
+    super::quantity_context::set_preference(v);
 }
 
 pub fn volume_size_unit() -> SizeUnit {
-    match SIZE_CALC_UNIT.load(Ordering::Relaxed) {
-        0 => SizeUnit::Base,
-        1 => SizeUnit::Quote,
-        _ => SizeUnit::default(),
-    }
+    super::quantity_context::QuantityContext::capture().preference()
 }
 
 /// Fixed atomic unit scale: 10^-QTY_SCALE is the smallest stored fraction.

@@ -17,6 +17,7 @@ pub const MAX_KLINE_STREAMS_PER_STREAM: usize = 100;
 
 #[derive(Clone)]
 pub struct AdapterHandles {
+    quantity_context: crate::unit::quantity_context::QuantityContext,
     binance: Option<binance::BinanceHandle>,
     bybit: Option<bybit::BybitHandle>,
     hyperliquid: Option<hyperliquid::HyperliquidHandle>,
@@ -25,6 +26,9 @@ pub struct AdapterHandles {
 }
 
 impl AdapterHandles {
+    pub fn quantity_context(&self) -> crate::unit::quantity_context::QuantityContext {
+        self.quantity_context
+    }
     pub fn spawn_venue(
         &mut self,
         client: &reqwest::Client,
@@ -59,6 +63,7 @@ impl AdapterHandles {
         proxy: Option<&super::proxy::Proxy>,
     ) -> Self {
         let mut out = Self {
+            quantity_context: crate::unit::quantity_context::QuantityContext::capture(),
             binance: None,
             bybit: None,
             hyperliquid: None,
@@ -437,40 +442,45 @@ impl AdapterHandles {
         timeframe: Timeframe,
         range: Option<(UnixMs, UnixMs)>,
     ) -> Result<Vec<Kline>, AdapterError> {
-        let venue = ticker_info.ticker.exchange.venue();
+        self.quantity_context
+            .check_future(async {
+                let venue = ticker_info.ticker.exchange.venue();
 
-        match venue {
-            Venue::Binance => {
-                let Some(handle) = self.binance.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle.fetch_klines(ticker_info, timeframe, range).await
-            }
-            Venue::Bybit => {
-                let Some(handle) = self.bybit.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle.fetch_klines(ticker_info, timeframe, range).await
-            }
-            Venue::Hyperliquid => {
-                let Some(handle) = self.hyperliquid.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle.fetch_klines(ticker_info, timeframe, range).await
-            }
-            Venue::Okex => {
-                let Some(handle) = self.okex.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle.fetch_klines(ticker_info, timeframe, range).await
-            }
-            Venue::Mexc => {
-                let Some(handle) = self.mexc.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle.fetch_klines(ticker_info, timeframe, range).await
-            }
-        }
+                match venue {
+                    Venue::Binance => {
+                        let Some(handle) = self.binance.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle.fetch_klines(ticker_info, timeframe, range).await
+                    }
+                    Venue::Bybit => {
+                        let Some(handle) = self.bybit.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle.fetch_klines(ticker_info, timeframe, range).await
+                    }
+                    Venue::Hyperliquid => {
+                        let Some(handle) = self.hyperliquid.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle.fetch_klines(ticker_info, timeframe, range).await
+                    }
+                    Venue::Okex => {
+                        let Some(handle) = self.okex.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle.fetch_klines(ticker_info, timeframe, range).await
+                    }
+                    Venue::Mexc => {
+                        let Some(handle) = self.mexc.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle.fetch_klines(ticker_info, timeframe, range).await
+                    }
+                }
+            })
+            .await
+            .map_err(|error| AdapterError::InvalidRequest(error.to_string()))?
     }
 
     pub async fn fetch_klines_page(
@@ -480,50 +490,55 @@ impl AdapterHandles {
         from: UnixMs,
         to: UnixMs,
     ) -> Result<KlinePage, AdapterError> {
-        let venue = ticker_info.ticker.exchange.venue();
+        self.quantity_context
+            .check_future(async {
+                let venue = ticker_info.ticker.exchange.venue();
 
-        match venue {
-            Venue::Binance => {
-                let Some(handle) = self.binance.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle
-                    .fetch_klines_page(ticker_info, timeframe, from, to)
-                    .await
-            }
-            Venue::Bybit => {
-                let Some(handle) = self.bybit.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle
-                    .fetch_klines_page(ticker_info, timeframe, from, to)
-                    .await
-            }
-            Venue::Hyperliquid => {
-                let Some(handle) = self.hyperliquid.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle
-                    .fetch_klines_page(ticker_info, timeframe, from, to)
-                    .await
-            }
-            Venue::Okex => {
-                let Some(handle) = self.okex.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle
-                    .fetch_klines_page(ticker_info, timeframe, from, to)
-                    .await
-            }
-            Venue::Mexc => {
-                let Some(handle) = self.mexc.as_ref() else {
-                    return Err(Self::missing_venue_error(venue));
-                };
-                handle
-                    .fetch_klines_page(ticker_info, timeframe, from, to)
-                    .await
-            }
-        }
+                match venue {
+                    Venue::Binance => {
+                        let Some(handle) = self.binance.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle
+                            .fetch_klines_page(ticker_info, timeframe, from, to)
+                            .await
+                    }
+                    Venue::Bybit => {
+                        let Some(handle) = self.bybit.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle
+                            .fetch_klines_page(ticker_info, timeframe, from, to)
+                            .await
+                    }
+                    Venue::Hyperliquid => {
+                        let Some(handle) = self.hyperliquid.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle
+                            .fetch_klines_page(ticker_info, timeframe, from, to)
+                            .await
+                    }
+                    Venue::Okex => {
+                        let Some(handle) = self.okex.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle
+                            .fetch_klines_page(ticker_info, timeframe, from, to)
+                            .await
+                    }
+                    Venue::Mexc => {
+                        let Some(handle) = self.mexc.as_ref() else {
+                            return Err(Self::missing_venue_error(venue));
+                        };
+                        handle
+                            .fetch_klines_page(ticker_info, timeframe, from, to)
+                            .await
+                    }
+                }
+            })
+            .await
+            .map_err(|error| AdapterError::InvalidRequest(error.to_string()))?
     }
 
     pub async fn fetch_open_interest(
@@ -571,30 +586,36 @@ impl AdapterHandles {
         from_time: UnixMs,
         data_path: Option<PathBuf>,
     ) -> Result<Vec<Trade>, AdapterError> {
-        let exchange = ticker_info.ticker.exchange;
+        self.quantity_context
+            .check_future(async {
+                let exchange = ticker_info.ticker.exchange;
 
-        match exchange.venue() {
-            Venue::Binance => {
-                let Some(handle) = self.binance.as_ref() else {
-                    return Err(Self::missing_venue_error(exchange.venue()));
-                };
-                handle.fetch_trades(ticker_info, from_time, data_path).await
-            }
-            Venue::Mexc if ticker_info.is_perps() => {
-                let Some(handle) = self.mexc.as_ref() else {
-                    return Err(Self::missing_venue_error(exchange.venue()));
-                };
-                handle.fetch_trades(ticker_info, from_time).await
-            }
-            _ => Err(AdapterError::InvalidRequest(format!(
-                "Trade fetch not available for {exchange}"
-            ))),
-        }
+                match exchange.venue() {
+                    Venue::Binance => {
+                        let Some(handle) = self.binance.as_ref() else {
+                            return Err(Self::missing_venue_error(exchange.venue()));
+                        };
+                        handle.fetch_trades(ticker_info, from_time, data_path).await
+                    }
+                    Venue::Mexc if ticker_info.is_perps() => {
+                        let Some(handle) = self.mexc.as_ref() else {
+                            return Err(Self::missing_venue_error(exchange.venue()));
+                        };
+                        handle.fetch_trades(ticker_info, from_time).await
+                    }
+                    _ => Err(AdapterError::InvalidRequest(format!(
+                        "Trade fetch not available for {exchange}"
+                    ))),
+                }
+            })
+            .await
+            .map_err(|error| AdapterError::InvalidRequest(error.to_string()))?
     }
 }
 
 impl std::hash::Hash for AdapterHandles {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::any::TypeId::of::<Self>().hash(state);
+        self.quantity_context.hash(state);
     }
 }

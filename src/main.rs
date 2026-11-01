@@ -317,7 +317,10 @@ enum StartupWarning {
 #[allow(clippy::large_enum_variant)]
 enum Message {
     Sidebar(dashboard::sidebar::Message),
-    MarketWsEvent(exchange::Event),
+    MarketWsEvent(
+        exchange::unit::quantity_context::QuantityContext,
+        exchange::Event,
+    ),
     Dashboard {
         /// If `None`, the active layout is used for the event.
         layout_id: Option<uuid::Uuid>,
@@ -636,7 +639,10 @@ impl Flowsurface {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::MarketWsEvent(event) => {
+            Message::MarketWsEvent(context, event) => {
+                if !context.is_current() {
+                    return Task::none();
+                }
                 let main_window_id = self.main_window.id;
 
                 if let exchange::Event::Connected(streams) = &event {
@@ -2268,7 +2274,8 @@ impl Flowsurface {
             &exchange::adapter::UniqueStreams::from(all_streams.iter()),
             &self.data_sources.exchange,
         )
-        .map(Message::MarketWsEvent);
+        .with(self.data_sources.exchange.quantity_context())
+        .map(|(context, event)| Message::MarketWsEvent(context, event));
 
         let layout_id = self.layout_manager.active_layout_id().map(|id| id.unique);
         let news = self
