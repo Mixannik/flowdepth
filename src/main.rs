@@ -85,11 +85,25 @@ fn template_file_name(name: &str) -> String {
 }
 
 fn main() {
+    // Acquire profile ownership before any logging or state/cache access.
+    let root = match data::profile::initialize(std::env::args_os().skip(1)) {
+        Ok(root) => root,
+        Err(error) => {
+            startup_failure(&error.to_string());
+        }
+    };
+    let _profile_lock = match data::profile::ProfileLock::acquire(&root) {
+        Ok(lock) => lock,
+        Err(error) => {
+            startup_failure(&error.to_string());
+        }
+    };
     logger::install_panic_hook();
 
     if let Err(err) = logger::setup(cfg!(debug_assertions)) {
         logger::report_stderr(&format!("Failed to initialize logger: {err}"));
     }
+    log::info!("PROFILE Ready | root={}", root.display());
 
     let profile = if cfg!(debug_assertions) {
         "debug"
@@ -125,6 +139,30 @@ fn main() {
         log::error!("{message}");
         logger::report_stderr(&message);
     }
+}
+
+// Never use the regular logger on a rejected launch: it belongs to the owner.
+fn startup_failure(message: &str) -> ! {
+    eprintln!("{message}");
+    #[cfg(target_os = "windows")]
+    {
+        let message = message.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let title = "Flowdepth"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        // SAFETY: both strings are NUL-terminated and live for the entire call.
+        unsafe {
+            windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                std::ptr::null_mut(),
+                message.as_ptr(),
+                title.as_ptr(),
+                windows_sys::Win32::UI::WindowsAndMessaging::MB_OK
+                    | windows_sys::Win32::UI::WindowsAndMessaging::MB_ICONWARNING,
+            );
+        }
+    }
+    std::process::exit(2);
 }
 
 struct Flowsurface {
@@ -2201,14 +2239,17 @@ impl Flowsurface {
     }
 
     fn title(&self, _window: window::Id) -> String {
+        let profile = data::profile::label()
+            .map(|name| format!(" — {name}"))
+            .unwrap_or_default();
         if self.debug_terminal.is_window(_window) {
-            return "Flowsurface Debug Terminal".to_string();
+            return format!("Flowsurface Debug Terminal{profile}");
         }
 
         if let Some(id) = self.layout_manager.active_layout_id() {
-            format!("Flowsurface [{}]", id.name)
+            format!("Flowsurface [{}]{profile}", id.name)
         } else {
-            "Flowsurface".to_string()
+            format!("Flowsurface{profile}")
         }
     }
 

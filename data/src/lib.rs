@@ -8,6 +8,7 @@ pub mod metadata;
 pub mod news;
 pub mod orderflow;
 pub mod panel;
+pub mod profile;
 pub mod stream;
 pub mod tickers_table;
 pub mod util;
@@ -1042,21 +1043,7 @@ pub fn open_url(url: &str) -> Result<(), InternalError> {
 }
 
 pub fn data_path(path_name: Option<&str>) -> PathBuf {
-    if let Ok(path) = std::env::var("FLOWSURFACE_DATA_PATH") {
-        let base = PathBuf::from(path);
-        if let Some(path_name) = path_name {
-            base.join(path_name)
-        } else {
-            base
-        }
-    } else {
-        let data_dir = dirs_next::data_dir().unwrap_or_else(|| PathBuf::from("."));
-        if let Some(path_name) = path_name {
-            data_dir.join("flowsurface").join(path_name)
-        } else {
-            data_dir.join("flowsurface")
-        }
-    }
+    profile::data_path(path_name)
 }
 
 fn cleanup_directory(data_path: &PathBuf) -> usize {

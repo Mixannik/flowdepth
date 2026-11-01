@@ -15,9 +15,14 @@ pub fn file() -> Result<fs::File, Error> {
 }
 
 pub fn path() -> Result<PathBuf, Error> {
-    let full_path = std::env::var("FLOWSURFACE_LOG_DIR")
+    let override_dir = if crate::profile::is_explicit() {
+        None
+    } else {
+        std::env::var_os("FLOWSURFACE_LOG_DIR")
+    };
+    let full_path = override_dir
         .map(PathBuf::from)
-        .unwrap_or_else(|_| crate::data_path(Some("logs")))
+        .unwrap_or_else(|| crate::data_path(Some("logs")))
         .join(LOG_FILE);
 
     let parent = full_path
