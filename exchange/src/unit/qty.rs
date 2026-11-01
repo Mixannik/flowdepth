@@ -20,6 +20,31 @@ pub enum SizeUnit {
     Quote = 1,
 }
 
+/// Unit of an already normalized quantity, independent of UI preference.
+/// Inverse contracts remain quote-valued even when the UI prefers base units.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantityUnit {
+    Base,
+    Quote,
+}
+
+impl QuantityUnit {
+    pub fn for_market(market: MarketKind, preference: SizeUnit) -> Self {
+        if market == MarketKind::InversePerps || preference == SizeUnit::Quote {
+            Self::Quote
+        } else {
+            Self::Base
+        }
+    }
+
+    pub fn cache_tag(self) -> &'static str {
+        match self {
+            Self::Base => "base",
+            Self::Quote => "quote",
+        }
+    }
+}
+
 static SIZE_CALC_UNIT: AtomicU8 = AtomicU8::new(SizeUnit::Quote as u8);
 
 pub fn set_preferred_currency(v: SizeUnit) {

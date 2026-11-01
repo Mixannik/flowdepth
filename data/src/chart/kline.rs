@@ -2,7 +2,7 @@ use crate::{aggr::time::DataPoint, chart::indicator::KlineIndicator};
 use exchange::{
     Kline, Trade, UnixMs,
     unit::price::{Price, PriceStep},
-    unit::qty::{Qty, SizeUnit, volume_size_unit},
+    unit::qty::{Qty, QuantityUnit, SizeUnit, volume_size_unit},
 };
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -445,6 +445,20 @@ pub const CACHE_AGGREGATE_AFTER_MS: u64 = 2 * 24 * 60 * 60 * 1000;
 /// (BTC: 1 USD), finer than any footprint row; each minute's exact high and low ticks are
 /// kept so candle extremes and unfinished auctions survive. Newer trades pass unchanged.
 pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade> {
+    let unit = if volume_size_unit() == SizeUnit::Quote {
+        QuantityUnit::Quote
+    } else {
+        QuantityUnit::Base
+    };
+    aggregate_trades_for_cache_with_unit(trades, cutoff, unit)
+}
+
+/// Cache callers capture the unit once for both the dataset key and size bins.
+pub fn aggregate_trades_for_cache_with_unit(
+    trades: &[Trade],
+    cutoff: UnixMs,
+    unit: QuantityUnit,
+) -> Vec<Trade> {
     let mut out: Vec<Trade> = trades
         .iter()
         .filter(|t| t.time >= cutoff)
@@ -457,7 +471,7 @@ pub fn aggregate_trades_for_cache(trades: &[Trade], cutoff: UnixMs) -> Vec<Trade
             .or_default()
             .push(trade);
     }
-    let quote_qty = volume_size_unit() == SizeUnit::Quote;
+    let quote_qty = unit == QuantityUnit::Quote;
     for (minute, mut group) in minutes {
         // Already aggregated (re-store of a cached range): keep as is.
         if group.iter().all(|t| is_aggregate_trade(t)) {
@@ -2459,6 +2473,39 @@ mod volume_bubble_tests {
             intrabar: None,
             cached_size_delta: None,
         }
+    }
+
+    #[test]
+    fn explicit_cache_units_preserve_size_buckets_and_volumes() {
+        let base = vec![
+            trade(1, 61_000, 100_000.0, 0.1, false),
+            trade(2, 62_000, 100_000.0, 0.2, true),
+        ];
+        let quote = base
+            .iter()
+            .map(|trade| Trade {
+                qty: Qty::from_f64(trade.qty.to_f64() * trade.price.to_f64()),
+                ..*trade
+            })
+            .collect::<Vec<_>>();
+        let cutoff = UnixMs::new(u64::MAX);
+        let base = aggregate_trades_for_cache_with_unit(&base, cutoff, QuantityUnit::Base);
+        let quote = aggregate_trades_for_cache_with_unit(&quote, cutoff, QuantityUnit::Quote);
+        assert_eq!(base.len(), quote.len());
+        for (base, quote) in base.iter().zip(&quote) {
+            assert_eq!(base.price, quote.price);
+            assert_eq!(base.is_sell, quote.is_sell);
+            assert_eq!(aggregate_size_bucket(base), aggregate_size_bucket(quote));
+            assert!((base.qty.to_f64() * base.price.to_f64() - quote.qty.to_f64()).abs() < 1e-8);
+        }
+        assert_eq!(
+            base.iter().map(|t| t.qty.units).sum::<i64>(),
+            Qty::from_f64(0.3).units
+        );
+        assert_eq!(
+            quote.iter().map(|t| t.qty.units).sum::<i64>(),
+            Qty::from_f64(30_000.0).units
+        );
     }
 
     #[test]

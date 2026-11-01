@@ -12,6 +12,7 @@ use data::chart::{
     },
     kline::{BubbleCandidate, BubbleVolumeSummary},
 };
+use exchange::unit::qty::{QuantityUnit, volume_size_unit};
 use exchange::{
     Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume,
     options::{
@@ -470,7 +471,7 @@ impl MarketDataCache {
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<Kline> {
-        let key = dataset_key(
+        let key = quantity_dataset_key(
             ticker_info,
             &format!("kline|timeframe_ms={}", timeframe.to_milliseconds()),
         );
@@ -528,7 +529,7 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[Kline],
     ) {
-        let key = dataset_key(
+        let key = quantity_dataset_key(
             ticker_info,
             &format!("kline|timeframe_ms={}", timeframe.to_milliseconds()),
         );
@@ -541,7 +542,7 @@ impl MarketDataCache {
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<Trade> {
-        let key = dataset_key(ticker_info, TRADE_DATASET);
+        let key = quantity_dataset_key(ticker_info, TRADE_DATASET);
         let mut slice: CacheSlice<Trade> =
             self.read_records(CacheKind::Trade, &key, from, to_exclusive, from);
 
@@ -572,8 +573,9 @@ impl MarketDataCache {
     }
 
     /// Trades older than two days are stored as per-minute price aggregates (see
-    /// [`data::chart::kline::aggregate_trades_for_cache`]): the footprint is unchanged, the
-    /// cache about 20× smaller. Recent ones stay raw for REST continuation and bubbles.
+    /// [`data::chart::kline::aggregate_trades_for_cache_with_unit`]): price detail and
+    /// execution order are reduced. Side volumes and size bins are retained within
+    /// each supplied batch. Recent trades stay raw for REST continuation and bubbles.
     pub fn store_trades(
         &self,
         ticker_info: TickerInfo,
@@ -581,9 +583,12 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[Trade],
     ) {
-        let key = dataset_key(ticker_info, TRADE_DATASET);
+        let unit =
+            QuantityUnit::for_market(ticker_info.exchange().market_type(), volume_size_unit());
+        let key = quantity_dataset_key_in(ticker_info, TRADE_DATASET, unit);
         let cutoff = UnixMs::now().saturating_sub(data::chart::kline::CACHE_AGGREGATE_AFTER_MS);
-        let records = data::chart::kline::aggregate_trades_for_cache(records, cutoff);
+        let records =
+            data::chart::kline::aggregate_trades_for_cache_with_unit(records, cutoff, unit);
         self.store_records(CacheKind::Trade, &key, from, to_exclusive, &records);
     }
 
@@ -1459,6 +1464,23 @@ fn dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
     )
 }
 
+// Untagged legacy quantities have unknown units. Keep their bytes, but never
+// reuse their records or coverage as a quantity-aware dataset.
+fn quantity_dataset_key_in(ticker_info: TickerInfo, suffix: &str, unit: QuantityUnit) -> String {
+    dataset_key(
+        ticker_info,
+        &format!("quantity_v1|unit={}|{suffix}", unit.cache_tag()),
+    )
+}
+
+fn quantity_dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
+    quantity_dataset_key_in(
+        ticker_info,
+        suffix,
+        QuantityUnit::for_market(ticker_info.exchange().market_type(), volume_size_unit()),
+    )
+}
+
 fn open_interest_dataset_key(ticker_info: TickerInfo, timeframe: Timeframe) -> String {
     dataset_key(
         ticker_info,
@@ -1474,7 +1496,7 @@ fn bubble_dataset_key(
     cluster_window_ms: u32,
     cluster_price_ticks: u32,
 ) -> String {
-    dataset_key(
+    quantity_dataset_key(
         ticker_info,
         &format!(
             "bubble_summary|algorithm=v2|timeframe_ms={timeframe_ms}|price_step_units={price_step_units}|max_candidates={max_candidates_per_candle}|cluster_ms={cluster_window_ms}|cluster_ticks={cluster_price_ticks}"
@@ -1726,6 +1748,68 @@ pub fn merge_bubble_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use exchange::SizeUnit;
+
+    #[test]
+    fn quantity_cache_isolates_units_and_ignores_untagged_legacy_coverage() {
+        let dir = TestCacheDir::new();
+        let cache = MarketDataCache::open_at(dir.database_path()).unwrap();
+        let ticker = ticker_info();
+        let base = quantity_dataset_key_in(ticker, TRADE_DATASET, QuantityUnit::Base);
+        let quote = quantity_dataset_key_in(ticker, TRADE_DATASET, QuantityUnit::Quote);
+        let legacy = dataset_key(ticker, TRADE_DATASET);
+        let from = UnixMs::new(100);
+        let to = UnixMs::new(200);
+        let mut trade = timed_trade(150);
+        trade.qty = exchange::unit::Qty::from_f64(999.0);
+        cache.store_records(CacheKind::Trade, &legacy, from, to, &[trade]);
+        for key in [&base, &quote] {
+            let missing: CacheSlice<Trade> =
+                cache.read_records(CacheKind::Trade, key, from, to, from);
+            assert!(missing.records.is_empty());
+            assert_eq!(missing.gaps, vec![(from, to)]);
+        }
+        for (key, qty) in [(&base, 2.0), (&quote, 200.0)] {
+            trade.qty = exchange::unit::Qty::from_f64(qty);
+            cache.store_records(CacheKind::Trade, key, from, to, &[trade]);
+        }
+        for (key, qty) in [(&base, 2.0), (&quote, 200.0), (&legacy, 999.0)] {
+            let cached: CacheSlice<Trade> =
+                cache.read_records(CacheKind::Trade, key, from, to, from);
+            assert!(cached.gaps.is_empty());
+            assert_eq!(cached.records.len(), 1);
+            assert_eq!(cached.records[0].qty.to_f64(), qty);
+        }
+    }
+
+    #[test]
+    fn quantity_identity_covers_spot_linear_and_inverse_markets() {
+        for exchange in [
+            exchange::adapter::Exchange::BinanceSpot,
+            exchange::adapter::Exchange::BinanceLinear,
+            exchange::adapter::Exchange::BinanceInverse,
+        ] {
+            let ticker =
+                TickerInfo::new(exchange::Ticker::new("BTCUSDT", exchange), 0.1, 0.001, None);
+            let base_unit = QuantityUnit::for_market(ticker.market_type(), SizeUnit::Base);
+            let quote_unit = QuantityUnit::for_market(ticker.market_type(), SizeUnit::Quote);
+            for suffix in [
+                TRADE_DATASET,
+                "kline|timeframe_ms=60000",
+                "bubble_summary|algorithm=v2",
+            ] {
+                let base_key = quantity_dataset_key_in(ticker, suffix, base_unit);
+                let quote_key = quantity_dataset_key_in(ticker, suffix, quote_unit);
+                if ticker.market_type() == exchange::adapter::MarketKind::InversePerps {
+                    assert_eq!(base_key, quote_key);
+                    assert_eq!(base_unit, QuantityUnit::Quote);
+                } else {
+                    assert_ne!(base_key, quote_key);
+                }
+                assert_ne!(base_key, dataset_key(ticker, suffix));
+            }
+        }
+    }
 
     struct TestCacheDir(PathBuf);
 
