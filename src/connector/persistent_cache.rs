@@ -471,10 +471,7 @@ impl MarketDataCache {
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<Kline> {
-        let key = quantity_dataset_key(
-            ticker_info,
-            &format!("kline|timeframe_ms={}", timeframe.to_milliseconds()),
-        );
+        let key = kline_dataset_key(ticker_info, timeframe);
         let timeframe_ms = timeframe.to_milliseconds();
         let record_from = from.saturating_sub(timeframe_ms.saturating_sub(1));
         let mut slice: CacheSlice<Kline> =
@@ -529,10 +526,7 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[Kline],
     ) {
-        let key = quantity_dataset_key(
-            ticker_info,
-            &format!("kline|timeframe_ms={}", timeframe.to_milliseconds()),
-        );
+        let key = kline_dataset_key(ticker_info, timeframe);
         self.store_records(CacheKind::Kline, &key, from, to_exclusive, records);
     }
 
@@ -1481,6 +1475,22 @@ fn quantity_dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
     )
 }
 
+fn kline_dataset_key(ticker_info: TickerInfo, timeframe: Timeframe) -> String {
+    let algorithm = match ticker_info.exchange() {
+        exchange::adapter::Exchange::BinanceSpot
+        | exchange::adapter::Exchange::BinanceLinear
+        | exchange::adapter::Exchange::BinanceInverse => "|volume=binance_turnover_v2",
+        _ => "",
+    };
+    quantity_dataset_key(
+        ticker_info,
+        &format!(
+            "kline{algorithm}|timeframe_ms={}",
+            timeframe.to_milliseconds()
+        ),
+    )
+}
+
 fn open_interest_dataset_key(ticker_info: TickerInfo, timeframe: Timeframe) -> String {
     dataset_key(
         ticker_info,
@@ -1749,6 +1759,35 @@ pub fn merge_bubble_summaries(
 mod tests {
     use super::*;
     use exchange::SizeUnit;
+
+    #[test]
+    fn binance_close_estimated_candles_do_not_cover_corrected_history() {
+        let dir = TestCacheDir::new();
+        let cache = MarketDataCache::open_at(dir.database_path()).unwrap();
+        let ticker = ticker_info();
+        let from = UnixMs::new(60_000);
+        let to = UnixMs::new(120_000);
+        let old_key = quantity_dataset_key(ticker, "kline|timeframe_ms=60000");
+        let candle = Kline::new(
+            from,
+            100.0,
+            120.0,
+            100.0,
+            110.0,
+            Volume::BuySell(
+                exchange::unit::Qty::from_f64(165.0),
+                exchange::unit::Qty::from_f64(220.0),
+            ),
+            ticker.min_ticksize,
+        );
+        cache.store_records(CacheKind::Kline, &old_key, from, to, &[candle]);
+        let new = cache.read_klines(ticker, Timeframe::M1, from, to);
+        assert!(new.records.is_empty());
+        assert_eq!(new.gaps, vec![(from, to)]);
+        let old: CacheSlice<Kline> = cache.read_records(CacheKind::Kline, &old_key, from, to, from);
+        assert_eq!(old.records.len(), 1);
+        assert!(old.gaps.is_empty());
+    }
 
     #[test]
     fn quantity_cache_isolates_units_and_ignores_untagged_legacy_coverage() {

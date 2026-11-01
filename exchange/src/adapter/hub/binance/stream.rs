@@ -3,14 +3,14 @@ use crate::orderflow::{
     OrderFlowDataQuality, OrderFlowEvent,
 };
 use crate::{
-    Event, Kline, Price, PushFrequency, Ticker, TickerInfo, Trade, Volume,
+    Event, Price, PushFrequency, Ticker, TickerInfo, Trade,
     adapter::{
         MarketKind, StreamKind, StreamTicksize,
         hub::{HeartbeatPolicy, TradeBuffer, WsAdapter, WsSession, WsTransport},
     },
     depth::{DeOrder, DepthPayload, DepthUpdate, LocalDepthCache},
     serde_util::de_string_to_number,
-    unit::qty::{QtyNormalization, SizeUnit, volume_size_unit},
+    unit::qty::{QtyNormalization, QuantityUnit, SizeUnit, volume_size_unit},
 };
 
 use super::{BinanceHandle, exchange_from_market_type, raw_qty_unit_from_market_type};
@@ -76,7 +76,7 @@ async fn connect_stream_socket(
 }
 
 #[derive(Deserialize, Debug, Clone)]
-struct SonicKline {
+pub(super) struct SonicKline {
     #[serde(rename = "t")]
     time: u64,
     #[serde(rename = "o", deserialize_with = "de_string_to_number")]
@@ -91,8 +91,28 @@ struct SonicKline {
     volume: f64,
     #[serde(rename = "V", deserialize_with = "de_string_to_number")]
     taker_buy_base_asset_volume: f64,
+    #[serde(rename = "q", deserialize_with = "de_string_to_number")]
+    secondary_total: f64,
+    #[serde(rename = "Q", deserialize_with = "de_string_to_number")]
+    secondary_buy: f64,
     #[serde(rename = "i")]
     interval: String,
+}
+
+impl SonicKline {
+    pub(super) fn into_candle(self) -> super::kline::BinanceCandle {
+        super::kline::BinanceCandle {
+            time: self.time,
+            open: self.open,
+            high: self.high,
+            low: self.low,
+            close: self.close,
+            native_total: self.volume,
+            native_buy: self.taker_buy_base_asset_volume,
+            secondary_total: self.secondary_total,
+            secondary_buy: self.secondary_buy,
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone)]
@@ -1215,7 +1235,7 @@ pub fn connect_depth_stream(
 
 struct KlineAdapter {
     market: MarketKind,
-    ticker_info_map: HashMap<Ticker, (TickerInfo, QtyNormalization)>,
+    ticker_info_map: HashMap<Ticker, (TickerInfo, QuantityUnit)>,
     timeframe_by_interval: HashMap<String, crate::Timeframe>,
     stream_str: String,
     proxy_cfg: Option<crate::proxy::Proxy>,
@@ -1246,24 +1266,13 @@ impl WsAdapter for KlineAdapter {
                 return Ok(Vec::new());
             };
 
-            if let Some((ticker_info, qty_norm)) = self.ticker_info_map.get(&ticker) {
+            if let Some((ticker_info, unit)) = self.ticker_info_map.get(&ticker) {
                 let ticker_info = *ticker_info;
 
-                let buy_volume_raw = de_kline.taker_buy_base_asset_volume;
-                let sell_volume_raw = de_kline.volume - buy_volume_raw;
-
-                let buy_volume = qty_norm.normalize_qty(buy_volume_raw, de_kline.close);
-                let sell_volume = qty_norm.normalize_qty(sell_volume_raw, de_kline.close);
-
-                let kline = Kline::new(
-                    de_kline.time,
-                    de_kline.open,
-                    de_kline.high,
-                    de_kline.low,
-                    de_kline.close,
-                    Volume::BuySell(buy_volume, sell_volume),
-                    ticker_info.min_ticksize,
-                );
+                let kline = de_kline
+                    .into_candle()
+                    .into_kline(ticker_info, *unit)
+                    .map_err(|error| error.to_string())?;
 
                 return Ok(vec![Event::KlineReceived(
                     StreamKind::Kline {
@@ -1322,11 +1331,7 @@ pub fn connect_kline_stream(
                 ticker_info.ticker,
                 (
                     *ticker_info,
-                    QtyNormalization::with_raw_qty_unit(
-                        volume_size_unit() == SizeUnit::Quote,
-                        *ticker_info,
-                        raw_qty_unit_from_market_type(market),
-                    ),
+                    QuantityUnit::for_market(market, volume_size_unit()),
                 ),
             )
         })

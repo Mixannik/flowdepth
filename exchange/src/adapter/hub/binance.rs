@@ -9,6 +9,7 @@ use super::{AdapterError, HttpHub, RequestPort};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 pub mod fetch;
+mod kline;
 pub mod stream;
 
 const SPOT_DOMAIN: &str = "https://api.binance.com";

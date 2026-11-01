@@ -1,10 +1,9 @@
 use crate::{
     Kline, OpenInterest, Price, Qty, Ticker, TickerInfo, TickerStats, Timeframe, Trade, UnixMs,
-    Volume,
     depth::{DeOrder, DepthPayload},
     serde_util,
     serde_util::de_string_to_number,
-    unit::qty::{QtyNormalization, SizeUnit, volume_size_unit},
+    unit::qty::{QtyNormalization, QuantityUnit, SizeUnit, volume_size_unit},
 };
 
 use super::{
@@ -48,7 +47,7 @@ fn remember_missing_historical_trade_archive(path: &str) {
 const MAX_KLINE_BARS: u64 = 1_000;
 
 #[derive(Deserialize, Debug, Clone)]
-struct FetchedKline(
+pub(super) struct FetchedKline(
     u64,
     #[serde(deserialize_with = "de_string_to_number")] f64,
     #[serde(deserialize_with = "de_string_to_number")] f64,
@@ -56,12 +55,42 @@ struct FetchedKline(
     #[serde(deserialize_with = "de_string_to_number")] f64,
     #[serde(deserialize_with = "de_string_to_number")] f64,
     u64,
-    String,
+    #[serde(deserialize_with = "de_string_to_number")] f64,
     u32,
     #[serde(deserialize_with = "de_string_to_number")] f64,
-    String,
+    #[serde(deserialize_with = "de_string_to_number")] f64,
     String,
 );
+
+impl FetchedKline {
+    pub(super) fn into_candle(self) -> super::kline::BinanceCandle {
+        let Self(
+            time,
+            open,
+            high,
+            low,
+            close,
+            native_total,
+            _close_time,
+            secondary_total,
+            _number_of_trades,
+            native_buy,
+            secondary_buy,
+            _ignore,
+        ) = self;
+        super::kline::BinanceCandle {
+            time,
+            open,
+            high,
+            low,
+            close,
+            native_total,
+            native_buy,
+            secondary_total,
+            secondary_buy,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -442,52 +471,11 @@ pub(super) async fn fetch_klines(
 
     let fetched_klines: Vec<FetchedKline> =
         hub.http_json_with_limiter(&url, weight, None, None).await?;
-
-    let size_in_quote_ccy = volume_size_unit() == SizeUnit::Quote;
-    let qty_norm = QtyNormalization::with_raw_qty_unit(
-        size_in_quote_ccy,
-        ticker_info,
-        raw_qty_unit_from_market_type(market_type),
-    );
-    let min_ticksize = ticker_info.min_ticksize;
-
-    let klines: Vec<_> = fetched_klines
+    let unit = QuantityUnit::for_market(market_type, volume_size_unit());
+    fetched_klines
         .into_iter()
-        .map(|k| {
-            let FetchedKline(
-                time,
-                open,
-                high,
-                low,
-                close,
-                volume,
-                _close_time,
-                _quote_asset_volume,
-                _number_of_trades,
-                taker_buy_base_asset_volume,
-                _taker_buy_quote_asset_volume,
-                _ignore,
-            ) = k;
-
-            let buy_volume = taker_buy_base_asset_volume;
-            let sell_volume = volume - buy_volume;
-
-            let buy_volume = qty_norm.normalize_qty(buy_volume, close);
-            let sell_volume = qty_norm.normalize_qty(sell_volume, close);
-
-            Kline::new(
-                time,
-                open,
-                high,
-                low,
-                close,
-                Volume::BuySell(buy_volume, sell_volume),
-                min_ticksize,
-            )
-        })
-        .collect();
-
-    Ok(klines)
+        .map(|k| k.into_candle().into_kline(ticker_info, unit))
+        .collect()
 }
 
 pub(super) async fn fetch_klines_page(
