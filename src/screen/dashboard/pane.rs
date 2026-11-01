@@ -187,6 +187,7 @@ pub struct State {
     pub notifications: Vec<Toast>,
     pub streams: ResolvedStream,
     pub status: Status,
+    history_warnings: Vec<(Option<crate::connector::fetcher::FetchRange>, String)>,
     pub link_group: Option<LinkGroup>,
     gex_liquidity_missing_logged: bool,
 }
@@ -444,6 +445,7 @@ impl State {
         tickers: Vec<TickerInfo>,
         kind: ContentKind,
     ) -> Vec<StreamKind> {
+        self.history_warnings.clear();
         if !(self.content.kind() == kind) {
             self.settings.selected_basis = None;
             self.settings.tick_multiply = None;
@@ -979,6 +981,43 @@ impl State {
         } = &mut self.content
         {
             chart.mark_request_failed(req_id, error);
+        }
+    }
+
+    pub fn mark_history_unavailable(
+        &mut self,
+        req_id: Option<uuid::Uuid>,
+        fetch: Option<crate::connector::fetcher::FetchRange>,
+        message: String,
+        retry_after_ms: u64,
+    ) {
+        if let Some(id) = req_id
+            && let Content::Kline {
+                chart: Some(chart), ..
+            } = &mut self.content
+        {
+            if chart.is_fetch_stale(id) {
+                return;
+            }
+            chart.mark_request_failed_with_retry(id, message.clone(), Some(retry_after_ms));
+        }
+        if !self
+            .history_warnings
+            .iter()
+            .any(|(range, text)| *range == fetch && text == &message)
+        {
+            self.history_warnings.push((fetch, message.clone()));
+        }
+        let toast = Toast::warn(message);
+        if !self.notifications.contains(&toast) {
+            self.notifications.push(toast);
+        }
+        self.status = Status::Ready;
+    }
+
+    pub fn clear_history_warning(&mut self, fetch: Option<crate::connector::fetcher::FetchRange>) {
+        if fetch.is_some() {
+            self.history_warnings.retain(|(range, _)| *range != fetch);
         }
     }
 
@@ -1586,6 +1625,23 @@ impl State {
             }
         };
 
+        if !self.history_warnings.is_empty() {
+            let details = self
+                .history_warnings
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            top_left_buttons = top_left_buttons.push(iced::widget::tooltip(
+                text("History incomplete").size(12).style(|theme: &Theme| {
+                    iced::widget::text::Style {
+                        color: Some(theme.palette().warning.base.color),
+                    }
+                }),
+                container(text(details)).padding(8).style(style::tooltip),
+                tooltip::Position::Bottom,
+            ));
+        }
         match &self.status {
             Status::Loading { info, source } => {
                 let action = match (source, info) {
@@ -2855,6 +2911,7 @@ impl Default for State {
             streams: ResolvedStream::waiting(vec![]),
             notifications: vec![],
             status: Status::Ready,
+            history_warnings: Vec::new(),
             link_group: None,
             gex_liquidity_missing_logged: false,
         }
@@ -3550,6 +3607,37 @@ mod tests {
             0.001,
             None,
         )
+    }
+
+    #[test]
+    fn history_notice_survives_unrelated_fetches_and_deduplicates_toasts() {
+        let mut state = State::default();
+        let fetch = Some(crate::connector::fetcher::FetchRange::Trades(
+            UnixMs::new(1000),
+            UnixMs::new(2000),
+        ));
+        state.mark_history_unavailable(
+            None,
+            fetch,
+            "Missing archive on 2026-10-28 UTC".into(),
+            300_000,
+        );
+        state.mark_history_unavailable(
+            None,
+            fetch,
+            "Missing archive on 2026-10-28 UTC".into(),
+            300_000,
+        );
+        assert_eq!(state.notifications.len(), 1);
+        assert_eq!(state.history_warnings.len(), 1);
+        state.status = Status::Ready;
+        state.clear_history_warning(Some(crate::connector::fetcher::FetchRange::Trades(
+            UnixMs::new(3000),
+            UnixMs::new(4000),
+        )));
+        assert_eq!(state.history_warnings.len(), 1);
+        state.clear_history_warning(fetch);
+        assert!(state.history_warnings.is_empty());
     }
 
     fn gex_state(config: data::chart::gex::Config) -> State {

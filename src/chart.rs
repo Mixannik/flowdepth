@@ -1270,7 +1270,7 @@ fn request_fetch(
         }
         Ok(None) => None,
         Err(ReqError::Failed(reason)) => {
-            log::error!("Failed to request {:?}: {}", range, reason);
+            log::trace!("Request cooling down {:?}: {}", range, reason);
             None
         }
     }

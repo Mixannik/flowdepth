@@ -44,6 +44,13 @@ use std::{collections::HashMap, sync::Arc, time::Instant, vec};
 
 #[derive(Debug, Clone)]
 pub enum Message {
+    HistoryUnavailable {
+        pane_id: uuid::Uuid,
+        req_id: Option<uuid::Uuid>,
+        fetch: Option<FetchRange>,
+        message: String,
+        retry_after_ms: u64,
+    },
     ScopedFetch {
         context: exchange::unit::quantity_context::QuantityContext,
         update: Box<fetcher::FetchUpdate>,
@@ -719,6 +726,17 @@ impl Dashboard {
     ) -> (Task<Message>, Option<Event>) {
         let handles = &data_sources.exchange;
         match message {
+            Message::HistoryUnavailable {
+                pane_id,
+                req_id,
+                fetch,
+                message,
+                retry_after_ms,
+            } => {
+                if let Some(state) = self.get_mut_pane_state_by_uuid(main_window.id, pane_id) {
+                    state.mark_history_unavailable(req_id, fetch, message, retry_after_ms);
+                }
+            }
             Message::ScopedFetch { context, update } => {
                 if context.is_current() {
                     return self.update(
@@ -1977,6 +1995,15 @@ impl Dashboard {
                 complete,
                 req_id,
             } => {
+                if complete
+                    && let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                {
+                    state.clear_history_warning(Some(FetchRange::RefTrades {
+                        from: range.0,
+                        to: range.1,
+                        spot,
+                    }));
+                }
                 log::debug!(
                     "DATA RefTrades Distribute | pane={} req={} spot={spot} complete={complete} count={}",
                     fetcher::short_id(pane_id),
@@ -2012,6 +2039,9 @@ impl Dashboard {
         };
 
         let mut chart_found = false;
+        if trade_outcome.is_none_or(|outcome| outcome.unfilled_tail.is_none()) {
+            pane_state.clear_history_warning(fetch);
+        }
         if let Some(fetcher::FetchRange::Trades(from, to)) = fetch
             && let pane::Content::Kline { chart: Some(c), .. } = &mut pane_state.content
         {
@@ -2041,6 +2071,26 @@ impl Dashboard {
         update: fetcher::FetchUpdate,
     ) {
         match update {
+            fetcher::FetchUpdate::HistoryUnavailable {
+                fetch,
+                message,
+                retry_after_ms,
+                ..
+            } => {
+                if let Some(fetch) = fetch {
+                    self.clear_pending_backfill(stream, fetch);
+                }
+                for pane_id in pane_ids {
+                    if let Some(state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                        state.mark_history_unavailable(
+                            None,
+                            fetch,
+                            message.clone(),
+                            retry_after_ms,
+                        );
+                    }
+                }
+            }
             fetcher::FetchUpdate::Scoped { context, update } => {
                 if context.is_current() {
                     self.apply_backfill_update(
@@ -3507,6 +3557,19 @@ fn all_unique_streams(streams: &UniqueStreams) -> Vec<StreamKind> {
 impl From<fetcher::FetchUpdate> for Message {
     fn from(update: fetcher::FetchUpdate) -> Self {
         match update {
+            fetcher::FetchUpdate::HistoryUnavailable {
+                pane_id,
+                req_id,
+                fetch,
+                message,
+                retry_after_ms,
+            } => Message::HistoryUnavailable {
+                pane_id,
+                req_id,
+                fetch,
+                message,
+                retry_after_ms,
+            },
             fetcher::FetchUpdate::Scoped { context, update } => {
                 Message::ScopedFetch { context, update }
             }

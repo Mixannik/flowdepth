@@ -13,6 +13,12 @@ pub enum AdapterError {
     InvalidRequest(String),
     #[error("Adapter unavailable for {venue}: {reason}")]
     Unavailable { venue: Venue, reason: String },
+    #[error("Historical trades unavailable: {symbol} {date} UTC: {detail}")]
+    HistoryUnavailable {
+        symbol: String,
+        date: String,
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -22,6 +28,7 @@ pub enum AdapterErrorKind {
     Websocket,
     InvalidRequest,
     Unavailable,
+    HistoryUnavailable,
 }
 
 #[derive(Debug)]
@@ -82,6 +89,7 @@ impl AdapterError {
             Self::WebsocketError(_) => AdapterErrorKind::Websocket,
             Self::InvalidRequest(_) => AdapterErrorKind::InvalidRequest,
             Self::Unavailable { .. } => AdapterErrorKind::Unavailable,
+            Self::HistoryUnavailable { .. } => AdapterErrorKind::HistoryUnavailable,
         }
     }
 
@@ -130,6 +138,9 @@ impl AdapterError {
             Self::WebsocketError(_) => "Stream error. Check logs for details.".to_string(),
             Self::InvalidRequest(message) => message.clone(),
             Self::Unavailable { reason, .. } => reason.clone(),
+            Self::HistoryUnavailable { symbol, date, .. } => {
+                format!("History incomplete: {symbol}, {date} UTC. Live continues. Retry in 5 min.")
+            }
         }
     }
 }

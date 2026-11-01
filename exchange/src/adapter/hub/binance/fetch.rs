@@ -16,31 +16,37 @@ use csv::ReaderBuilder;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     io::BufReader,
     path::PathBuf,
     sync::{LazyLock, Mutex},
-    time::Duration,
     time::UNIX_EPOCH,
+    time::{Duration, Instant},
 };
 
 const METADATA_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Binance can publish a daily archive after the UTC day has already closed.
-/// Remember a 404 for the lifetime of the process so REST pagination does not
-/// download the same missing URL once per page.
-static MISSING_HIST_TRADE_ARCHIVES: LazyLock<Mutex<HashSet<String>>> =
-    LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Pause after a 404, but recheck later: an archive may appear while we run.
+const MISSING_ARCHIVE_RECHECK: Duration = Duration::from_secs(5 * 60);
+static MISSING_HIST_TRADE_ARCHIVES: LazyLock<Mutex<HashMap<String, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn historical_trade_archive_is_missing(path: &str) -> bool {
-    MISSING_HIST_TRADE_ARCHIVES
-        .lock()
-        .is_ok_and(|missing| missing.contains(path))
+    historical_trade_archive_is_missing_at(path, Instant::now())
+}
+
+fn historical_trade_archive_is_missing_at(path: &str, now: Instant) -> bool {
+    MISSING_HIST_TRADE_ARCHIVES.lock().is_ok_and(|mut missing| {
+        missing
+            .retain(|_, checked| now.saturating_duration_since(*checked) < MISSING_ARCHIVE_RECHECK);
+        missing.contains_key(path)
+    })
 }
 
 fn remember_missing_historical_trade_archive(path: &str) {
     if let Ok(mut missing) = MISSING_HIST_TRADE_ARCHIVES.lock() {
-        missing.insert(path.to_string());
+        missing.insert(path.to_string(), Instant::now());
     }
 }
 
@@ -811,6 +817,13 @@ pub(super) async fn fetch_trades(
                     if date < today {
                         continue;
                     }
+                    ensure_rest_history_available(
+                        ticker_info,
+                        from_time,
+                        now_ms,
+                        date,
+                        "No later archived trades",
+                    )?;
                     return fetch_intraday_trades(hub, ticker_info, from_time).await;
                 };
                 // Binance REST only serves the last two days; older gaps come from the next
@@ -824,6 +837,13 @@ pub(super) async fn fetch_trades(
                 return Ok(trades);
             }
             Err(e) => {
+                ensure_rest_history_available(
+                    ticker_info,
+                    from_time,
+                    now_ms,
+                    date,
+                    &e.to_string(),
+                )?;
                 log::warn!(
                     "Historical trades fetch failed: {}, falling back to intraday fetch",
                     e
@@ -832,6 +852,23 @@ pub(super) async fn fetch_trades(
             }
         }
     }
+}
+
+fn ensure_rest_history_available(
+    ticker: TickerInfo,
+    from: UnixMs,
+    now_ms: u64,
+    archive_date: chrono::NaiveDate,
+    detail: &str,
+) -> Result<(), AdapterError> {
+    if ticker.market_type() != MarketKind::Spot && !intraday_window_covers(from.as_u64(), now_ms) {
+        return Err(AdapterError::HistoryUnavailable {
+            symbol: ticker.ticker.to_full_symbol_and_type().0.to_string(),
+            date: archive_date.to_string(),
+            detail: detail.to_owned(),
+        });
+    }
+    Ok(())
 }
 
 /// Binance futures `aggTrades` rejects start times older than two days (code -4166). Keep an
@@ -848,6 +885,52 @@ mod tests {
         archive_bool, archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
         oi_request_limit, remember_missing_historical_trade_archive,
     };
+
+    #[test]
+    fn missing_old_archive_never_falls_back_to_expired_futures_rest() {
+        use crate::{Ticker, TickerInfo, UnixMs, adapter::Exchange};
+        let now = 1_000 * 60 * 60 * 1000;
+        let old = UnixMs::new(now - 72 * 60 * 60 * 1000);
+        let recent = UnixMs::new(now - 12 * 60 * 60 * 1000);
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 10, 28).unwrap();
+        for exchange in [
+            Exchange::BinanceLinear,
+            Exchange::BinanceInverse,
+            Exchange::BinanceSpot,
+        ] {
+            let ticker = TickerInfo::new(Ticker::new("BTCUSDT", exchange), 0.1, 0.001, None);
+            let result =
+                super::ensure_rest_history_available(ticker, old, now, date, "archive HTTP 404");
+            if exchange == Exchange::BinanceSpot {
+                assert!(result.is_ok());
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(super::AdapterError::HistoryUnavailable { .. })
+                ));
+            }
+            assert!(
+                super::ensure_rest_history_available(ticker, recent, now, date, "archive HTTP 404")
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn missing_archive_is_rechecked_after_cooldown() {
+        let path = "test/archive-expiry.zip";
+        let checked = std::time::Instant::now();
+        super::MISSING_HIST_TRADE_ARCHIVES
+            .lock()
+            .unwrap()
+            .insert(path.into(), checked);
+        assert!(!super::historical_trade_archive_is_missing_at(
+            path,
+            checked + super::MISSING_ARCHIVE_RECHECK + std::time::Duration::from_secs(1)
+        ));
+        remember_missing_historical_trade_archive(path);
+        assert!(historical_trade_archive_is_missing(path));
+    }
 
     #[test]
     fn spot_archive_microseconds_become_milliseconds() {

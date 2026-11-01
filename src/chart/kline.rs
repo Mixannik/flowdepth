@@ -1261,7 +1261,7 @@ impl KlineChart {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(ReqError::Failed(reason)) => {
-                log::error!("Failed to request {:?}: {}", fetch, reason);
+                log::trace!("Request cooling down {:?}: {}", fetch, reason);
                 false
             }
         }
@@ -1272,8 +1272,18 @@ impl KlineChart {
     }
 
     pub fn mark_request_failed(&mut self, req_id: uuid::Uuid, error: String) {
+        self.mark_request_failed_with_retry(req_id, error, None);
+    }
+
+    pub fn mark_request_failed_with_retry(
+        &mut self,
+        req_id: uuid::Uuid,
+        error: String,
+        retry_after_ms: Option<u64>,
+    ) {
         let failed_trade_request = self.request_handler.is_trade_request(req_id);
-        self.request_handler.mark_failed(req_id, error);
+        self.request_handler
+            .mark_failed_with_retry(req_id, error, retry_after_ms);
         if failed_trade_request {
             self.fetching_trades = (false, None);
         }

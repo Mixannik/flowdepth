@@ -1029,6 +1029,10 @@ impl RequestHandler {
     }
 
     pub fn mark_failed(&mut self, id: Uuid, error: String) {
+        self.mark_failed_with_retry(id, error, None);
+    }
+
+    pub fn mark_failed_with_retry(&mut self, id: Uuid, error: String, retry_after_ms: Option<u64>) {
         if let Some(request) = self.requests.get_mut(&id) {
             // Do not overwrite a terminal status (Superseded, Completed)
             if matches!(request.status, RequestStatus::Superseded { .. }) {
@@ -1048,7 +1052,8 @@ impl RequestHandler {
 
             let now = chrono::Utc::now().timestamp_millis() as u64;
             request.attempts = request.attempts.saturating_add(1);
-            let retry_delay = Self::retry_delay_ms(request.attempts);
+            let retry_delay =
+                retry_after_ms.unwrap_or_else(|| Self::retry_delay_ms(request.attempts));
             log::warn!(
                 "FETCH Failed | req={} {} error={} retry_after={}",
                 short_id(id),
@@ -1307,6 +1312,13 @@ fn interrupted_trade_fetch(
 
 #[derive(Debug, Clone)]
 pub enum FetchUpdate {
+    HistoryUnavailable {
+        pane_id: Uuid,
+        req_id: Option<Uuid>,
+        fetch: Option<FetchRange>,
+        message: String,
+        retry_after_ms: u64,
+    },
     Scoped {
         context: QuantityContext,
         update: Box<FetchUpdate>,
@@ -1327,6 +1339,30 @@ pub enum FetchUpdate {
         req_id: Option<Uuid>,
         fetch: Option<FetchRange>,
     },
+}
+
+fn fetch_failure(
+    pane_id: Uuid,
+    req_id: Option<Uuid>,
+    fetch: Option<FetchRange>,
+    error: AdapterError,
+) -> FetchUpdate {
+    if matches!(error, AdapterError::HistoryUnavailable { .. }) {
+        FetchUpdate::HistoryUnavailable {
+            pane_id,
+            req_id,
+            fetch,
+            message: error.ui_message(),
+            retry_after_ms: 5 * 60 * 1000,
+        }
+    } else {
+        FetchUpdate::Error {
+            pane_id,
+            req_id,
+            fetch,
+            error: error.ui_message(),
+        }
+    }
 }
 
 fn scope_fetch_task(task: Task<FetchUpdate>, context: QuantityContext) -> Task<FetchUpdate> {
@@ -1688,19 +1724,14 @@ fn request_fetch_inner(
                                     }
                                     _ => "Failed",
                                 };
-                                log::error!(
+                                log::log!(if matches!(&err, AdapterError::HistoryUnavailable { .. }) { log::Level::Warn } else { log::Level::Error },
                                     "TRADE {terminal} | venue={} symbol={} req={} range={} error={err}",
                                     format_venue(&ticker_info),
                                     format_symbol(&ticker_info),
                                     short_id(req_id),
                                     format_time_range(from_time, to_time)
                                 );
-                                FetchUpdate::Error {
-                                    pane_id,
-                                    error: err.ui_message(),
-                                    req_id: Some(req_id),
-                                    fetch: Some(FetchRange::Trades(from_time, to_time)),
-                                }
+                                fetch_failure(pane_id, Some(req_id), Some(FetchRange::Trades(from_time, to_time)), err)
                             }
                         },
                     )
@@ -1861,7 +1892,6 @@ fn bubble_summary_fetch_task(
             data_path,
         )
         .await
-        .map_err(|err| err.ui_message())
     };
 
     update_status.chain(Task::perform(fetch, move |result| match result {
@@ -1877,11 +1907,10 @@ fn bubble_summary_fetch_task(
                 req_id: Some(req_id),
             },
         },
-        Err(error) => FetchUpdate::Error {
+        Err(error) => fetch_failure(
             pane_id,
-            error,
-            req_id: Some(req_id),
-            fetch: Some(FetchRange::BubbleSummary {
+            Some(req_id),
+            Some(FetchRange::BubbleSummary {
                 from: from_time,
                 to: to_time,
                 timeframe_ms,
@@ -1890,7 +1919,8 @@ fn bubble_summary_fetch_task(
                 cluster_window_ms,
                 cluster_price_ticks,
             }),
-        },
+            error,
+        ),
     }))
 }
 
@@ -2466,29 +2496,26 @@ fn ref_trades_fetch_task(
         Ok::<_, AdapterError>((trades, complete))
     };
 
-    Task::perform(
-        iced::futures::TryFutureExt::map_err(fetch, |err| err.ui_message()),
-        move |result| match result {
-            Ok((data, complete)) => FetchUpdate::Data {
-                layout_id,
-                pane_id,
-                data: FetchedData::RefTrades {
-                    data,
-                    spot,
-                    range: (from, to),
-                    complete,
-                    req_id: Some(req_id),
-                },
-                stream: chart_stream,
-            },
-            Err(error) => FetchUpdate::Error {
-                pane_id,
-                error,
+    Task::perform(fetch, move |result| match result {
+        Ok((data, complete)) => FetchUpdate::Data {
+            layout_id,
+            pane_id,
+            data: FetchedData::RefTrades {
+                data,
+                spot,
+                range: (from, to),
+                complete,
                 req_id: Some(req_id),
-                fetch: Some(FetchRange::RefTrades { from, to, spot }),
             },
+            stream: chart_stream,
         },
-    )
+        Err(error) => fetch_failure(
+            pane_id,
+            Some(req_id),
+            Some(FetchRange::RefTrades { from, to, spot }),
+            error,
+        ),
+    })
 }
 
 pub fn kline_fetch_task(
@@ -2905,7 +2932,12 @@ pub fn fetch_trades_batched(
                         }
                     }
                     Ok(Err(err)) => {
-                        log::error!(
+                        log::log!(
+                            if matches!(&err, AdapterError::HistoryUnavailable { .. }) {
+                                log::Level::Warn
+                            } else {
+                                log::Level::Error
+                            },
                             "TRADE Error | venue={venue} symbol={symbol} req={} request_idx={request_count} from={} duration={} error={err}",
                             short_id(req_id),
                             format_time_short(latest_trade_t),
@@ -3445,6 +3477,61 @@ mod tests {
 
         // Verify it's still stale (Superseded)
         assert!(handler.is_stale_generation(req_id));
+    }
+
+    #[test]
+    fn unavailable_history_keeps_range_failed_and_waits_for_source_retry() {
+        let mut handler = RequestHandler::default();
+        let range = FetchRange::Trades(UnixMs::new(1_000), UnixMs::new(2_000));
+        let id = handler.add_request(range).unwrap().unwrap();
+        handler.mark_failed_with_retry(id, "History incomplete".into(), Some(300_000));
+        match handler.requests[&id].status {
+            RequestStatus::Failed {
+                failed_at,
+                retry_at,
+                ..
+            } => assert_eq!(retry_at - failed_at, 300_000),
+            _ => panic!("missing history must not be marked completed or empty"),
+        }
+        assert!(matches!(
+            handler.add_request(range),
+            Err(ReqError::Failed(_))
+        ));
+        if let RequestStatus::Failed { retry_at, .. } =
+            &mut handler.requests.get_mut(&id).unwrap().status
+        {
+            *retry_at = 0;
+        }
+        assert!(handler.add_request(range).unwrap().is_some());
+    }
+
+    #[test]
+    fn history_unavailable_uses_typed_warning_path_and_network_errors_stay_errors() {
+        let range = Some(FetchRange::Trades(UnixMs::new(1), UnixMs::new(2)));
+        let update = fetch_failure(
+            Uuid::nil(),
+            None,
+            range,
+            AdapterError::HistoryUnavailable {
+                symbol: "BTCUSDT".into(),
+                date: "2026-10-28".into(),
+                detail: "HTTP 404".into(),
+            },
+        );
+        assert!(matches!(
+            update,
+            FetchUpdate::HistoryUnavailable {
+                retry_after_ms: 300_000,
+                ..
+            }
+        ));
+        let update = fetch_failure(
+            Uuid::nil(),
+            None,
+            range,
+            AdapterError::ParseError("bad data".into()),
+        );
+        assert!(matches!(update, FetchUpdate::Error { .. }));
     }
 
     #[test]
