@@ -101,8 +101,8 @@ fn without_unsupported_sources(value: &mut Value) {
 }
 
 fn load(path: &Path) -> data::State {
-    // Recovery prunes old backups by filename. Give each fixture its own directory
-    // so that neither recovery nor backup retention can alter another fixture.
+    // Recovery writes protected snapshots/session files. Keep each fixture's
+    // generated files isolated from the originals and other fixtures.
     let scratch = path
         .parent()
         .unwrap()

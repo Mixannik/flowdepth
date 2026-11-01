@@ -426,6 +426,11 @@ fn normalize_derive_maker_trades(
 impl MarketDataCache {
     fn open() -> Result<Self, String> {
         let path = data::data_path(Some("market_data/cache/market.redb"));
+        Self::open_at(path)
+    }
+
+    // Keep filesystem policy independent of the application's profile path.
+    fn open_at(path: PathBuf) -> Result<Self, String> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|error| {
                 format!(
@@ -435,25 +440,27 @@ impl MarketDataCache {
             })?;
         }
 
-        match open_initialized_database(&path) {
-            Ok(mut db) => {
-                if let Err(error) = Self::drop_raw_trade_cache(&mut db) {
-                    log::error!("CACHE RawTradesDrop Error | error={error}");
-                }
-                Ok(Self { db, path })
-            }
+        let db = match open_initialized_database(&path) {
+            Ok(db) => db,
             Err(first_error) => {
-                if path.exists() {
-                    quarantine_database(&path, &first_error)?;
+                // Lock, access, format/version and initialization errors do not
+                // prove corruption. Leave the original in place and disable cache.
+                if !first_error.is_confirmed_corruption() || !path.exists() {
+                    return Err(first_error.to_string());
                 }
-                let db = open_initialized_database(&path).map_err(|second_error| {
+                quarantine_database(&path, &first_error.to_string())?;
+                open_initialized_database(&path).map_err(|second_error| {
                     format!(
                         "cache recreation failed after {first_error}; second error: {second_error}"
                     )
-                })?;
-                Ok(Self { db, path })
+                })?
             }
+        };
+        let mut db = db;
+        if let Err(error) = Self::drop_raw_trade_cache(&mut db) {
+            log::error!("CACHE RawTradesDrop Error | error={error}");
         }
+        Ok(Self { db, path })
     }
 
     pub fn read_klines(
@@ -1350,8 +1357,31 @@ impl MarketDataCache {
     }
 }
 
-fn open_initialized_database(path: &Path) -> Result<Database, String> {
-    let db = Database::create(path).map_err(|error| error.to_string())?;
+#[derive(Debug, thiserror::Error)]
+enum CacheOpenError {
+    #[error("{0}")]
+    Open(#[from] redb::DatabaseError),
+    #[error("cache initialization failed: {0}")]
+    Initialization(String),
+}
+
+impl CacheOpenError {
+    fn is_confirmed_corruption(&self) -> bool {
+        matches!(
+            self,
+            Self::Open(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                _
+            )))
+        )
+    }
+}
+
+fn open_initialized_database(path: &Path) -> Result<Database, CacheOpenError> {
+    let db = Database::create(path)?;
+    initialize_database(db).map_err(CacheOpenError::Initialization)
+}
+
+fn initialize_database(db: Database) -> Result<Database, String> {
     let write = db.begin_write().map_err(|error| error.to_string())?;
     {
         let mut meta = write
@@ -1412,28 +1442,14 @@ fn quarantine_database(path: &Path, cause: &str) -> Result<(), String> {
         .and_then(|name| name.to_str())
         .unwrap_or("market.redb");
     let quarantine = path.with_file_name(format!("{file_name}.corrupt-{timestamp}"));
-    match std::fs::rename(path, &quarantine) {
-        Ok(()) => {
-            log::warn!(
-                "CACHE Database Quarantined | path={} quarantine={} cause={cause}",
-                path.display(),
-                quarantine.display()
-            );
-            Ok(())
-        }
-        Err(rename_error) => {
-            std::fs::remove_file(path).map_err(|remove_error| {
-                format!(
-                    "cannot quarantine invalid cache ({rename_error}) or remove it ({remove_error})"
-                )
-            })?;
-            log::warn!(
-                "CACHE Database Removed | path={} cause={cause} rename_error={rename_error}",
-                path.display()
-            );
-            Ok(())
-        }
-    }
+    std::fs::rename(path, &quarantine)
+        .map_err(|error| format!("cannot quarantine cache; original retained: {error}"))?;
+    log::warn!(
+        "CACHE Database Quarantined | path={} quarantine={} cause={cause}",
+        path.display(),
+        quarantine.display()
+    );
+    Ok(())
 }
 
 fn dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
@@ -1710,6 +1726,136 @@ pub fn merge_bubble_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TestCacheDir(PathBuf);
+
+    impl TestCacheDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("flowsurface-cache-open-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+
+        fn database_path(&self) -> PathBuf {
+            self.0.join("market.redb")
+        }
+
+        fn assert_no_quarantine(&self) {
+            assert_eq!(std::fs::read_dir(&self.0).unwrap().count(), 1);
+        }
+    }
+
+    impl Drop for TestCacheDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn second_cache_open_preserves_locked_database_and_records() {
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        let first = MarketDataCache::open_at(path.clone()).unwrap();
+        let write = first.db.begin_write().unwrap();
+        write
+            .open_table(META_TABLE)
+            .unwrap()
+            .insert("sentinel", 42)
+            .unwrap();
+        write.commit().unwrap();
+
+        let error = match MarketDataCache::open_at(path.clone()) {
+            Ok(_) => panic!("a locked database must not be recreated"),
+            Err(error) => error,
+        };
+        assert!(error.contains("already open"), "{error}");
+        assert!(path.is_file());
+        dir.assert_no_quarantine();
+        drop(first);
+
+        let reopened = MarketDataCache::open_at(path).unwrap();
+        let read = reopened.db.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(META_TABLE)
+                .unwrap()
+                .get("sentinel")
+                .unwrap()
+                .unwrap()
+                .value(),
+            42
+        );
+    }
+
+    #[test]
+    fn unsupported_cache_schema_is_retained_without_recreation() {
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        let db = open_initialized_database(&path).unwrap();
+        let write = db.begin_write().unwrap();
+        write
+            .open_table(META_TABLE)
+            .unwrap()
+            .insert(SCHEMA_KEY, CACHE_SCHEMA + 1)
+            .unwrap();
+        write.commit().unwrap();
+        drop(db);
+
+        let error = MarketDataCache::open_at(path.clone()).err().unwrap();
+        assert!(error.contains("unsupported cache schema"), "{error}");
+        dir.assert_no_quarantine();
+        let db = Database::create(&path).unwrap();
+        let read = db.begin_read().unwrap();
+        assert_eq!(
+            read.open_table(META_TABLE)
+                .unwrap()
+                .get(SCHEMA_KEY)
+                .unwrap()
+                .unwrap()
+                .value(),
+            CACHE_SCHEMA + 1
+        );
+    }
+
+    #[test]
+    fn inaccessible_database_path_is_not_quarantined_or_removed() {
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        // A directory in place of the file fails consistently on Windows/Unix,
+        // unlike permission bits when tests run with elevated privileges.
+        std::fs::create_dir(&path).unwrap();
+        std::fs::write(path.join("sentinel"), b"keep").unwrap();
+        assert!(MarketDataCache::open_at(path.clone()).is_err());
+        assert_eq!(std::fs::read(path.join("sentinel")).unwrap(), b"keep");
+        dir.assert_no_quarantine();
+    }
+
+    #[test]
+    fn only_explicit_redb_corruption_allows_quarantine() {
+        assert!(
+            CacheOpenError::Open(redb::DatabaseError::Storage(redb::StorageError::Corrupted(
+                "bad checksum".into()
+            )))
+            .is_confirmed_corruption()
+        );
+        for error in [
+            redb::DatabaseError::DatabaseAlreadyOpen,
+            redb::DatabaseError::RepairAborted,
+            redb::DatabaseError::UpgradeRequired(1),
+            redb::DatabaseError::Storage(redb::StorageError::Io(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied,
+            ))),
+            redb::DatabaseError::Storage(redb::StorageError::Io(std::io::Error::other(
+                "unknown IO failure",
+            ))),
+        ] {
+            assert!(!CacheOpenError::Open(error).is_confirmed_corruption());
+        }
+        assert!(
+            !CacheOpenError::Initialization("corrupted is only text here".into())
+                .is_confirmed_corruption()
+        );
+    }
 
     fn bubble_candidate(
         qty: f64,

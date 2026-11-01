@@ -70,6 +70,7 @@ pub enum StateLoadOutcome {
         state: State,
         warnings: Vec<String>,
         backup_path: Option<PathBuf>,
+        save_path: PathBuf,
     },
     Corrupt {
         error: String,
@@ -169,6 +170,13 @@ pub fn load_saved_state_file() -> StateLoadOutcome {
 }
 
 pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
+    load_saved_state_with_backup(path, backup_saved_state)
+}
+
+fn load_saved_state_with_backup(
+    path: &Path,
+    backup: impl Fn(&Path, &str) -> std::io::Result<PathBuf>,
+) -> StateLoadOutcome {
     info!("SAVED_STATE LoadStart | path={}", path.display());
 
     let raw = match std::fs::read_to_string(path) {
@@ -182,7 +190,7 @@ pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
             return StateLoadOutcome::Corrupt {
                 error: err.to_string(),
                 original_path: path.to_path_buf(),
-                backup_path: backup_saved_state(path, "corrupt").ok(),
+                backup_path: backup(path, "corrupt").ok(),
             };
         }
     };
@@ -191,7 +199,7 @@ pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
         Ok(value) => value,
         Err(err) => {
             error!("SAVED_STATE ParseFailed | error={err}");
-            let backup_path = backup_saved_state(path, "corrupt").ok();
+            let backup_path = backup(path, "corrupt").ok();
             return StateLoadOutcome::Corrupt {
                 error: err.to_string(),
                 original_path: path.to_path_buf(),
@@ -217,15 +225,15 @@ pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
         return StateLoadOutcome::Corrupt {
             error,
             original_path: path.to_path_buf(),
-            backup_path: backup_saved_state(path, "incompatible").ok(),
+            backup_path: backup(path, "incompatible").ok(),
         };
     }
 
-    let mut state: State = match serde_json::from_value(value) {
+    let mut state: State = match serde_json::from_value(value.clone()) {
         Ok(state) => state,
         Err(err) => {
             error!("SAVED_STATE DeserializeFailed | error={err}");
-            let backup_path = backup_saved_state(path, "corrupt").ok();
+            let backup_path = backup(path, "corrupt").ok();
             return StateLoadOutcome::Corrupt {
                 error: err.to_string(),
                 original_path: path.to_path_buf(),
@@ -239,10 +247,63 @@ pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
     let to_version = report.to_version;
     state.saved_state_version = CURRENT_SAVED_STATE_VERSION;
     let mut warnings = report.warnings;
+    // Serde accepts unknown struct fields silently. Detect fields that this
+    // build cannot represent before a subsequent save could discard them.
+    if let Ok(represented) = serde_json::to_value(&state) {
+        collect_unrepresented_fields(&value, &represented, "$", &mut warnings);
+    }
     sanitize_state(&mut state, &mut warnings);
 
+    // A repaired model may have lost unsupported panes/indicators. Keep it in
+    // a separate session file, including all subsequent application saves.
+    if !warnings.is_empty() {
+        let backup_path = match backup(path, "recovered") {
+            Ok(backup) => backup,
+            Err(error) => {
+                return StateLoadOutcome::Corrupt {
+                    error: format!("cannot protect original state before recovery: {error}"),
+                    original_path: path.to_path_buf(),
+                    backup_path: None,
+                };
+            }
+        };
+        let stamp = chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default();
+        let save_path = path.with_file_name(format!(
+            "saved-state.session-{stamp}-{}.json",
+            std::process::id()
+        ));
+        if let Err(error) = save_saved_state_at(&state, &save_path) {
+            return StateLoadOutcome::Corrupt {
+                error: format!("cannot save recovered session: {error}"),
+                original_path: path.to_path_buf(),
+                backup_path: Some(backup_path),
+            };
+        }
+        warn!(
+            "SAVED_STATE Recovered | original={} session={} warnings={}",
+            path.display(),
+            save_path.display(),
+            warnings.join("; ")
+        );
+        return StateLoadOutcome::Recovered {
+            state,
+            warnings,
+            backup_path: Some(backup_path),
+            save_path,
+        };
+    }
+
     if migrated {
-        let backup_path = backup_saved_state(path, "v0").ok();
+        let backup_path = match backup(path, "v0") {
+            Ok(backup) => Some(backup),
+            Err(error) => {
+                return StateLoadOutcome::Corrupt {
+                    error: format!("cannot protect original state before migration: {error}"),
+                    original_path: path.to_path_buf(),
+                    backup_path: None,
+                };
+            }
+        };
         match serde_json::to_string(&state)
             .map_err(std::io::Error::other)
             .and_then(|json| write_json_to_file_atomic_at(&json, path))
@@ -269,41 +330,28 @@ pub fn load_saved_state_from_path(path: &Path) -> StateLoadOutcome {
         };
     }
 
-    if !warnings.is_empty() {
-        let backup_path = backup_saved_state(path, "recovered").ok();
-        warn!("SAVED_STATE Recovered | warnings={}", warnings.join("; "));
-        match serde_json::to_string(&state)
-            .map_err(std::io::Error::other)
-            .and_then(|json| write_json_to_file_atomic_at(&json, path))
-        {
-            Ok(()) => {
-                info!(
-                    "SAVED_STATE RecoveredWriteComplete | backup={}",
-                    backup_path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "none".to_string())
-                );
-            }
-            Err(err) => warn!("SAVED_STATE RecoveredWriteFailed | error={err}"),
-        }
-        return StateLoadOutcome::Recovered {
-            state,
-            warnings,
-            backup_path,
-        };
-    }
-
     StateLoadOutcome::Loaded(state)
 }
 
 pub fn save_saved_state_atomic(state: &State) -> std::io::Result<()> {
     let path = data_path(Some(SAVED_STATE_PATH));
+    save_saved_state_at(state, &path)
+}
+
+pub fn save_saved_state_at(state: &State, path: &Path) -> std::io::Result<()> {
     let json = serde_json::to_string(state).map_err(std::io::Error::other)?;
-    write_json_to_file_atomic_at(&json, &path)
+    write_json_to_file_atomic_at(&json, path)
 }
 
 pub fn write_json_to_file_atomic_at(json: &str, path: &Path) -> std::io::Result<()> {
+    write_json_to_file_with_replace(json, path, |from, to| std::fs::rename(from, to))
+}
+
+fn write_json_to_file_with_replace(
+    json: &str,
+    path: &Path,
+    replace: impl FnOnce(&Path, &Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
     info!("SAVED_STATE SaveStart | path={}", path.display());
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid state file path")
@@ -328,20 +376,21 @@ pub fn write_json_to_file_atomic_at(json: &str, path: &Path) -> std::io::Result<
     }
 
     if path.exists() {
-        let rolling_backup = parent.join(SAVED_STATE_BACKUP_PATH);
+        let rolling_backup = if path
+            .file_name()
+            .is_some_and(|name| name == SAVED_STATE_PATH)
+        {
+            parent.join(SAVED_STATE_BACKUP_PATH)
+        } else {
+            path.with_extension("backup.json")
+        };
         std::fs::copy(path, &rolling_backup)?;
     }
 
-    #[cfg(target_os = "windows")]
-    {
-        if path.exists() {
-            std::fs::remove_file(path)?;
-        }
-    }
-
-    std::fs::rename(&tmp_path, path).inspect_err(|_| {
-        let _ = std::fs::remove_file(&tmp_path);
-    })?;
+    // rename replaces an existing file on Windows too. Never unlink the
+    // destination first: if replacement fails, both the old state and the
+    // fully flushed new state must remain available for recovery.
+    replace(&tmp_path, path)?;
 
     if let Ok(dir) = File::open(parent) {
         let _ = dir.sync_all();
@@ -350,6 +399,37 @@ pub fn write_json_to_file_atomic_at(json: &str, path: &Path) -> std::io::Result<
     cleanup_saved_state_backups(parent);
     info!("SAVED_STATE SaveComplete | path={}", path.display());
     Ok(())
+}
+
+fn collect_unrepresented_fields(
+    input: &serde_json::Value,
+    represented: &serde_json::Value,
+    location: &str,
+    warnings: &mut Vec<String>,
+) {
+    match (input, represented) {
+        (serde_json::Value::Object(input), serde_json::Value::Object(output)) => {
+            for (key, value) in input {
+                let location = format!("{location}.{key}");
+                if let Some(output) = output.get(key) {
+                    collect_unrepresented_fields(value, output, &location, warnings);
+                } else {
+                    warnings.push(format!("unsupported saved field {location}"));
+                }
+            }
+        }
+        (serde_json::Value::Array(input), serde_json::Value::Array(output)) => {
+            for (index, (input, output)) in input.iter().zip(output).enumerate() {
+                collect_unrepresented_fields(
+                    input,
+                    output,
+                    &format!("{location}[{index}]"),
+                    warnings,
+                );
+            }
+        }
+        _ => {}
+    }
 }
 
 fn backup_saved_state(path: &Path, reason: &str) -> std::io::Result<PathBuf> {
@@ -364,10 +444,17 @@ fn backup_saved_state(path: &Path, reason: &str) -> std::io::Result<PathBuf> {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid state file path")
     })?;
     let backup_path = parent.join(format!(
-        "saved-state.{reason}.{}.json",
-        chrono::Local::now().format("%Y-%m-%d_%H-%M-%S")
+        "saved-state.{reason}.{}-{}.json",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+        std::process::id()
     ));
-    std::fs::copy(path, &backup_path)?;
+    let mut original = File::open(path)?;
+    let mut copy = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&backup_path)?;
+    std::io::copy(&mut original, &mut copy)?;
+    copy.sync_all()?;
     info!("SAVED_STATE BackupCreated | path={}", backup_path.display());
     Ok(backup_path)
 }
@@ -904,7 +991,9 @@ fn cleanup_saved_state_backups(parent: &Path) {
         .filter_map(|entry| {
             let path = entry.path();
             let name = path.file_name()?.to_str()?;
-            if name.starts_with("saved-state.") && name.ends_with(".json") {
+            // Recovery, migration and session snapshots protect originals and
+            // must not be aged out by ordinary saves. Rotate only autosnapshots.
+            if name.starts_with("saved-state.auto-") && name.ends_with(".json") {
                 Some((path, entry.metadata().and_then(|m| m.modified()).ok()))
             } else {
                 None
@@ -1105,6 +1194,123 @@ mod tests {
             }
             _ => panic!("unexpected outcome"),
         }
+    }
+
+    #[test]
+    fn unknown_fields_are_preserved_in_original_and_recovery_backup() {
+        let path = temp_state_path("saved-state.json");
+        let mut value = serde_json::to_value(valid_state()).unwrap();
+        value["future_feature"] = serde_json::json!({"enabled": true});
+        value["layout_manager"]["layouts"][0]["dashboard"]["future_panel_option"] =
+            serde_json::json!(42);
+        let original = serde_json::to_vec_pretty(&value).unwrap();
+        std::fs::write(&path, &original).unwrap();
+        match load_saved_state_from_path(&path) {
+            StateLoadOutcome::Recovered {
+                state,
+                warnings,
+                backup_path,
+                save_path,
+            } => {
+                assert!(warnings.iter().any(|w| w.contains("$.future_feature")));
+                assert!(warnings.iter().any(|w| w.contains("future_panel_option")));
+                assert_eq!(std::fs::read(backup_path.unwrap()).unwrap(), original);
+                save_saved_state_at(&state, &save_path).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            }
+            _ => panic!("unknown fields require a separate recovery session"),
+        }
+    }
+
+    #[test]
+    fn failed_backup_blocks_recovery_and_migration_without_overwrite() {
+        for legacy in [false, true] {
+            let path = temp_state_path("saved-state.json");
+            let mut value = serde_json::to_value(valid_state()).unwrap();
+            if legacy {
+                value.as_object_mut().unwrap().remove("saved_state_version");
+            } else {
+                value["layout_manager"]["layouts"][0]["dashboard"]["pane"] =
+                    serde_json::json!({"FuturePane": {}});
+            }
+            let original = serde_json::to_vec(&value).unwrap();
+            std::fs::write(&path, &original).unwrap();
+            let outcome = load_saved_state_with_backup(&path, |_, _| {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            });
+            assert!(matches!(
+                outcome,
+                StateLoadOutcome::Corrupt {
+                    backup_path: None,
+                    ..
+                }
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+            assert_eq!(
+                std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_snapshots_and_session_files_survive_normal_save_rotation() {
+        let path = temp_state_path("saved-state.json");
+        let parent = path.parent().unwrap();
+        for index in 0..10 {
+            std::fs::write(
+                parent.join(format!("saved-state.auto-{index}.json")),
+                "auto",
+            )
+            .unwrap();
+        }
+        for name in [
+            "saved-state.recovered.keep.json",
+            "saved-state.v0.keep.json",
+            "saved-state.incompatible.keep.json",
+            "saved-state.session-keep.json",
+            "saved-state.session-keep.backup.json",
+        ] {
+            std::fs::write(parent.join(name), "protected").unwrap();
+        }
+        save_saved_state_at(&valid_state(), &path).unwrap();
+        for name in [
+            "saved-state.recovered.keep.json",
+            "saved-state.v0.keep.json",
+            "saved-state.incompatible.keep.json",
+            "saved-state.session-keep.json",
+            "saved-state.session-keep.backup.json",
+        ] {
+            assert_eq!(
+                std::fs::read_to_string(parent.join(name)).unwrap(),
+                "protected"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(parent)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("saved-state.auto-"))
+                .count(),
+            SAVED_STATE_BACKUP_RETENTION
+        );
+    }
+
+    #[test]
+    fn recovery_session_saves_do_not_replace_original_rolling_backup() {
+        let path = temp_state_path("saved-state.session-test.json");
+        let rolling = path.parent().unwrap().join(SAVED_STATE_BACKUP_PATH);
+        std::fs::write(&rolling, "original backup").unwrap();
+        std::fs::write(&path, "previous session").unwrap();
+        save_saved_state_at(&valid_state(), &path).unwrap();
+        assert_eq!(std::fs::read_to_string(rolling).unwrap(), "original backup");
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("backup.json")).unwrap(),
+            "previous session"
+        );
     }
 
     #[test]
@@ -1644,7 +1850,7 @@ mod tests {
     }
 
     #[test]
-    fn recovered_saved_state_is_persisted() {
+    fn recovered_saved_state_is_saved_separately_and_original_survives_saves() {
         let path = temp_state_path("saved-state.json");
         let value = serde_json::json!({
             "saved_state_version": CURRENT_SAVED_STATE_VERSION,
@@ -1672,19 +1878,34 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
 
+        let original = std::fs::read(&path).unwrap();
         match load_saved_state_from_path(&path) {
-            StateLoadOutcome::Recovered { warnings, .. } => {
+            StateLoadOutcome::Recovered {
+                warnings,
+                state,
+                save_path,
+                backup_path,
+            } => {
                 assert!(
                     warnings
                         .iter()
                         .any(|warning| warning.contains("visual config"))
                 );
+                assert_ne!(save_path, path);
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert_eq!(std::fs::read(backup_path.unwrap()).unwrap(), original);
+                save_saved_state_at(&state, &save_path).unwrap();
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+                assert!(matches!(
+                    load_saved_state_from_path(&save_path),
+                    StateLoadOutcome::Loaded(_)
+                ));
             }
             _ => panic!("unexpected outcome"),
         }
 
         match load_saved_state_from_path(&path) {
-            StateLoadOutcome::Loaded(state) => {
+            StateLoadOutcome::Recovered { state, .. } => {
                 assert_eq!(state.layout_manager.layouts.len(), 1);
             }
             _ => panic!("unexpected outcome"),
@@ -1718,7 +1939,7 @@ mod tests {
         }
 
         match load_saved_state_from_path(&path) {
-            StateLoadOutcome::Loaded(state) => {
+            StateLoadOutcome::Recovered { state, .. } => {
                 assert!(state.main_window.is_none());
             }
             _ => panic!("unexpected outcome"),
@@ -1783,5 +2004,35 @@ mod tests {
             "previous"
         );
         assert!(!path.with_extension("json.tmp").exists());
+    }
+
+    #[test]
+    fn failed_state_replacement_retains_previous_and_pending_state() {
+        let path = temp_state_path("saved-state.json");
+        let previous = serde_json::to_string(&valid_state()).unwrap();
+        std::fs::write(&path, &previous).unwrap();
+        let mut changed = valid_state();
+        changed.layout_manager.active_layout = Some("Changed".into());
+        let pending = serde_json::to_string(&changed).unwrap();
+
+        let error = write_json_to_file_with_replace(&pending, &path, |tmp, target| {
+            assert_eq!(std::fs::read_to_string(target).unwrap(), previous);
+            assert_eq!(std::fs::read_to_string(tmp).unwrap(), pending);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), previous);
+        assert_eq!(
+            std::fs::read_to_string(path.with_extension("json.tmp")).unwrap(),
+            pending
+        );
+        assert_eq!(
+            std::fs::read_to_string(path.parent().unwrap().join(SAVED_STATE_BACKUP_PATH)).unwrap(),
+            previous
+        );
+        write_json_to_file_atomic_at(&pending, &path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), pending);
     }
 }

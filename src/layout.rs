@@ -62,6 +62,7 @@ pub enum SavedStateLoadOutcome {
         state: SavedState,
         warnings: Vec<String>,
         backup_path: Option<PathBuf>,
+        save_path: PathBuf,
     },
     Corrupt {
         error: String,
@@ -742,10 +743,12 @@ pub fn load_saved_state() -> SavedStateLoadOutcome {
             state,
             warnings,
             backup_path,
+            save_path,
         } => SavedStateLoadOutcome::Recovered {
             state: saved_state_from_config(state),
             warnings,
             backup_path,
+            save_path,
         },
         data::StateLoadOutcome::Corrupt {
             error,

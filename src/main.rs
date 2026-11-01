@@ -139,6 +139,7 @@ struct Flowsurface {
     confirm_dialog: Option<screen::ConfirmDialog<Message>>,
     startup_warning: Option<StartupWarning>,
     save_state_enabled: bool,
+    state_save_path: Option<PathBuf>,
     volume_size_unit: exchange::SizeUnit,
     ui_scale_factor: data::ScaleFactor,
     timezone: data::UserTimezone,
@@ -265,6 +266,7 @@ enum StartupWarning {
     SavedStateRecovered {
         warnings: Vec<String>,
         backup_path: Option<PathBuf>,
+        save_path: PathBuf,
     },
     SavedStateMigrated {
         from_version: u32,
@@ -348,11 +350,13 @@ impl Flowsurface {
                 state,
                 warnings,
                 backup_path,
+                save_path,
             } => (
                 state,
                 Some(StartupWarning::SavedStateRecovered {
                     warnings,
                     backup_path,
+                    save_path,
                 }),
                 true,
             ),
@@ -438,6 +442,10 @@ impl Flowsurface {
             power_guard::windows_power::init();
         }
 
+        let state_save_path = match &startup_warning {
+            Some(StartupWarning::SavedStateRecovered { save_path, .. }) => Some(save_path.clone()),
+            _ => None,
+        };
         let mut state = Self {
             main_window: window::Window::new(main_window_id),
             layout_manager: saved_state.layout_manager,
@@ -448,6 +456,7 @@ impl Flowsurface {
             confirm_dialog: None,
             startup_warning,
             save_state_enabled,
+            state_save_path,
             timezone: saved_state.timezone,
             ui_scale_factor: saved_state.scale_factor,
             volume_size_unit: saved_state.volume_size_unit,
@@ -491,9 +500,11 @@ impl Flowsurface {
             Some(StartupWarning::SavedStateRecovered {
                 warnings,
                 backup_path,
+                save_path,
             }) => state.notifications.push(Toast::warn(format!(
-                "Saved layout was repaired: {} Backup: {}",
+                "Some saved settings could not be loaded: {} Original file preserved. This session saves to: {} Backup: {}",
                 warnings.join("; "),
+                save_path.display(),
                 backup_path
                     .as_ref()
                     .map(|p| p.display().to_string())
@@ -3003,9 +3014,19 @@ impl Flowsurface {
             self.sidebar.cache_enabled(),
         );
 
-        match data::save_saved_state_atomic(&state) {
+        let save_result = match &self.state_save_path {
+            Some(path) => data::save_saved_state_at(&state, path),
+            None => data::save_saved_state_atomic(&state),
+        };
+        match save_result {
             Ok(()) => {
-                log::info!("Persisted state to {}", data::SAVED_STATE_PATH);
+                log::info!(
+                    "Persisted state to {}",
+                    self.state_save_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_else(|| data::SAVED_STATE_PATH.to_owned())
+                );
             }
             Err(e) => {
                 log::error!("SAVED_STATE SaveFailed | error={e}");
