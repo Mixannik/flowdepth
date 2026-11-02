@@ -76,7 +76,9 @@ jobs:
     name: Prepare develop prerelease
     needs:
       - quality
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Temporarily disabled by maintainer approval. Original condition:
+    # github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: ${{ false }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -167,6 +169,8 @@ jobs:
 
   build:
     name: Build ${{ matrix.target.name }}
+    # Independent guard: do not rely only on prepare-release being skipped.
+    if: ${{ false }}
     needs:
       - prepare-release
     runs-on: ${{ matrix.target.os }}
@@ -233,6 +237,8 @@ jobs:
 
   publish-release:
     name: Publish develop prerelease
+    # Independent guard: re-enabling releases requires reviewing all three jobs.
+    if: ${{ false }}
     needs:
       - prepare-release
       - build

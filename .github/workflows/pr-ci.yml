@@ -1,0 +1,100 @@
+name: PR CI
+
+on:
+  pull_request:
+    branches: [feat/delta-table]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  quality:
+    name: PR quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout PR merge commit
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # No workflow-level path filter: this check also completes for docs-only PRs.
+      # Use git, not the paginated/truncated changed-files API; unknown paths run Rust.
+      - name: Classify changes and check whitespace
+        id: changes
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: python
+        run: |
+          import os
+          import subprocess
+          from pathlib import PurePosixPath
+
+          comparison = os.environ["BASE_SHA"] + "..." + os.environ["HEAD_SHA"]
+          subprocess.run(["git", "diff", "--check", comparison], check=True)
+          raw = subprocess.check_output([
+              "git", "diff", "--name-only", "--no-renames", "-z", comparison
+          ])
+          paths = [p.decode("utf-8", errors="surrogateescape") for p in raw.split(b"\0") if p]
+          def documentation(path):
+              p = PurePosixPath(path)
+              return (p.suffix == ".md" and
+                      (path.startswith("docs/") or
+                       path in {"README.md", "REVIEW.md", "CONTRIBUTING.md",
+                                "SECURITY.md", "CODE_OF_CONDUCT.md", "CLAUDE.md", "AGENTS.md"}))
+          rust = not paths or not all(documentation(p) for p in paths)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write("rust=" + str(rust).lower() + "\n")
+          print("Rust checks required:", rust)
+
+      - name: Install Linux build dependencies
+        if: steps.changes.outputs.rust == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libasound2-dev libudev-dev libxkbcommon-dev
+
+      - name: Activate pinned Rust toolchain
+        if: steps.changes.outputs.rust == 'true'
+        run: |
+          rustup show
+          rustup component add rustfmt
+
+      - name: Check formatting
+        if: steps.changes.outputs.rust == 'true'
+        run: cargo fmt --all -- --check
+
+      - name: Check compilation
+        if: steps.changes.outputs.rust == 'true'
+        run: cargo check --workspace --all-targets --locked
+
+      # Workspace selection preserves the application's dependency feature unification.
+      # These are baseline regressions, not the full test suite or task-specific acceptance.
+      - name: Test analysis, persistent cache and adapters
+        if: steps.changes.outputs.rust == 'true'
+        run: |
+          cargo test --workspace --locked analysis::
+          cargo test --workspace --locked persistent_cache::
+          cargo test --workspace --locked adapter::
+
+      - name: Test indicator engine
+        if: steps.changes.outputs.rust == 'true'
+        run: cargo test -p flowsurface-indicator-engine --lib --locked
+
+      - name: Validate indicator sources
+        if: steps.changes.outputs.rust == 'true'
+        run: |
+          cargo run --locked -p flowsurface-indicator-engine --bin flowsurface-indicator -- test data/indicators/sources --namespace core
+          cargo run --locked -p flowsurface-indicator-engine --bin flowsurface-indicator -- test indicators/sources --namespace catalog
+
+      - name: Documentation-only result
+        if: steps.changes.outputs.rust == 'false'
+        run: echo 'Only allowlisted Markdown changed; whitespace checked, Rust checks skipped.'
