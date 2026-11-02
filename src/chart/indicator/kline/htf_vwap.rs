@@ -1,8 +1,8 @@
 //! Runtime of the VWAP indicator. The session VWAP (from trades) is drawn by `KlineChart`;
 //! this part adds the developing weekly (from Monday 00:00 UTC) and monthly VWAP, built from
 //! the chart market's hourly candles with the typical price (H+L+C)/3 and fetched separately,
-//! so both lines exist on any timeframe without a month of trades. Within a few dollars of
-//! the trade-based VWAP.
+//! so both lines exist without loading a month of trades. Hourly-candle approximation;
+//! it is not an exact trade-based VWAP.
 use crate::chart::{
     Basis, Message, ViewState,
     indicator::kline::{
@@ -10,14 +10,13 @@ use crate::chart::{
     },
 };
 use crate::connector::fetcher::FetchRange;
-use data::analysis::period_levels::{month_starts, week_start};
+use data::analysis::htf_vwap::{Anchor, HourlyBar, HtfVwap};
 
 use data::chart::kline::VwapConfig;
 use exchange::unit::Price;
 use exchange::{Kline, Timeframe, UnixMs};
 use iced::widget::canvas::{self, Frame, LineDash, Stroke};
 use iced::{Alignment, Point};
-use std::collections::BTreeMap;
 
 /// Refresh period of the forming hourly candle.
 const POLL_MS: u64 = 30_000;
@@ -26,59 +25,17 @@ const WEEK_COLOR: iced::Color = iced::Color::from_rgba(0.40, 0.72, 0.86, 0.75);
 const MONTH_COLOR: iced::Color = iced::Color::from_rgba(0.92, 0.66, 0.38, 0.75);
 
 pub struct HtfVwapIndicator {
-    /// Hourly candle open time → (typical price, volume).
-    hourly: BTreeMap<u64, (f64, f64)>,
+    model: HtfVwap,
     config: VwapConfig,
 }
 
 impl HtfVwapIndicator {
     pub fn new() -> Self {
         Self {
-            hourly: BTreeMap::new(),
+            model: HtfVwap::new(chrono::Utc::now().timestamp_millis() as u64),
             config: VwapConfig::default(),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct VwapPoint {
-    time: u64,
-    value: f64,
-    /// Volume-weighted standard deviation of price around the VWAP.
-    sigma: f64,
-}
-
-/// VWAP points, one run per anchor period.
-fn sessions(
-    hourly: &BTreeMap<u64, (f64, f64)>,
-    anchor: impl Fn(u64) -> u64,
-) -> Vec<Vec<VwapPoint>> {
-    let mut runs: Vec<Vec<VwapPoint>> = Vec::new();
-    let mut current = None;
-    let (mut pv, mut p2v, mut v) = (0.0, 0.0, 0.0);
-    for (&time, &(price, volume)) in hourly {
-        let start = anchor(time);
-        if current != Some(start) {
-            current = Some(start);
-            (pv, p2v, v) = (0.0, 0.0, 0.0);
-            runs.push(Vec::new());
-        }
-        pv += price * volume;
-        p2v += price * price * volume;
-        v += volume;
-        if v > 0.0
-            && let Some(run) = runs.last_mut()
-        {
-            let value = pv / v;
-            run.push(VwapPoint {
-                time,
-                value,
-                sigma: (p2v / v - value * value).max(0.0).sqrt(),
-            });
-        }
-    }
-    runs.retain(|run| !run.is_empty());
-    runs
 }
 
 impl KlineIndicatorImpl for HtfVwapIndicator {
@@ -113,14 +70,15 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
             return None;
         }
         let now = chrono::Utc::now().timestamp_millis() as u64;
+        self.model.advance_to(now);
         let from = self
-            .hourly
-            .last_key_value()
-            .map_or_else(|| month_starts(now).1, |(&last, _)| last);
+            .model
+            .current()
+            .fetch_from(self.config.weekly, self.config.monthly);
         // `to` moves in POLL_MS steps; identical requests are throttled by the handler.
         Some(FetchRange::RefKlines {
             from: UnixMs::new(from),
-            to: UnixMs::new(now - now % POLL_MS).max(UnixMs::new(from + 1)),
+            to: UnixMs::new(now - now % POLL_MS).max(UnixMs::new(from.saturating_add(1))),
             timeframe: Timeframe::H1,
             spot: false,
         })
@@ -130,28 +88,52 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
         if spot || timeframe != Timeframe::H1 {
             return;
         }
-        // Long fixed-range profiles fetch months of hourly candles on the same path; keep
-        // only what this indicator draws (previous and current month).
-        let since = month_starts(chrono::Utc::now().timestamp_millis() as u64).1;
-        let klines = klines.iter().filter(|k| k.time.as_u64() >= since);
-        self.hourly.extend(klines.map(|k| {
-            let typical = (k.high.to_f64() + k.low.to_f64() + k.close.to_f64()) / 3.0;
-            (k.time.as_u64(), (typical, k.volume.total().to_f64()))
-        }));
+        self.model.insert(
+            klines.iter().map(|k| HourlyBar {
+                time: k.time.as_u64(),
+                price: (k.high.to_f64() + k.low.to_f64() + k.close.to_f64()) / 3.0,
+                volume: k.volume.total().to_f64(),
+            }),
+            chrono::Utc::now().timestamp_millis() as u64,
+        );
     }
 
     /// Current weekly and monthly VWAP.
     fn reference_prices(&self) -> Vec<f64> {
-        let anchors: [(bool, fn(u64) -> u64); 2] = [
-            (self.config.weekly, week_start),
-            (self.config.monthly, |t| month_starts(t).0),
-        ];
-        anchors
-            .into_iter()
-            .filter(|(enabled, _)| *enabled)
-            .filter_map(|(_, anchor)| sessions(&self.hourly, anchor).last()?.last().copied())
-            .map(|point| point.value)
-            .collect()
+        [
+            (self.config.weekly, Anchor::Week),
+            (self.config.monthly, Anchor::Month),
+        ]
+        .into_iter()
+        .filter(|(enabled, _)| *enabled)
+        .filter_map(|(_, anchor)| self.model.current().reference(anchor))
+        .collect()
+    }
+
+    fn data_warning(&self) -> Option<String> {
+        let mut details = Vec::new();
+        for (enabled, anchor, name) in [
+            (self.config.weekly, Anchor::Week, "Weekly"),
+            (self.config.monthly, Anchor::Month, "Monthly"),
+        ] {
+            if !enabled {
+                continue;
+            }
+            let runs = self.model.current().runs(anchor);
+            let missing: usize = runs.iter().map(|r| r.coverage.missing_hours.len()).sum();
+            let invalid: usize = runs.iter().map(|r| r.coverage.invalid_hours.len()).sum();
+            let pending: usize = runs
+                .iter()
+                .map(|r| r.coverage.unconfirmed_hours.len())
+                .sum();
+            if let Some(first) = runs.iter().filter_map(|r| r.coverage.first_gap()).min() {
+                let date = chrono::DateTime::from_timestamp_millis(first as i64)
+                    .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+                    .unwrap_or_default();
+                details.push(format!("{name} VWAP: {missing} missing, {invalid} invalid, {pending} awaiting closed-hour update. First: {date}."));
+            }
+        }
+        (!details.is_empty()).then(|| format!("VWAP history incomplete\n{}\nLines stop at the first gap; incomplete current VWAP is excluded from level filters. Based on hourly candles.", details.join("\n")))
     }
 
     fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
@@ -159,20 +141,19 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
         let label_size = 10.0 / ctx.scaling;
         let width = cfg.line_width.clamp(0.5, 5.0) / ctx.scaling;
         let multiplier = f64::from(cfg.band_multiplier.max(0.0));
-        let anchors: [(bool, fn(u64) -> u64, iced::Color, &str); 2] = [
-            (cfg.weekly, week_start, WEEK_COLOR, "W VWAP"),
-            (cfg.monthly, |t| month_starts(t).0, MONTH_COLOR, "M VWAP"),
+        let anchors = [
+            (cfg.weekly, Anchor::Week, WEEK_COLOR, "W VWAP"),
+            (cfg.monthly, Anchor::Month, MONTH_COLOR, "M VWAP"),
         ];
         for (enabled, anchor, color, name) in anchors {
             if !enabled {
                 continue;
             }
-            let runs = sessions(&self.hourly, anchor);
-            let last_run = runs.len().saturating_sub(1);
-            for (i, run) in runs.iter().enumerate() {
+            let runs = self.model.current().runs(anchor);
+            for run in runs.iter().filter(|run| !run.points.is_empty()) {
                 let stroke_line = |frame: &mut Frame, offset: f64, stroke: Stroke| {
                     let mut path = canvas::path::Builder::new();
-                    for (j, p) in run.iter().enumerate() {
+                    for (j, p) in run.points.iter().enumerate() {
                         let price = Price::from_f64(p.value + offset * p.sigma * multiplier);
                         let point = Point::new((ctx.x)(p.time), (ctx.y)(price));
                         if j == 0 {
@@ -202,8 +183,9 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
                     stroke_line(frame, -1.0, band);
                 }
                 if cfg.show_labels
-                    && i == last_run
-                    && let Some(p) = run.last()
+                    && run.start == anchor.start(self.model.current().hour)
+                    && run.coverage.is_complete()
+                    && let Some(p) = run.points.last()
                 {
                     frame.fill_text(canvas::Text {
                         content: format!("{name} {:.0}", p.value),
@@ -227,22 +209,57 @@ impl KlineIndicatorImpl for HtfVwapIndicator {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const HOUR: u64 = 3_600_000;
+    use chrono::{TimeZone, Utc};
+    use data::analysis::htf_vwap::{HOUR_MS, retained_since};
 
     #[test]
-    fn vwap_resets_at_anchor_and_weights_by_volume() {
-        let mut hourly = BTreeMap::new();
-        hourly.insert(0, (100.0, 1.0));
-        hourly.insert(HOUR, (110.0, 3.0));
-        hourly.insert(10 * HOUR, (200.0, 2.0));
-        let runs = sessions(&hourly, |t| t / (10 * HOUR) * (10 * HOUR));
-        assert_eq!(runs.len(), 2);
-        let values: Vec<_> = runs[0].iter().map(|p| (p.time, p.value)).collect();
-        assert_eq!(values, vec![(0, 100.0), (HOUR, 107.5)]);
-        // sqrt((1·100² + 3·110²)/4 − 107.5²) = sqrt(18.75)
-        assert!((runs[0][1].sigma - 18.75_f64.sqrt()).abs() < 1e-9);
-        assert_eq!(runs[1][0].value, 200.0);
-        assert_eq!(runs[1][0].sigma, 0.0);
+    fn incomplete_vwap_warns_stops_at_gap_and_recovers_references() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 2, 4, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let gap = now - 2 * HOUR_MS;
+        let mut indicator = HtfVwapIndicator {
+            model: HtfVwap::new(now),
+            config: VwapConfig::default(),
+        };
+        indicator.config.weekly = true;
+        indicator.config.monthly = true;
+        indicator.model.insert(
+            (retained_since(now)..=now)
+                .step_by(HOUR_MS as usize)
+                .filter(|&t| t != gap)
+                .map(|time| HourlyBar {
+                    time,
+                    price: 100.0,
+                    volume: 1.0,
+                }),
+            now,
+        );
+        assert!(indicator.reference_prices().is_empty());
+        assert!(
+            indicator
+                .data_warning()
+                .unwrap()
+                .contains("2026-11-02 02:00 UTC")
+        );
+        assert_eq!(indicator.model.current().fetch_from(true, true), gap);
+        indicator.model.insert(
+            [HourlyBar {
+                time: gap,
+                price: 100.0,
+                volume: 1.0,
+            }],
+            now,
+        );
+        assert_eq!(indicator.reference_prices(), vec![100.0, 100.0]);
+        assert!(indicator.data_warning().is_none());
+        let before = indicator.model.current().clone();
+        let _ = indicator.reference_prices();
+        assert_eq!(indicator.model.current(), &before);
+        indicator.config.weekly = false;
+        indicator.config.monthly = false;
+        assert!(indicator.reference_prices().is_empty());
+        assert!(indicator.data_warning().is_none());
     }
 }
