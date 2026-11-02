@@ -1,4 +1,5 @@
 pub mod aggr;
+pub mod analysis;
 pub mod audio;
 pub mod chart;
 pub mod config;

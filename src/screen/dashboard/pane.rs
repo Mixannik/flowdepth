@@ -1625,13 +1625,15 @@ impl State {
             }
         };
 
-        if !self.history_warnings.is_empty() {
-            let details = self
-                .history_warnings
-                .iter()
-                .map(|(_, text)| text.as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
+        let mut data_warnings = match &self.content {
+            Content::Kline {
+                chart: Some(chart), ..
+            } => chart.indicator_data_warnings(),
+            _ => Vec::new(),
+        };
+        data_warnings.extend(self.history_warnings.iter().map(|(_, text)| text.clone()));
+        if !data_warnings.is_empty() {
+            let details = data_warnings.join("\n");
             top_left_buttons = top_left_buttons.push(iced::widget::tooltip(
                 text("History incomplete").size(12).style(|theme: &Theme| {
                     iced::widget::text::Style {

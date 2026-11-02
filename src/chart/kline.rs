@@ -2317,6 +2317,26 @@ impl KlineChart {
         self.indicator_enabled(KlineIndicator::Vwap) && self.visual_config.vwap.session
     }
 
+    /// Coverage warnings from enabled calculations, without recomputing them.
+    pub fn indicator_data_warnings(&self) -> Vec<String> {
+        self.indicators
+            .iter()
+            .filter(|(kind, _)| self.indicator_enabled(*kind))
+            .filter_map(|(_, indicator)| {
+                indicator.as_ref().and_then(|i| {
+                    if matches!(
+                        i.availability(&self.chart),
+                        indicator::kline::IndicatorAvailability::Unavailable(_)
+                    ) {
+                        None
+                    } else {
+                        i.data_warning()
+                    }
+                })
+            })
+            .collect()
+    }
+
     /// Overlays that own fetched data (period levels, week/month VWAP).
     fn draw_data_overlays(
         &self,

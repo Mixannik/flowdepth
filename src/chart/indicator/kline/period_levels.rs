@@ -10,125 +10,29 @@ use crate::chart::{
 };
 use crate::connector::fetcher::FetchRange;
 
-use chrono::{Datelike, TimeZone, Utc};
+use data::analysis::period_levels::{
+    DAY_MS, DailyBar, Level, Period, PeriodLevels, Snapshot, day_start,
+};
 use data::chart::kline::PeriodLevelsConfig;
 use exchange::unit::Price;
 use exchange::{Kline, Timeframe, UnixMs};
 use iced::widget::canvas::{self, Frame, LineDash, Path, Stroke};
 use iced::{Alignment, Point};
-use std::collections::BTreeMap;
 
-const DAY_MS: u64 = 24 * 60 * 60_000;
 /// Daily candles requested: enough for the previous calendar month.
 const HISTORY_DAYS: u64 = 66;
-/// Retry period while yesterday's candle is missing.
+/// Retry period while any enabled source period is incomplete.
 const POLL_MS: u64 = 60_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Period {
-    Day,
-    Week,
-    Month,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Level {
-    pub period: Period,
-    pub is_high: bool,
-    pub price: f64,
-    /// Start of the current period: the line starts here.
-    pub from: u64,
-}
-
-impl Level {
-    fn name(&self) -> &'static str {
-        match (self.period, self.is_high) {
-            (Period::Day, true) => "PDH",
-            (Period::Day, false) => "PDL",
-            (Period::Week, true) => "PWH",
-            (Period::Week, false) => "PWL",
-            (Period::Month, true) => "PMH",
-            (Period::Month, false) => "PML",
-        }
-    }
-}
-
-fn day_start(ms: u64) -> u64 {
-    ms - ms % DAY_MS
-}
-
-/// Monday 00:00 UTC of the week containing `ms` (the epoch was a Thursday).
-pub(super) fn week_start(ms: u64) -> u64 {
-    const MONDAY_SHIFT: u64 = 3 * DAY_MS;
-    let week = 7 * DAY_MS;
-    ((ms + MONDAY_SHIFT) / week * week).saturating_sub(MONDAY_SHIFT)
-}
-
-/// First day 00:00 UTC of the month containing `ms`, and of the month before it.
-pub(super) fn month_starts(ms: u64) -> (u64, u64) {
-    let date = Utc
-        .timestamp_millis_opt(ms as i64)
-        .single()
-        .unwrap_or_default()
-        .date_naive();
-    let first = date.with_day(1).unwrap_or(date);
-    let prev = if first.month() == 1 {
-        first
-            .with_year(first.year() - 1)
-            .and_then(|d| d.with_month(12))
-    } else {
-        first.with_month(first.month() - 1)
-    }
-    .unwrap_or(first);
-    let to_ms = |d: chrono::NaiveDate| {
-        d.and_hms_opt(0, 0, 0)
-            .map_or(0, |t| t.and_utc().timestamp_millis() as u64)
-    };
-    (to_ms(first), to_ms(prev))
-}
-
-/// Levels of the periods before the one containing `now`; `daily` maps candle open time to
-/// (high, low).
-pub fn compute(daily: &BTreeMap<u64, (f64, f64)>, now: u64) -> Vec<Level> {
-    let today = day_start(now);
-    let this_week = week_start(now);
-    let (this_month, prev_month) = month_starts(now);
-    let periods = [
-        (Period::Day, today - DAY_MS, today),
-        (Period::Week, this_week - 7 * DAY_MS, this_week),
-        (Period::Month, prev_month, this_month),
-    ];
-    let mut levels = Vec::new();
-    for (period, from, to) in periods {
-        let mut bars = daily.range(from..to).map(|(_, hl)| *hl).peekable();
-        if bars.peek().is_none() {
-            continue;
-        }
-        let (high, low) = bars.fold((f64::MIN, f64::MAX), |(h, l), (bh, bl)| {
-            (h.max(bh), l.min(bl))
-        });
-        for (is_high, price) in [(true, high), (false, low)] {
-            levels.push(Level {
-                period,
-                is_high,
-                price,
-                from: to,
-            });
-        }
-    }
-    levels
-}
-
 pub struct PeriodLevelsIndicator {
-    /// Daily candle open time → (high, low).
-    daily: BTreeMap<u64, (f64, f64)>,
+    model: PeriodLevels,
     config: PeriodLevelsConfig,
 }
 
 impl PeriodLevelsIndicator {
     pub fn new() -> Self {
         Self {
-            daily: BTreeMap::new(),
+            model: PeriodLevels::new(chrono::Utc::now().timestamp_millis() as u64),
             config: PeriodLevelsConfig::default(),
         }
     }
@@ -159,17 +63,13 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
 
     fn fetch_range(&mut self, _ctx: &FetchCtx) -> Option<FetchRange> {
         let now = chrono::Utc::now().timestamp_millis() as u64;
-        let yesterday = day_start(now) - DAY_MS;
-        if self
-            .daily
-            .last_key_value()
-            .is_some_and(|(&last, _)| last >= yesterday)
-        {
+        self.model.advance_to(now);
+        if !self.needs_history() {
             return None;
         }
         // `to` moves in POLL_MS steps; identical requests are throttled by the handler.
         Some(FetchRange::RefKlines {
-            from: UnixMs::new(day_start(now) - HISTORY_DAYS * DAY_MS),
+            from: UnixMs::new(day_start(now).saturating_sub(HISTORY_DAYS * DAY_MS)),
             to: UnixMs::new(now - now % POLL_MS),
             timeframe: Timeframe::D1,
             spot: false,
@@ -180,10 +80,13 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
         if spot || timeframe != Timeframe::D1 {
             return;
         }
-        self.daily.extend(
-            klines
-                .iter()
-                .map(|k| (k.time.as_u64(), (k.high.to_f64(), k.low.to_f64()))),
+        self.model.insert(
+            klines.iter().map(|k| DailyBar {
+                time: k.time.as_u64(),
+                high: k.high.to_f64(),
+                low: k.low.to_f64(),
+            }),
+            chrono::Utc::now().timestamp_millis() as u64,
         );
     }
 
@@ -192,14 +95,42 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
     }
 
     fn draw_overlay(&self, frame: &mut Frame, ctx: &OverlayCtx) {
-        draw(&self.shown_levels(), frame, ctx, &self.config);
+        draw(&self.current_levels(), frame, ctx, &self.config);
     }
 
     fn reference_prices(&self) -> Vec<f64> {
-        self.shown_levels()
+        self.current_levels()
             .iter()
             .map(|level| level.price)
             .collect()
+    }
+
+    fn data_warning(&self) -> Option<String> {
+        let missing = self
+            .enabled_periods()
+            .filter(|p| !p.coverage.is_complete())
+            .map(|p| {
+                let name = match p.period {
+                    Period::Day => "day",
+                    Period::Week => "week",
+                    Period::Month => "month",
+                };
+                let date = |ms| {
+                    chrono::DateTime::from_timestamp_millis(ms as i64)
+                        .map(|t| t.format("%Y-%m-%d").to_string())
+                        .unwrap_or_default()
+                };
+                format!(
+                    "Previous {name} ({} to {} UTC): {}/{} valid daily candles; {} invalid.",
+                    date(p.source_from),
+                    date(p.source_to.saturating_sub(DAY_MS)),
+                    p.coverage.valid_days,
+                    p.coverage.expected_days,
+                    p.coverage.invalid_days.len()
+                )
+            })
+            .collect::<Vec<_>>();
+        (!missing.is_empty()).then(|| format!("Period levels incomplete\n{}\nIncomplete levels are hidden and excluded from signals. Daily history is checked every minute.", missing.join("\n")))
     }
 
     /// Each day's own levels (yesterday's high on that day, and so on), so history shows
@@ -226,19 +157,40 @@ impl KlineIndicatorImpl for PeriodLevelsIndicator {
 }
 
 impl PeriodLevelsIndicator {
-    fn shown_levels(&self) -> Vec<Level> {
-        self.levels_at(chrono::Utc::now().timestamp_millis() as u64)
+    fn needs_history(&self) -> bool {
+        self.enabled_periods().any(|p| !p.coverage.is_complete())
+    }
+
+    fn enabled(&self, period: Period) -> bool {
+        match period {
+            Period::Day => self.config.day,
+            Period::Week => self.config.week,
+            Period::Month => self.config.month,
+        }
+    }
+
+    fn enabled_periods(
+        &self,
+    ) -> impl Iterator<Item = &data::analysis::period_levels::PeriodResult> {
+        self.model
+            .current()
+            .periods
+            .iter()
+            .filter(|p| self.enabled(p.period))
+    }
+
+    fn current_levels(&self) -> Vec<Level> {
+        self.enabled_periods()
+            .flat_map(|p| p.levels.iter().copied())
+            .collect()
     }
 
     fn levels_at(&self, now: u64) -> Vec<Level> {
-        let cfg = self.config;
-        compute(&self.daily, now)
+        let Snapshot { periods, .. } = self.model.at(now);
+        periods
             .into_iter()
-            .filter(|level| match level.period {
-                Period::Day => cfg.day,
-                Period::Week => cfg.week,
-                Period::Month => cfg.month,
-            })
+            .filter(|p| self.enabled(p.period))
+            .flat_map(|p| p.levels)
             .collect()
     }
 }
@@ -303,46 +255,66 @@ fn draw(levels: &[Level], frame: &mut Frame, ctx: &OverlayCtx, cfg: &PeriodLevel
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{TimeZone, Utc};
 
-    fn ms(y: i32, m: u32, d: u32) -> u64 {
-        Utc.with_ymd_and_hms(y, m, d, 0, 0, 0)
+    #[test]
+    fn partial_month_keeps_loading_and_never_enters_reference_or_auction_levels() {
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 2, 0, 0, 0)
             .unwrap()
-            .timestamp_millis() as u64
-    }
-
-    #[test]
-    fn previous_day_week_and_month() {
-        // Wednesday 2026-10-28; daily bars from 2026-09-01.
-        let mut daily = BTreeMap::new();
-        let mut t = ms(2026, 9, 1);
-        let mut i = 0.0;
-        while t <= ms(2026, 10, 28) {
-            daily.insert(t, (100.0 + i, 50.0 + i));
-            t += DAY_MS;
-            i += 1.0;
-        }
-        let levels = compute(&daily, ms(2026, 10, 28) + 5 * 3_600_000);
-        let get = |p: Period, h: bool| {
-            levels
-                .iter()
-                .find(|l| l.period == p && l.is_high == h)
-                .map(|l| (l.price, l.from))
+            .timestamp_millis() as u64;
+        let missing = Utc
+            .with_ymd_and_hms(2026, 10, 12, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let first = Utc
+            .with_ymd_and_hms(2026, 10, 1, 0, 0, 0)
+            .unwrap()
+            .timestamp_millis() as u64;
+        let mut indicator = PeriodLevelsIndicator {
+            model: PeriodLevels::new(now),
+            config: PeriodLevelsConfig::default(),
         };
-        // Day 2026-10-27 is index 56.
-        assert_eq!(get(Period::Day, true), Some((156.0, ms(2026, 10, 28))));
-        // Week 2026-10-19..25 (Mon..Sun): indices 48..54.
-        assert_eq!(get(Period::Week, true), Some((154.0, ms(2026, 10, 26))));
-        assert_eq!(get(Period::Week, false), Some((98.0, ms(2026, 10, 26))));
-        // September: indices 0..29.
-        assert_eq!(get(Period::Month, true), Some((129.0, ms(2026, 10, 1))));
-        assert_eq!(get(Period::Month, false), Some((50.0, ms(2026, 10, 1))));
-    }
-
-    #[test]
-    fn january_looks_back_to_december() {
-        assert_eq!(
-            month_starts(ms(2027, 1, 15)),
-            (ms(2027, 1, 1), ms(2026, 12, 1))
+        indicator.model.insert(
+            (first..now)
+                .step_by(DAY_MS as usize)
+                .filter(|&t| t != missing)
+                .map(|time| DailyBar {
+                    time,
+                    high: 100.0,
+                    low: 50.0,
+                }),
+            now,
         );
+        assert!(indicator.needs_history()); // Yesterday exists, the month is not complete.
+        assert_eq!(indicator.current_levels().len(), 4);
+        assert_eq!(indicator.reference_prices().len(), 4);
+        assert!(
+            indicator
+                .auction_levels(now, now)
+                .iter()
+                .all(|l| !["PMH", "PML"].contains(&l.name))
+        );
+        let warning = indicator.data_warning().unwrap();
+        assert!(warning.contains("30/31"));
+        indicator.config.month = false;
+        assert!(!indicator.needs_history());
+        assert!(indicator.data_warning().is_none());
+        indicator.config.month = true;
+        indicator.model.insert(
+            [DailyBar {
+                time: missing,
+                high: 120.0,
+                low: 40.0,
+            }],
+            now,
+        );
+        assert!(!indicator.needs_history());
+        assert!(indicator.data_warning().is_none());
+        assert_eq!(indicator.current_levels().len(), 6);
+        let snapshot = indicator.model.current().clone();
+        assert_eq!(indicator.current_levels(), indicator.levels_at(now));
+        let _ = indicator.reference_prices();
+        assert_eq!(indicator.model.current(), &snapshot);
     }
 }

@@ -100,6 +100,11 @@ pub trait KlineIndicatorImpl {
         self.availability(chart).unavailable_message(indicator)
     }
 
+    /// Non-blocking source coverage warning, independent of drawing/loading state.
+    fn data_warning(&self) -> Option<String> {
+        None
+    }
+
     /// If the indicator needs data fetching, return the required range
     fn fetch_range(&mut self, _ctx: &FetchCtx) -> Option<FetchRange> {
         None

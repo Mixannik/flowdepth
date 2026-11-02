@@ -3,7 +3,6 @@
 //! the chart market's hourly candles with the typical price (H+L+C)/3 and fetched separately,
 //! so both lines exist on any timeframe without a month of trades. Within a few dollars of
 //! the trade-based VWAP.
-use super::period_levels::{month_starts, week_start};
 use crate::chart::{
     Basis, Message, ViewState,
     indicator::kline::{
@@ -11,6 +10,7 @@ use crate::chart::{
     },
 };
 use crate::connector::fetcher::FetchRange;
+use data::analysis::period_levels::{month_starts, week_start};
 
 use data::chart::kline::VwapConfig;
 use exchange::unit::Price;
