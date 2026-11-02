@@ -18,7 +18,7 @@
 ### C3: большой пакет profiles, 02.11.2026
 
 По просьбе владельца связанные правки объединены в одну поставку. Общий `value_area` для SVP/FRVP/naked сохраняет прежние ties и dense/sparse adjacency; naked расчёт вынесен в data::analysis с проверкой исходной сессии и последующего price path. Partial FRVP не попадает в shared/reference/failed auctions; H1 полнота видит внутренние дыры, левый overlap, хвост и stale forming→closed receipt. Candle fallback/FRVP approximation отмечены `~`. Готовые результаты всех трёх профилей вынесены из draw в независимые calculation caches; навигация SVP не перестраивает FRVP/naked, H1 retention ограничен. Детали — `docs/profile-core-batch.md`.
-Финальный workspace: 548 passed, 15 ignored, 0 failed (`profiles-batch-final.log`). All-targets check, fmt/diff прошли; визуальная приёмка новой сборки впереди. Открыта тестовая 84f310a, PID 24304 при последнем запуске; обновление готовить одним ожидающим скриптом, рабочий app-dev не заменять.
+Финальный workspace: 548 passed, 15 ignored, 0 failed (`profiles-batch-final.log`). All-targets check, fmt/diff прошли. Тестовая 373bfed запущена 02.11 в 16:29:51 МСК, PID 1784; до 16:32:02 — 0 ERROR/panic/FATAL и 0 NoMatch, WS и загрузки работают, процесс отвечает (~713 МБ). Короткий smoke прошёл; визуальная приёмка FRVP/session/naked и tooltip впереди. Рабочий app-dev не менялся, ожидающих обновителей нет. Бэкап — `.local/snapshots/2026-11-02T13-28-50-075Z`.
 
 ### C2: ядро HTF VWAP, 02.11.2026
 

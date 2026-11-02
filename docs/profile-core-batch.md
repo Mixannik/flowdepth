@@ -36,6 +36,8 @@ H1 в графике сохраняются за недавнее окно и а
 
 Живая визуальная проверка — после единственного обновления test-profile. Рабочий app-dev не заменяется; экран пользователя автоматически не захватывается.
 
+Сборка 373bfed установлена и запущена в test-profile 02.11 в 16:29:51 МСК, PID 1784. Перед сборкой сохранены exe/state в `.local/snapshots/2026-11-02T13-28-50-075Z`. До 16:32:02 журнал содержит 0 ERROR/panic/FATAL и 0 NoMatch; WS подключены, данные поступают, процесс отвечает, working set около 713 МБ. Это короткий smoke, не контролируемый benchmark и не визуальная приёмка профилей. Ожидающих обновителей больше нет.
+
 ## Проверки
 
 Полный workspace: 548 passed, 15 ignored, 0 failed (`profiles-batch-final.log`). Проверены общие tie/VA/finite правила, dense vs sparse, полный/дырявый H1-grid и формирующийся хвост, naked source/path completeness и touch endpoints, candle fallback, gate raw range/buckets, withheld signals/shared при частичном рисунке, восстановление H1 и closed receipt, отсутствие пересчёта при чтении/навигации, удаление рисунка и очистка его runtime H1. `cargo check --workspace --all-targets --locked` прошёл (`profiles-batch-final-check.log`), fmt/diff проверены.
