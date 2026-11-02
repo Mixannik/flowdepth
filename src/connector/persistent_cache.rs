@@ -39,7 +39,9 @@ const MAX_RECORDS_PER_BUCKET: usize = 5_000_000;
 const SCHEMA_KEY: &str = "market-data-cache-schema";
 const RAW_TRADES_DROPPED_KEY: &str = "raw-trade-cache-dropped";
 /// Trade dataset holding per-minute aggregates for anything older than two days.
-const TRADE_DATASET: &str = "trade_aggregated_v1";
+// V1 compacted each incoming page independently, losing colliding partial-minute
+// aggregates. Keep those records on disk, but never reuse their coverage.
+const TRADE_DATASET: &str = "trade_aggregated_v2";
 
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_meta_v1");
 const COVERAGE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_coverage_v1");
@@ -247,6 +249,35 @@ struct StoredCoverage {
     dataset_key: String,
     /// Sorted, merged, half-open intervals `[from, to)`.
     intervals: Vec<(u64, u64)>,
+}
+
+/// Merge executions before lossy compaction. Existing aggregates in this dataset
+/// represent a fully covered minute; overlapping pages must not add volume.
+fn merge_trade_minute(
+    mut existing: Vec<Trade>,
+    incoming: Vec<Trade>,
+    minute: u64,
+    coverage: &[(u64, u64)],
+    cutoff: UnixMs,
+    unit: QuantityUnit,
+) -> Vec<Trade> {
+    if existing.iter().any(data::chart::kline::is_aggregate_trade) {
+        return existing;
+    }
+    existing.extend(incoming);
+    let merged = Trade::normalize(existing);
+    let end = minute.saturating_add(TRADE_BUCKET_MS);
+    // The fetcher can end a REST page in the last millisecond of this minute,
+    // with more executions at that same timestamp still on the next page.
+    // Require coverage beyond the minute; keep the boundary minute raw.
+    let complete = coverage
+        .iter()
+        .any(|&(from, to)| from <= minute && to > end);
+    if complete && end <= cutoff.as_u64() {
+        data::chart::kline::aggregate_trades_for_cache_with_unit(&merged, cutoff, unit)
+    } else {
+        merged
+    }
 }
 
 trait CacheRecord: Clone + Serialize + DeserializeOwned {
@@ -569,7 +600,8 @@ impl MarketDataCache {
     /// Trades older than two days are stored as per-minute price aggregates (see
     /// [`data::chart::kline::aggregate_trades_for_cache_with_unit`]): price detail and
     /// execution order are reduced. Side volumes and size bins are retained within
-    /// each supplied batch. Recent trades stay raw for REST continuation and bubbles.
+    /// each complete minute. Partial minutes stay raw until their coverage joins.
+    /// Recent trades stay raw for REST continuation and bubbles.
     pub fn store_trades(
         &self,
         ticker_info: TickerInfo,
@@ -581,9 +613,22 @@ impl MarketDataCache {
             QuantityUnit::for_market(ticker_info.exchange().market_type(), volume_size_unit());
         let key = quantity_dataset_key_in(ticker_info, TRADE_DATASET, unit);
         let cutoff = UnixMs::now().saturating_sub(data::chart::kline::CACHE_AGGREGATE_AFTER_MS);
-        let records =
-            data::chart::kline::aggregate_trades_for_cache_with_unit(records, cutoff, unit);
-        self.store_records(CacheKind::Trade, &key, from, to_exclusive, &records);
+        // Only raw source pages can establish new coverage. An aggregate cannot
+        // prove which executions of a partially requested minute it represents.
+        if records.iter().any(data::chart::kline::is_aggregate_trade) {
+            log::warn!("CACHE Write Rejected | dataset=trade reason=aggregate_source");
+            return;
+        }
+        self.store_records_with(
+            CacheKind::Trade,
+            &key,
+            from,
+            to_exclusive,
+            records,
+            |existing, incoming, minute, coverage| {
+                merge_trade_minute(existing, incoming, minute, coverage, cutoff, unit)
+            },
+        );
     }
 
     /// One-time cleanup of the raw trade cache written before aggregation (gigabytes for a
@@ -609,7 +654,7 @@ impl MarketDataCache {
                 .open_table(TRADE_TABLE)
                 .map_err(|error| error.to_string())?;
             trades
-                .retain(|key, _| key.contains(&format!("|{TRADE_DATASET}|")))
+                .retain(|key, _| key.contains("|trade_aggregated_"))
                 .map_err(|error| error.to_string())?;
             let mut coverage = write
                 .open_table(COVERAGE_TABLE)
@@ -1135,6 +1180,29 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[T],
     ) {
+        self.store_records_with(
+            kind,
+            dataset_key,
+            from,
+            to_exclusive,
+            records,
+            |mut existing, incoming, _, _| {
+                existing.extend(incoming);
+                T::normalize(existing)
+            },
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_records_with<T: CacheRecord>(
+        &self,
+        kind: CacheKind,
+        dataset_key: &str,
+        from: UnixMs,
+        to_exclusive: UnixMs,
+        records: &[T],
+        merge: impl Fn(Vec<T>, Vec<T>, u64, &[(u64, u64)]) -> Vec<T>,
+    ) {
         if from >= to_exclusive {
             return;
         }
@@ -1167,6 +1235,7 @@ impl MarketDataCache {
             from.as_u64(),
             to_exclusive.as_u64(),
             records,
+            merge,
         ) {
             log::error!(
                 "CACHE Write Error | dataset={} key={} records={} error={error}",
@@ -1177,6 +1246,7 @@ impl MarketDataCache {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn store_records_inner<T: CacheRecord>(
         &self,
         kind: CacheKind,
@@ -1184,6 +1254,7 @@ impl MarketDataCache {
         from: u64,
         to_exclusive: u64,
         records: &[T],
+        merge: impl Fn(Vec<T>, Vec<T>, u64, &[(u64, u64)]) -> Vec<T>,
     ) -> Result<(), String> {
         let mut records_by_bucket: BTreeMap<u64, Vec<T>> = BTreeMap::new();
         add_empty_buckets(kind, &mut records_by_bucket, from, to_exclusive);
@@ -1195,6 +1266,27 @@ impl MarketDataCache {
         }
 
         let write = self.db.begin_write().map_err(|error| error.to_string())?;
+        // Read and extend coverage under the same write transaction as the data.
+        // A minute is compactable only after all of its pages have been merged.
+        let intervals = {
+            let coverage_table = write
+                .open_table(COVERAGE_TABLE)
+                .map_err(|e| e.to_string())?;
+            let blob = coverage_table
+                .get(dataset_key)
+                .map_err(|e| e.to_string())?
+                .map(|v| v.value().to_vec());
+            let mut intervals = blob
+                .and_then(|blob| decode_checked::<StoredCoverage>(&blob).ok())
+                .filter(|c| {
+                    c.schema == CACHE_SCHEMA
+                        && c.dataset_key == dataset_key
+                        && valid_intervals(&c.intervals)
+                })
+                .map_or_else(Vec::new, |c| c.intervals);
+            intervals.push((from, to_exclusive));
+            merge_intervals(intervals)
+        };
         {
             let mut table = write
                 .open_table(kind.table())
@@ -1207,7 +1299,7 @@ impl MarketDataCache {
                         .map_err(|error| error.to_string())?
                         .map(|value| value.value().to_vec())
                 };
-                let mut merged = existing_blob
+                let existing = existing_blob
                     .and_then(|blob| decode_checked::<StoredBucket<T>>(&blob).ok())
                     .filter(|bucket| {
                         bucket.schema == CACHE_SCHEMA
@@ -1220,8 +1312,7 @@ impl MarketDataCache {
                             })
                     })
                     .map_or_else(Vec::new, |bucket| bucket.records);
-                merged.extend(new_records);
-                merged = T::normalize(merged);
+                let merged = merge(existing, new_records, bucket_start, &intervals);
                 if merged.len() > MAX_RECORDS_PER_BUCKET {
                     return Err(format!(
                         "bucket {bucket_start} exceeds {MAX_RECORDS_PER_BUCKET} records"
@@ -1243,22 +1334,6 @@ impl MarketDataCache {
             let mut coverage_table = write
                 .open_table(COVERAGE_TABLE)
                 .map_err(|error| error.to_string())?;
-            let existing_blob = {
-                coverage_table
-                    .get(dataset_key)
-                    .map_err(|error| error.to_string())?
-                    .map(|value| value.value().to_vec())
-            };
-            let mut intervals = existing_blob
-                .and_then(|blob| decode_checked::<StoredCoverage>(&blob).ok())
-                .filter(|coverage| {
-                    coverage.schema == CACHE_SCHEMA
-                        && coverage.dataset_key == dataset_key
-                        && valid_intervals(&coverage.intervals)
-                })
-                .map_or_else(Vec::new, |coverage| coverage.intervals);
-            intervals.push((from, to_exclusive));
-            intervals = merge_intervals(intervals);
             let encoded = encode_checked(&StoredCoverage {
                 schema: CACHE_SCHEMA,
                 dataset_key: dataset_key.to_string(),
@@ -1759,6 +1834,155 @@ pub fn merge_bubble_summaries(
 mod tests {
     use super::*;
     use exchange::SizeUnit;
+
+    fn minute_fixture() -> Vec<Trade> {
+        (0..80)
+            .map(|i| {
+                let mut trade = timed_trade(61_000 + i * 700);
+                trade.id = Some(i + 1);
+                // A single order split between pages at the same millisecond.
+                if (38..43).contains(&i) {
+                    trade.time = UnixMs::new(90_000);
+                }
+                trade.is_sell = i % 3 == 0;
+                trade.price = exchange::unit::Price::from_f64(100_000.0 + (i % 7) as f64 * 0.1);
+                trade.qty = exchange::unit::Qty::from_f64(if i % 4 == 0 { 0.3 } else { 0.01 });
+                trade
+            })
+            .collect()
+    }
+
+    fn trade_signature(trades: &[Trade]) -> Vec<(u64, u64, i64, i64, bool)> {
+        let mut result = trades
+            .iter()
+            .map(|t| {
+                (
+                    t.id.unwrap(),
+                    t.time.as_u64(),
+                    t.price.units,
+                    t.qty.units,
+                    t.is_sell,
+                )
+            })
+            .collect::<Vec<_>>();
+        result.sort();
+        result
+    }
+
+    #[test]
+    fn old_trade_pages_merge_before_compaction_and_overlap_is_idempotent() {
+        for unit in [QuantityUnit::Base, QuantityUnit::Quote] {
+            let trades = minute_fixture();
+            let cutoff = UnixMs::new(u64::MAX);
+            let whole = merge_trade_minute(
+                Vec::new(),
+                trades.clone(),
+                60_000,
+                &[(60_000, 120_001)],
+                cutoff,
+                unit,
+            );
+            assert!(whole.len() < trades.len());
+            for reverse in [false, true] {
+                let (first, second) = if reverse {
+                    (trades[40..].to_vec(), trades[..43].to_vec())
+                } else {
+                    (trades[..43].to_vec(), trades[40..].to_vec())
+                };
+                let first_coverage = if reverse {
+                    (90_000, 120_001)
+                } else {
+                    (60_000, 90_001)
+                };
+                let partial =
+                    merge_trade_minute(Vec::new(), first, 60_000, &[first_coverage], cutoff, unit);
+                assert!(
+                    partial
+                        .iter()
+                        .all(|t| !data::chart::kline::is_aggregate_trade(t))
+                );
+                let merged =
+                    merge_trade_minute(partial, second, 60_000, &[(60_000, 120_001)], cutoff, unit);
+                assert_eq!(trade_signature(&merged), trade_signature(&whole));
+                let repeated = merge_trade_minute(
+                    merged,
+                    trades.clone(),
+                    60_000,
+                    &[(60_000, 120_001)],
+                    cutoff,
+                    unit,
+                );
+                assert_eq!(trade_signature(&repeated), trade_signature(&whole));
+            }
+            let sum = |records: &[Trade], sell| {
+                records
+                    .iter()
+                    .filter(|t| t.is_sell == sell)
+                    .map(|t| t.qty.units)
+                    .sum::<i64>()
+            };
+            for side in [false, true] {
+                assert_eq!(sum(&whole, side), sum(&trades, side));
+            }
+            let boundary = merge_trade_minute(
+                Vec::new(),
+                trades.clone(),
+                60_000,
+                &[(60_000, 120_000)],
+                cutoff,
+                unit,
+            );
+            assert_eq!(trade_signature(&boundary), trade_signature(&trades));
+        }
+    }
+
+    #[test]
+    fn persisted_minute_matches_full_load_after_pages_restart_and_expansion() {
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        let ticker = ticker_info();
+        let trades = minute_fixture();
+        {
+            let cache = MarketDataCache::open_at(path.clone()).unwrap();
+            cache.store_trades(
+                ticker,
+                UnixMs::new(60_000),
+                UnixMs::new(90_001),
+                &trades[..43],
+            );
+            let partial = cache.read_trades(ticker, UnixMs::new(60_000), UnixMs::new(120_001));
+            assert!(!partial.is_complete());
+            assert_eq!(partial.records.len(), 43);
+        }
+        let cache = MarketDataCache::open_at(path).unwrap();
+        cache.store_trades(
+            ticker,
+            UnixMs::new(90_000),
+            UnixMs::new(120_001),
+            &trades[40..],
+        );
+        cache.store_trades(ticker, UnixMs::new(60_000), UnixMs::new(120_001), &trades);
+        let loaded = cache.read_trades(ticker, UnixMs::new(60_000), UnixMs::new(120_001));
+        assert!(loaded.is_complete());
+        let expected = data::chart::kline::aggregate_trades_for_cache_with_unit(
+            &trades,
+            UnixMs::new(u64::MAX),
+            QuantityUnit::for_market(ticker.market_type(), volume_size_unit()),
+        );
+        assert_eq!(trade_signature(&loaded.records), trade_signature(&expected));
+        // Previous lossy records remain on disk, but cannot satisfy new coverage.
+        let old_key = quantity_dataset_key(ticker, "trade_aggregated_v1");
+        cache.store_records(
+            CacheKind::Trade,
+            &old_key,
+            UnixMs::new(180_000),
+            UnixMs::new(240_000),
+            &[timed_trade(190_000)],
+        );
+        let missing = cache.read_trades(ticker, UnixMs::new(180_000), UnixMs::new(240_000));
+        assert!(missing.records.is_empty());
+        assert!(!missing.is_complete());
+    }
 
     #[test]
     fn binance_close_estimated_candles_do_not_cover_corrected_history() {
