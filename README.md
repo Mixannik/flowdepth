@@ -1,191 +1,53 @@
-# Flowdepth — crypto order flow, below the surface
+# Flowdepth — личный order-flow форк
 
-> Flowdepth is an independent open-source desktop terminal for crypto order flow and options analytics, built natively in Rust.
+Форк [Niketion/flowdepth](https://github.com/Niketion/flowdepth) под рабочие раскладки и анализ ордерфлоу. Приложение написано на Rust и iced; исполняемый файл пока называется `flowsurface`.
 
-[![Develop CI](https://github.com/Niketion/flowdepth/actions/workflows/develop-ci.yml/badge.svg?branch=develop)](https://github.com/Niketion/flowdepth/actions/workflows/develop-ci.yml)
-[![Latest GitHub release](https://img.shields.io/github/v/release/Niketion/flowdepth?include_prereleases&label=latest%20beta)](https://github.com/Niketion/flowdepth/releases)
-[![Repository](https://img.shields.io/badge/repository-standalone-2ea44f.svg)](#project-lineage)
-[![License: GPLv3](https://img.shields.io/badge/license-GPLv3-blue.svg)](./LICENSE)
-[![Rust 1.95](https://img.shields.io/badge/Rust-1.95-orange.svg?logo=rust)](./rust-toolchain.toml)
-[![Made with iced](https://iced.rs/badge.svg)](https://github.com/iced-rs/iced)
-[![Flowsurface Discord](https://img.shields.io/badge/Discord-Flowsurface%20community-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/RN2XAF7ZuR)
+Репозиторий опубликован для хранения истории и внешнего ревью. Основная рабочая ветка — **feat/delta-table**. Архитектура и функции продолжают дорабатываться.
 
-Flowdepth combines crypto order-flow charts with footprint and L2 heatmap views, adaptive volume bubbles, Binance iceberg/replenishment detection, Deribit GEX, and Derive observed maker flow. A persistent market-data cache, automatic reconnect, and historical gap recovery help charts remain useful through longer sessions and network interruptions.
+## Рабочее направление
 
-> [!IMPORTANT]
-> **Beta status:** Flowdepth is experimental but usable beta software and is evolving quickly. Back up important layouts before updating. Beta releases may contain regressions.
-> Flowdepth is developed and released independently. It originated from [Flowsurface](https://github.com/flowsurface-rs/flowsurface) and preserves its Git history, license, and contributor attribution.
+- Footprint: Table и Delta Table, статистика бара, автоматический шаг строк.
+- Сравнение Binance spot/perpetual, CVD Futures + Spot, CVD по размеру заявок и Open Interest.
+- Session/Weekly/Monthly VWAP, уровни прошлых периодов, Fixed Range Volume Profile и naked-уровни.
+- Исследование order-flow сигналов: absorption, trapped traders, exhaustion, imbalances и failed auctions. Эти правила требуют дальнейшей проверки на данных.
+- Рабочие раскладки с графиками, стаканом и heatmap.
 
-<div align="center">
-  <img
-    src="https://github.com/user-attachments/assets/8b15b4a7-e689-465f-86cc-a9b3dad50de0"
-    alt="Flowdepth desktop terminal showing crypto market charts"
-    style="max-width: 100%; height: auto;"
-  />
-</div>
+В текущей серии изменений укрепляется ядро: сохранность настроек и кэша, отдельный тестовый профиль, полнота истории, единицы количества, общие загрузки и расчёты вне отрисовки. Неполные уровни исключаются из соответствующих сигнальных фильтров, свечные приближения обозначаются отдельно.
 
-## Why Flowdepth?
+Наличие унаследованного модуля в исходниках не означает, что он проверен или используется в этом форке. Скриншот проверенной сборки пока не добавлен.
 
-Flowdepth is built for traders and market observers who want deeper crypto order-flow tooling in a native desktop application. Its independent roadmap focuses on richer execution and liquidity visualization, resilient market-data ingestion and recovery, and crypto-options analytics.
+## Для ревью
 
-Detection and analytics such as possible iceberg activity, GEX, and observed maker flow describe market data; they are not certain trading signals.
+Начните с [REVIEW.md](REVIEW.md). Там перечислены приоритеты проверки и основные документы.
 
-## Download
+- [Карта проекта](docs/project-guide.md)
+- [Архитектура](docs/core-architecture.md)
+- [Текущее состояние и ограничения](docs/state.md)
+- [План order-flow функций](docs/orderflow-roadmap.md)
 
-Automated beta builds are available from the [Flowdepth Releases page](https://github.com/Niketion/flowdepth/releases). They are generated from the `develop` branch after the full quality gate succeeds.
+## Сборка
 
-Beta builds published before Flowdepth became a standalone repository remain available in the read-only [legacy release archive](https://github.com/Niketion/flowdepth-fork-archive/releases).
+Нужны Git, Rust из [rust-toolchain.toml](rust-toolchain.toml) и платформенные зависимости iced. На Windows используется Rust MSVC toolchain.
 
-For a quick start:
-
-1. Open the [Releases page](https://github.com/Niketion/flowdepth/releases).
-2. Download the package for your platform: Windows x64, Linux x64, or universal macOS.
-3. Extract the archive.
-4. Run `flowsurface.exe` on Windows or the `flowsurface` binary on Linux/macOS.
-
-The application binary and Rust package are currently still named `flowsurface` for compatibility with the original codebase.
-
-Windows and macOS beta binaries are not currently signed. Windows SmartScreen may require **More info → Run anyway**. On macOS, control-click the binary and choose **Open**, or allow it under **System Settings → Privacy & Security**.
-
-### Release channels
-
-- **Beta builds:** automated builds from `develop`, published as GitHub prereleases after formatting, check, Clippy, tests, and all platform packages succeed. Tags use `develop-<commit>`, where `<commit>` is the seven-character Git commit identifier used for the build.
-- **Stable releases:** not currently available.
-
-## Key features
-
-- **Order-flow charts:** footprint views, historical L2 heatmaps, Time & Sales, DOM/ladder, candlesticks, comparisons, volume profiles, and cumulative volume delta.
-- **Adaptive volume bubbles:** configurable clustering of aggressive executions with adaptive thresholds, side/delta coloring, bounded labels, and stable live updates.
-- **Possible Binance iceberg/replenishment detection:** optional markers for evidence of passive absorption on Binance USDⓈ-M perpetuals. The detector is probabilistic, disabled by default, and does not prove that an exchange-native iceberg order exists.
-- **[News Tracker](docs/news-tracker.md):** multi-source crypto headlines, asset/topic filters, source links and explained impact relevance scores, with optional CryptoPanic integration.
-- **Crypto options analytics:** BTC, ETH, and SOL GEX profiles sourced from Deribit, plus independently displayed Derive observed maker flow matched to Deribit contracts. SOL uses the linear USDC option chain.
-- **Persistent market-data cache:** local storage for klines, open interest, trades, and derived bubble summaries with gap detection, deduplication, and invalidation.
-- **Connection recovery:** automatic reconnect, historical gap backfill, bounded retries, stale-request cancellation, and sequence-aware recovery.
-- **Technical studies:** RSI, ATR, MACD and ADX/DMI evaluated by the upstream indicator engine, plus a candle-based TPO overlay with session coverage labels.
-- **Workspace tools:** persistent layouts, saved-state recovery, customizable themes, pane linking, loading/coverage feedback, and an in-app debug terminal.
-- **Public market data:** market data is received directly from exchange REST APIs and WebSockets. Current features do not require exchange trading credentials.
-
-### Historical trades on footprint charts
-
-Live trades are captured over WebSocket. Binance charts can optionally backfill the visible range from [data.binance.vision](https://data.binance.vision/) daily files, the paginated REST API, or both. Historical trade fetching for Bybit and Hyperliquid is not available; OKX support remains work in progress.
-
-By default, Flowdepth captures and plots live trades in real time via WebSocket.
-
-To backfill the visible time range on footprint charts, enable **trade fetching**
-in Settings → Network. Three modes are available:
-
-- **Exchange**: Fetches directly from Binance's public REST API and bulk data
-  mirrors ([data.binance.vision](https://data.binance.vision/)). Fast for
-  daily archives; paginated and rate-limited for intraday ranges. **Binance
-  only for full history** (spot, linear, inverse). MEXC perpetuals can seed the
-  chart from the public recent-deals window (the latest 100 trades); use Server
-  mode for older MEXC history.
-
-- **[Server](https://github.com/flowsurface-rs/server)**: Fetches from any HTTP server that exposes a
-  `GET /trades.arrow` endpoint returning an
-  [Arrow IPC](https://arrow.apache.org/) stream with:
-    - Response: `Content-Type: application/vnd.apache.arrow.stream`
-    - Schema (columns matched by name, order not significant):
-
-        `ts (int64)`, `price (float64)`, `qty (float64)`, `is_sell (bool)`
-
-    - Query parameters:
-      `venue`, `market`, `symbol`, `from` (inclusive), `to` (inclusive), `limit`
-    - Optional bearer-token auth: (`Authorization: Bearer <token>`)
-
-    Self-signed TLS certificates are
-    accepted. Works with **all exchanges** and has no exchange rate limits.
-    Bring your own data source.
-
-    A reference implementation is available at
-    [flowsurface-server](https://github.com/flowsurface-rs/server), a
-    self-contained collector that writes trades to DuckDB and serves
-    them over this protocol.
-
-- **Off**: Live trades only; no historical backfill.
-
-##### Historical klines, open interest, and ticker metadata/stats are always fetched from exchange REST APIs.
-
-##### Live trades, orderbook and kline updates are streamed from exchange WebSocket feeds.
-
-## Installation
-
-### Prebuilt beta packages
-
-Follow the [quick-start download steps](#download). Packages contain the application binary and the assets needed by that platform.
-
-### Build from source
-
-Requirements:
-
-- [Rust](https://www.rust-lang.org/tools/install); the pinned version and components are defined in [`rust-toolchain.toml`](./rust-toolchain.toml).
-- [Git](https://git-scm.com/).
-- Platform dependencies:
-  - Debian/Ubuntu: `sudo apt install build-essential pkg-config libasound2-dev`
-  - Arch Linux: `sudo pacman -S base-devel alsa-lib`
-  - Fedora: `sudo dnf install gcc make alsa-lib-devel`
-  - macOS: install Xcode Command Line Tools with `xcode-select --install`.
-  - Windows: use a Rust MSVC toolchain; no additional project dependency is required.
-
-Install directly from the `develop` branch:
-
-```bash
-cargo install --git https://github.com/Niketion/flowdepth.git --branch develop flowsurface
-flowsurface
-```
-
-Or clone, build, and run the repository:
-
-```bash
-git clone --branch develop https://github.com/Niketion/flowdepth.git
+```sh
+git clone --branch feat/delta-table https://github.com/Mixannik/flowdepth.git
 cd flowdepth
 cargo build --release --locked
 cargo run --release --locked
 ```
 
-The application binary and Rust package are currently still named `flowsurface` for compatibility with the original codebase. The standalone project is named Flowdepth; internal crate and module names intentionally retain their historical names.
+Проверки:
 
-## Technical documentation
-
-- [Adaptive volume bubbles](./docs/adaptive-volume-bubbles.md)
-- [Binance iceberg/replenishment detector](./docs/binance-iceberg-detector.md)
-- [Derive maker flow and GEX architecture](./docs/derive-maker-flow.md)
-- [Contributing guide](./CONTRIBUTING.md)
-- [Security policy](./SECURITY.md)
-- [Code of Conduct](./CODE_OF_CONDUCT.md)
-
-## Development model
-
-`develop` is Flowdepth's default integration branch and the source of automated beta releases. Feature and fix branches are merged into `develop` after the formatting, build, Clippy, and test gates pass. Stable releases will use `main` when a stable channel is introduced.
-
-The repository retains Flowsurface as an optional `upstream` remote for attribution, review, and selective integration. Because Flowdepth is no longer part of GitHub's fork network, compare the codebases locally when needed:
-
-```bash
-git remote add upstream https://github.com/flowsurface-rs/flowsurface.git
-git fetch upstream
-git log --oneline upstream/main..develop
-git diff upstream/main...develop
+```sh
+cargo test --release --workspace --locked
+cargo check --workspace --all-targets --locked
+cargo fmt --all -- --check
 ```
 
-## Project lineage
+Готовые релизы именно этого личного форка пока не опубликованы. Релизы исходного проекта не содержат автоматически все изменения этой ветки.
 
-Flowdepth is an independent repository originally derived from [Flowsurface](https://github.com/flowsurface-rs/flowsurface). The full shared Git history is intentionally preserved, together with the GPL license and attribution of the original contributors. Flowdepth has its own roadmap, development branches, releases, and support lifecycle.
+Личные раскладки, рыночный кэш, логи, тестовые профили и собранные exe не загружены в репозиторий. [Изолированный тестовый профиль](docs/profiles.md) позволяет проверять сборку отдельно от рабочих настроек.
 
-Flowdepth is not part of the Flowsurface GitHub fork network and is not an official Flowsurface release. The Rust package and executable retain the `flowsurface` name for source and build compatibility while the migration to standalone project naming is evaluated separately.
+## Происхождение и лицензия
 
-## Credits
-
-- [Flowsurface](https://github.com/flowsurface-rs/flowsurface) and its contributors, whose work forms the historical foundation of Flowdepth.
-- [Kraken Desktop](https://www.kraken.com/desktop), formerly [Cryptowatch](https://blog.kraken.com/product/cryptowatch-to-sunset-kraken-pro-to-integrate-cryptowatch-features), which inspired the original project.
-- [Halloy](https://github.com/squidowl/halloy), an open-source reference for foundational design and architecture.
-- [iced](https://github.com/iced-rs/iced), the Rust GUI library used by the application.
-
-## Community
-
-Project updates, source code, and release information are published in this repository. The linked [Discord server](https://discord.gg/RN2XAF7ZuR) is operated by the Flowsurface community and is not an official Flowdepth support channel.
-
-Please read the [contribution guide](./CONTRIBUTING.md) and [Code of Conduct](./CODE_OF_CONDUCT.md) before contributing.
-
-## License
-
-Flowdepth is distributed under the [GNU General Public License v3.0 or later](./LICENSE), consistent with its Flowsurface foundation. Contributions are shared under the same license.
+Основа — [Niketion/flowdepth](https://github.com/Niketion/flowdepth), происходящий от [Flowsurface](https://github.com/flowsurface-rs/flowsurface). История и авторство исходных изменений сохранены. Лицензия — [GNU GPL v3 или более поздняя](LICENSE).
