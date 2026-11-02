@@ -16,198 +16,12 @@ use iced::{
     widget::canvas::{self, Frame, LineDash, Path, Stroke},
 };
 
-const DAY_MS: u64 = 24 * 60 * 60_000;
-const WEEK_MS: u64 = 7 * DAY_MS;
-/// Share of session volume inside the value area.
-const VALUE_AREA_SHARE: f64 = 0.70;
-/// Profile rows per session: fine enough for a POC, cheap enough to rebuild every frame.
-const ROWS_PER_SESSION: f64 = 200.0;
-/// Most recent completed sessions considered, per session length.
+pub(super) use data::analysis::naked_levels::{Bar, BarVolume, Level, LevelKind, SessionKind};
+use data::analysis::naked_levels::{Snapshot, calculate};
+use data::chart::kline::TradeCoverage;
+
 const MAX_DAILY_SESSIONS: usize = 3;
 const MAX_WEEKLY_SESSIONS: usize = 2;
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) enum BarVolume {
-    /// Footprint levels as (price, volume).
-    Levels(Vec<(f64, f64)>),
-    /// Only the candle's total volume is known.
-    Total(f64),
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub(super) struct Bar {
-    pub time: u64,
-    pub high: f64,
-    pub low: f64,
-    pub volume: BarVolume,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum SessionKind {
-    Daily,
-    Weekly,
-}
-
-impl SessionKind {
-    fn ms(self) -> u64 {
-        match self {
-            SessionKind::Daily => DAY_MS,
-            SessionKind::Weekly => WEEK_MS,
-        }
-    }
-
-    fn tag(self) -> &'static str {
-        match self {
-            SessionKind::Daily => "D",
-            SessionKind::Weekly => "W",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum LevelKind {
-    Poc,
-    Vah,
-    Val,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct Level {
-    pub kind: LevelKind,
-    pub session: SessionKind,
-    pub price: f64,
-    /// Session end: the line starts here.
-    pub from: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct SessionLevels {
-    end: u64,
-    poc: f64,
-    vah: f64,
-    val: f64,
-}
-
-/// Volume profile of one session's bars; `None` without volume or range.
-fn session_levels(bars: &[&Bar], end: u64) -> Option<SessionLevels> {
-    let high = bars.iter().map(|b| b.high).fold(f64::MIN, f64::max);
-    let low = bars.iter().map(|b| b.low).fold(f64::MAX, f64::min);
-    if !(high > low) {
-        return None;
-    }
-    let row = (high - low) / ROWS_PER_SESSION;
-    let rows = ROWS_PER_SESSION as usize + 1;
-    let index = |price: f64| (((price - low) / row).floor().max(0.0) as usize).min(rows - 1);
-    let mut volume = vec![0.0_f64; rows];
-
-    for bar in bars {
-        match &bar.volume {
-            BarVolume::Levels(levels) => {
-                for &(price, qty) in levels {
-                    volume[index(price)] += qty;
-                }
-            }
-            BarVolume::Total(qty) => {
-                // Half-open [low, high): a candle ending where the next one starts must not
-                // put both candles' volume into the shared boundary row.
-                let from = index(bar.low);
-                let to = index(bar.high - row * 1e-6).max(from);
-                let share = qty / (to - from + 1) as f64;
-                for slot in &mut volume[from..=to] {
-                    *slot += share;
-                }
-            }
-        }
-    }
-
-    let total: f64 = volume.iter().sum();
-    if total <= 0.0 {
-        return None;
-    }
-    let poc = volume
-        .iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map(|(i, _)| i)?;
-
-    // Expand from the POC toward the heavier neighbour until the value area is filled.
-    let (mut lo, mut hi, mut inside) = (poc, poc, volume[poc]);
-    while inside < total * VALUE_AREA_SHARE && (lo > 0 || hi + 1 < rows) {
-        let below = if lo > 0 { volume[lo - 1] } else { -1.0 };
-        let above = if hi + 1 < rows { volume[hi + 1] } else { -1.0 };
-        if above >= below {
-            hi += 1;
-            inside += volume[hi];
-        } else {
-            lo -= 1;
-            inside += volume[lo];
-        }
-    }
-
-    let center = |i: usize| low + (i as f64 + 0.5) * row;
-    Some(SessionLevels {
-        end,
-        poc: center(poc),
-        vah: center(hi),
-        val: center(lo),
-    })
-}
-
-/// Naked levels for one session length. `bars` are ordered oldest first; only sessions that
-/// have closed before the last bar count, and a level is dropped once any later bar's range
-/// contains it.
-pub(super) fn naked_levels(
-    bars: &[Bar],
-    kind: SessionKind,
-    max_sessions: usize,
-    align: impl Fn(u64, u64) -> u64,
-) -> Vec<Level> {
-    let Some(last) = bars.last() else {
-        return Vec::new();
-    };
-    let session_ms = kind.ms();
-    let current_session = align(last.time, session_ms);
-
-    let mut sessions: Vec<(u64, Vec<&Bar>)> = Vec::new();
-    for bar in bars {
-        let start = align(bar.time, session_ms);
-        if start >= current_session {
-            break;
-        }
-        match sessions.last_mut() {
-            Some((s, members)) if *s == start => members.push(bar),
-            _ => sessions.push((start, vec![bar])),
-        }
-    }
-
-    let first_kept = sessions.len().saturating_sub(max_sessions);
-    let mut levels = Vec::new();
-    for (start, members) in &sessions[first_kept..] {
-        let end = start + session_ms;
-        let Some(session) = session_levels(members, end) else {
-            continue;
-        };
-        for (level_kind, price) in [
-            (LevelKind::Poc, session.poc),
-            (LevelKind::Vah, session.vah),
-            (LevelKind::Val, session.val),
-        ] {
-            let touched = bars
-                .iter()
-                .filter(|b| b.time >= session.end)
-                .any(|b| b.low <= price && price <= b.high);
-            if !touched {
-                levels.push(Level {
-                    kind: level_kind,
-                    session: kind,
-                    price,
-                    from: session.end,
-                });
-            }
-        }
-    }
-    levels
-}
 
 fn collect_bars(source: &PlotData<KlineDataPoint>) -> Vec<Bar> {
     let PlotData::TimeBased(series) = source else {
@@ -220,7 +34,9 @@ fn collect_bars(source: &PlotData<KlineDataPoint>) -> Vec<Bar> {
             time: dp.kline.time.as_u64(),
             high: dp.kline.high.to_f64(),
             low: dp.kline.low.to_f64(),
-            volume: if dp.footprint.trades.is_empty() {
+            volume: if dp.trade_coverage != TradeCoverage::Complete
+                || dp.footprint.trades.is_empty()
+            {
                 BarVolume::Total(dp.kline.volume.total().to_f64())
             } else {
                 BarVolume::Levels(
@@ -273,40 +89,57 @@ fn format_price(price: f64) -> String {
     }
 }
 
-/// The levels the indicator shows: weekly POC/VAH/VAL and daily POCs, as configured.
-pub(super) fn shown_levels(
+pub(super) fn snapshot(
     source: &PlotData<KlineDataPoint>,
     align: impl Fn(u64, u64) -> u64 + Copy,
     config: &NakedLevelsConfig,
-) -> Vec<Level> {
-    let bars = collect_bars(source);
-    let mut levels = if config.weekly {
-        naked_levels(&bars, SessionKind::Weekly, MAX_WEEKLY_SESSIONS, align)
-    } else {
-        Vec::new()
+) -> Snapshot {
+    let PlotData::TimeBased(series) = source else {
+        return Snapshot::default();
     };
+    let bars = collect_bars(source);
+    let interval = series.interval.to_milliseconds();
+    let mut result = Snapshot::default();
+    if config.weekly {
+        let weekly = calculate(
+            &bars,
+            SessionKind::Weekly,
+            MAX_WEEKLY_SESSIONS,
+            interval,
+            align,
+        );
+        result.incomplete_sessions += weekly.incomplete_sessions;
+        result.levels.extend(weekly.levels);
+    }
     if config.daily_poc {
-        levels.extend(
-            naked_levels(&bars, SessionKind::Daily, MAX_DAILY_SESSIONS, align)
+        let daily = calculate(
+            &bars,
+            SessionKind::Daily,
+            MAX_DAILY_SESSIONS,
+            interval,
+            align,
+        );
+        result.incomplete_sessions += daily.incomplete_sessions;
+        result.levels.extend(
+            daily
+                .levels
                 .into_iter()
-                .filter(|level| level.kind == LevelKind::Poc),
+                .filter(|l| l.kind == LevelKind::Poc),
         );
     }
-    levels
+    result
 }
 
-/// Draws naked levels from their session end to `right_x`: weekly POC/VAH/VAL as solid lines,
-/// daily POCs dashed. Daily value-area edges are left out; on higher timeframes they mostly
-/// crowd the price with noise.
+/// Complete session profiles with a continuous post-session price path.
+/// Draw already prepared naked levels; no distribution work happens here.
 #[allow(clippy::too_many_arguments)]
-pub(super) fn draw(
-    source: &PlotData<KlineDataPoint>,
+pub(super) fn draw_levels(
+    levels: &[Level],
     frame: &mut Frame,
     x: impl Fn(u64) -> f32,
     y: impl Fn(Price) -> f32,
     right_x: f32,
     scaling: f32,
-    align: impl Fn(u64, u64) -> u64 + Copy,
     palette: &Palette,
     config: &NakedLevelsConfig,
 ) {
@@ -314,7 +147,7 @@ pub(super) fn draw(
     let label_size = px(10.0);
 
     let mut labels = Vec::new();
-    for level in shown_levels(source, align, config) {
+    for level in levels {
         let left = x(level.from);
         if left >= right_x {
             continue;
@@ -342,7 +175,11 @@ pub(super) fn draw(
         );
         labels.push(Label {
             y: line_y,
-            names: vec![format!("{name} {}", level.session.tag())],
+            names: vec![format!(
+                "{name}{} {}",
+                if level.approximate { "~" } else { "" },
+                level.session.tag()
+            )],
             price: level.price,
             is_poc: level.kind == LevelKind::Poc,
         });
@@ -381,87 +218,47 @@ pub(super) fn draw(
 mod tests {
     use super::*;
 
-    const HOUR: u64 = 60 * 60_000;
-
-    fn day_align(time: u64, ms: u64) -> u64 {
-        time / ms * ms
-    }
-
-    /// Bar at `hour` hours with all its volume at one price.
-    fn bar_at(hour: u64, low: f64, high: f64, volume_at: f64, qty: f64) -> Bar {
-        Bar {
-            time: hour * HOUR,
-            high,
-            low,
-            volume: BarVolume::Levels(vec![(volume_at, qty), (low, 0.1), (high, 0.1)]),
-        }
-    }
-
-    fn poc(levels: &[Level]) -> Option<f64> {
-        levels
-            .iter()
-            .find(|l| l.kind == LevelKind::Poc)
-            .map(|l| l.price)
-    }
-
     #[test]
-    fn untested_poc_of_previous_day_is_naked() {
-        // Day 0 trades 100..110 with heavy volume at 105; day 1 stays above 112.
-        let mut bars: Vec<Bar> = (0..24)
-            .map(|h| bar_at(h, 100.0, 110.0, 105.0, 50.0))
-            .collect();
-        bars.extend((24..30).map(|h| bar_at(h, 112.0, 118.0, 115.0, 10.0)));
-        let levels = naked_levels(&bars, SessionKind::Daily, 5, day_align);
-        let price = poc(&levels).expect("day 0 POC stays naked");
-        assert!((price - 105.0).abs() < 0.1, "POC at {price}");
-        assert!(levels.iter().all(|l| l.from == 24 * HOUR));
-    }
-
-    #[test]
-    fn traded_through_poc_is_dropped() {
-        let mut bars: Vec<Bar> = (0..24)
-            .map(|h| bar_at(h, 100.0, 110.0, 105.0, 50.0))
-            .collect();
-        // Day 1 dips back through 105.
-        bars.push(bar_at(24, 104.0, 108.0, 106.0, 10.0));
-        let levels = naked_levels(&bars, SessionKind::Daily, 5, day_align);
-        assert_eq!(poc(&levels), None);
-    }
-
-    #[test]
-    fn current_session_is_ignored() {
-        let bars: Vec<Bar> = (0..10)
-            .map(|h| bar_at(h, 100.0, 110.0, 105.0, 50.0))
-            .collect();
-        assert!(naked_levels(&bars, SessionKind::Daily, 5, day_align).is_empty());
-    }
-
-    #[test]
-    fn candle_only_volume_still_gives_levels() {
-        // No footprint: volume spread over each candle's range. Most candles sit 100..104.
-        let mut bars: Vec<Bar> = (0..20)
-            .map(|h| Bar {
-                time: h * HOUR,
-                high: 104.0,
-                low: 100.0,
-                volume: BarVolume::Total(100.0),
-            })
-            .collect();
-        bars.extend((20..24).map(|h| Bar {
-            time: h * HOUR,
-            high: 120.0,
-            low: 104.0,
-            volume: BarVolume::Total(10.0),
-        }));
-        bars.push(Bar {
-            time: 30 * HOUR,
-            high: 130.0,
-            low: 125.0,
-            volume: BarVolume::Total(5.0),
-        });
-        let levels = naked_levels(&bars, SessionKind::Daily, 5, day_align);
-        let price = poc(&levels).expect("candle-based POC");
-        assert!((100.0..=104.0).contains(&price), "POC at {price}");
+    fn partial_footprint_uses_full_candle_fallback_until_complete() {
+        use data::aggr::time::TimeSeries;
+        use exchange::unit::{PriceStep, Qty};
+        use exchange::{Kline, Timeframe, Trade, UnixMs, Volume};
+        let step = PriceStep {
+            units: Price::from_f64(0.1).units,
+        };
+        let bar = Kline {
+            time: UnixMs::ZERO,
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(110.0),
+            low: Price::from_f64(100.0),
+            close: Price::from_f64(105.0),
+            volume: Volume::TotalOnly(Qty::from_f64(100.0)),
+        };
+        let mut series = TimeSeries::<KlineDataPoint>::new(Timeframe::H1, step, &[bar]);
+        series.datapoints.get_mut(&UnixMs::ZERO).unwrap().add_trade(
+            &Trade {
+                id: Some(1),
+                time: UnixMs::ZERO,
+                is_sell: false,
+                price: Price::from_f64(105.0),
+                qty: Qty::from_f64(1.0),
+            },
+            step,
+        );
+        let mut source = PlotData::TimeBased(series);
+        assert_eq!(collect_bars(&source)[0].volume, BarVolume::Total(100.0));
+        let PlotData::TimeBased(series) = &mut source else {
+            unreachable!()
+        };
+        series
+            .datapoints
+            .get_mut(&UnixMs::ZERO)
+            .unwrap()
+            .trade_coverage = TradeCoverage::Complete;
+        assert!(matches!(
+            collect_bars(&source)[0].volume,
+            BarVolume::Levels(_)
+        ));
     }
 
     fn label(y: f32, name: &str, is_poc: bool) -> Label {
@@ -500,20 +297,5 @@ mod tests {
         assert_eq!(format_price(81650.36), "81650");
         assert_eq!(format_price(2.5), "2.50");
         assert_eq!(format_price(0.000123), "0.00012");
-    }
-
-    #[test]
-    fn only_recent_sessions_are_kept() {
-        // Five days, each trading its own band and never revisited.
-        let mut bars = Vec::new();
-        for day in 0..5u64 {
-            let base = 100.0 + day as f64 * 20.0;
-            bars.extend((0..24).map(|h| bar_at(day * 24 + h, base, base + 10.0, base + 5.0, 50.0)));
-        }
-        bars.push(bar_at(5 * 24, 300.0, 310.0, 305.0, 1.0));
-        let levels = naked_levels(&bars, SessionKind::Daily, 2, day_align);
-        let sessions: std::collections::BTreeSet<u64> = levels.iter().map(|l| l.from).collect();
-        assert_eq!(sessions.len(), 2);
-        assert_eq!(sessions.into_iter().next(), Some(4 * 24 * HOUR));
     }
 }

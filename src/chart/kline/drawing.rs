@@ -249,19 +249,18 @@ impl KlineChart {
     }
 
     pub(super) fn fixed_volume_profile_ready(&self, from: UnixMs, to: UnixMs) -> bool {
+        if from >= to || from >= UnixMs::now() {
+            return false;
+        }
         let (Basis::Time(timeframe), data::chart::PlotData::TimeBased(timeseries)) =
             (self.chart.basis, &self.data_source)
         else {
             return false;
         };
         if super::range_levels::uses_candles(from.as_u64(), to.as_u64()) {
-            return super::range_levels::missing_hourly(
-                &self.range_hourly,
-                from.as_u64(),
-                to.as_u64(),
-                UnixMs::now().as_u64(),
-            )
-            .is_none_or(|(missing_from, _)| missing_from > from.as_u64());
+            return self
+                .missing_profile_hourly(from.as_u64(), to.as_u64(), UnixMs::now().as_u64())
+                .is_none();
         }
         let (_, latest) = timeseries.timerange();
         let historical_to =
@@ -319,6 +318,7 @@ impl KlineChart {
         });
         self.drawings.selected = Some(id);
         self.drawings.active_tool = DrawingTool::Select;
+        self.prepare_profile_calculations();
         self.chart.cache.clear_all();
     }
 
@@ -686,6 +686,7 @@ impl KlineChart {
             }
             DrawingMessage::FloatingPanelDragEnded => self.stop_dragging_floating_panel(),
         }
+        self.prepare_profile_calculations();
         self.chart.cache.clear_all();
         if self.has_fixed_volume_profiles() {
             self.last_tick = std::time::Instant::now() - std::time::Duration::from_secs(1);
@@ -1179,6 +1180,7 @@ impl KlineChart {
         self.drawings.drawings = drawings;
         self.drawings.selected = None;
         self.drawings.draft = None;
+        self.prepare_profile_calculations();
     }
     pub fn drawing_text_input_id(&self) -> Option<iced::widget::Id> {
         matches!(self.drawings.draft, Some(Draft::Text { .. }))

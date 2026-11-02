@@ -40,6 +40,7 @@ mod drawing;
 mod failed_auction;
 mod naked_levels;
 mod oi_bars;
+mod profile_state;
 pub mod range_levels;
 mod signals;
 mod tpo;
@@ -338,6 +339,8 @@ pub struct KlineChart {
     pending_tick_multiplier: Option<TickMultiplier>,
     /// Hourly candles (open time → candle) for long fixed-range profiles.
     range_hourly: std::collections::BTreeMap<u64, Kline>,
+    range_hourly_confirmed: std::collections::BTreeSet<u64>,
+    profile_calculations: profile_state::ProfileCalculations,
     /// Fixed-range profile levels drawn on other charts of this ticker.
     shared_range_levels: Vec<range_levels::RangeLevels>,
 }
@@ -491,6 +494,8 @@ impl KlineChart {
                     drawings: drawing::DrawingState::default(),
                     pending_tick_multiplier: None,
                     range_hourly: std::collections::BTreeMap::new(),
+                    range_hourly_confirmed: std::collections::BTreeSet::new(),
+                    profile_calculations: profile_state::ProfileCalculations::default(),
                     shared_range_levels: Vec::new(),
                 }
             }
@@ -574,6 +579,8 @@ impl KlineChart {
                     drawings: drawing::DrawingState::default(),
                     pending_tick_multiplier: None,
                     range_hourly: std::collections::BTreeMap::new(),
+                    range_hourly_confirmed: std::collections::BTreeSet::new(),
+                    profile_calculations: profile_state::ProfileCalculations::default(),
                     shared_range_levels: Vec::new(),
                 }
             }
@@ -581,6 +588,7 @@ impl KlineChart {
     }
 
     pub fn update_latest_kline(&mut self, kline: &Kline, received_at: UnixMs) {
+        self.profile_calculations.dirty = true;
         match self.data_source {
             PlotData::TimeBased(ref mut timeseries) => {
                 let previous_latest_x = self.chart.latest_x;
@@ -994,12 +1002,9 @@ impl KlineChart {
                         if !range_levels::uses_candles(from.as_u64(), to.as_u64()) {
                             continue;
                         }
-                        let Some((fetch_from, fetch_to)) = range_levels::missing_hourly(
-                            &self.range_hourly,
-                            from.as_u64(),
-                            to.as_u64(),
-                            now.as_u64(),
-                        ) else {
+                        let Some((fetch_from, fetch_to)) =
+                            self.missing_profile_hourly(from.as_u64(), to.as_u64(), now.as_u64())
+                        else {
                             continue;
                         };
                         let range = FetchRange::RefKlines {
@@ -1189,6 +1194,7 @@ impl KlineChart {
     }
 
     pub fn reset_request_handler(&mut self) {
+        self.profile_calculations.dirty = true;
         let old_generation = self.request_handler.generation_id();
         let superseded_ids = self
             .request_handler
@@ -1213,9 +1219,12 @@ impl KlineChart {
     /// Drops all derived historical market data so it is rebuilt from a fresh
     /// persistent-cache/network pass on the next chart tick.
     pub fn invalidate_market_data_cache(&mut self) {
+        self.profile_calculations.dirty = true;
         self.request_handler = RequestHandler::default();
         log::warn!("CHART Reset | reason=cache_invalidated request_history=discarded");
         self.raw_trades.clear();
+        self.range_hourly.clear();
+        self.range_hourly_confirmed.clear();
         self.raw_trades_pruned = false;
 
         match &mut self.data_source {
@@ -1290,6 +1299,7 @@ impl KlineChart {
     }
 
     pub fn mark_trade_range_covered(&mut self, from: UnixMs, to: UnixMs) {
+        self.profile_calculations.dirty = true;
         if to <= from {
             log::warn!(
                 "DATA Trades CoveredSkip | incoming_range={} reason=invalid_range",
@@ -1602,6 +1612,7 @@ impl KlineChart {
     /// Called when a trade fetch completes with empty results to prevent
     /// re-requesting the same range.
     pub fn mark_visible_range_trades_complete(&mut self) {
+        self.profile_calculations.dirty = true;
         let (visible_earliest, visible_latest) = match self.visible_timerange() {
             Some(range) => range,
             None => return,
@@ -1789,6 +1800,7 @@ impl KlineChart {
     }
 
     pub fn set_visual_config(&mut self, mut visual_config: Config) {
+        self.profile_calculations.dirty = true;
         visual_config.migrate_legacy_indicator_configs();
         let old_bubbles = self.visual_config.volume_bubbles;
         let new_bubbles = visual_config.volume_bubbles;
@@ -1889,6 +1901,7 @@ impl KlineChart {
     }
 
     pub fn change_tick_size(&mut self, new_step: PriceStep) {
+        self.profile_calculations.dirty = true;
         let chart = self.mut_state();
 
         chart.cell_height *= (new_step.units as f32) / (chart.tick_size.units as f32);
@@ -1912,6 +1925,7 @@ impl KlineChart {
     }
 
     pub fn set_basis(&mut self, new_basis: Basis) -> Option<Action> {
+        self.profile_calculations.dirty = true;
         let previous_basis = self.chart.basis;
 
         self.chart.last_price = None;
@@ -1974,6 +1988,7 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
+        self.profile_calculations.dirty = true;
         let buffer = deduplicate_incoming_trades(
             &self.raw_trades,
             buffer,
@@ -2070,6 +2085,7 @@ impl KlineChart {
     }
 
     pub fn insert_raw_trades(&mut self, raw_trades: Vec<Trade>, is_batches_done: bool) {
+        self.profile_calculations.dirty = true;
         let received_size = raw_trades.len();
         let raw_trades = deduplicate_incoming_trades(
             &self.raw_trades,
@@ -2232,6 +2248,7 @@ impl KlineChart {
     }
 
     pub fn insert_hist_klines(&mut self, req_id: uuid::Uuid, klines_raw: &[Kline]) {
+        self.profile_calculations.dirty = true;
         let count = klines_raw.len();
         let earliest = klines_raw.first().map(|k| k.time);
         let latest = klines_raw.last().map(|k| k.time);
@@ -2334,6 +2351,7 @@ impl KlineChart {
                     }
                 })
             })
+            .chain(self.profile_warnings())
             .collect()
     }
 
@@ -2390,6 +2408,7 @@ impl KlineChart {
         timeframe: exchange::Timeframe,
         klines: &[Kline],
     ) {
+        self.profile_calculations.dirty = true;
         if let Some(req_id) = req_id {
             if klines.is_empty() {
                 self.request_handler.mark_no_data(req_id);
@@ -2402,8 +2421,24 @@ impl KlineChart {
             indi.on_ref_klines(spot, timeframe, klines);
         }
         if !spot && timeframe == exchange::Timeframe::H1 {
-            self.range_hourly
-                .extend(klines.iter().map(|k| (k.time.as_u64(), *k)));
+            self.range_hourly.extend(
+                klines
+                    .iter()
+                    .filter(|k| k.time.as_u64() % range_levels::HOUR_MS == 0)
+                    .map(|k| (k.time.as_u64(), *k)),
+            );
+            let now = UnixMs::now().as_u64();
+            for bar in klines {
+                let time = bar.time.as_u64();
+                if time % range_levels::HOUR_MS != 0 {
+                    continue;
+                }
+                if time.saturating_add(range_levels::HOUR_MS) <= now {
+                    self.range_hourly_confirmed.insert(time);
+                } else {
+                    self.range_hourly_confirmed.remove(&time);
+                }
+            }
             if self.has_fixed_volume_profiles() {
                 self.invalidate(None);
             }
@@ -2413,19 +2448,7 @@ impl KlineChart {
     /// Levels of this chart's fixed-range profiles that continue to the right edge, for
     /// this chart and for the other charts of its ticker.
     pub fn range_levels(&self) -> Vec<range_levels::RangeLevels> {
-        self.fixed_volume_profiles()
-            .into_iter()
-            .filter(|(_, _, config)| config.extend_levels)
-            .filter_map(|(from, to, config)| {
-                let profile = self.fixed_volume_profile(from, to, &config)?;
-                Some(range_levels::RangeLevels {
-                    to: to.as_u64(),
-                    poc: profile.poc.to_f64(),
-                    vah: profile.vah.to_f64(),
-                    val: profile.val.to_f64(),
-                })
-            })
-            .collect()
+        self.prepared_range_levels()
     }
 
     /// Prices of every reference level this chart shows (fixed-range profiles, period
@@ -2460,13 +2483,10 @@ impl KlineChart {
         }
         if self.indicator_enabled(KlineIndicator::NakedLevels) {
             prices.extend(
-                naked_levels::shown_levels(
-                    &self.data_source,
-                    align_session_start,
-                    &self.visual_config.indicator_configs.naked_levels,
-                )
-                .iter()
-                .map(|level| level.price),
+                self.profile_calculations
+                    .naked
+                    .iter()
+                    .map(|level| level.price),
             );
         }
         prices
@@ -2537,7 +2557,7 @@ impl KlineChart {
 
     /// The fixed-range profile as far as its data is loaded: hourly candles for long
     /// ranges, trades otherwise.
-    fn fixed_volume_profile(
+    fn compute_fixed_volume_profile(
         &self,
         from: UnixMs,
         to: UnixMs,
@@ -2735,8 +2755,10 @@ impl KlineChart {
                 self.change_tick_size(step);
                 self.pending_tick_multiplier = Some(multiplier);
             }
+            self.prepare_profile_calculations();
             self.fetch_missing_data()
         } else {
+            self.prepare_profile_calculations();
             None
         }
     }
@@ -2767,6 +2789,7 @@ impl KlineChart {
     }
 
     pub fn toggle_indicator(&mut self, indicator: KlineIndicator) {
+        self.profile_calculations.dirty = true;
         if !self.kind.allows_indicator(indicator) {
             return;
         }
@@ -3067,14 +3090,13 @@ impl canvas::Program<Message> for KlineChart {
                     );
 
                     if self.indicator_enabled(KlineIndicator::NakedLevels) {
-                        naked_levels::draw(
-                            &self.data_source,
+                        naked_levels::draw_levels(
+                            &self.profile_calculations.naked,
                             frame,
                             interval_to_x,
                             price_to_y,
                             region.x + region.width,
                             chart.scaling,
-                            align_session_start,
                             palette,
                             &self.visual_config.indicator_configs.naked_levels,
                         );
@@ -3282,14 +3304,13 @@ impl canvas::Program<Message> for KlineChart {
                         );
                     }
                     if self.indicator_enabled(KlineIndicator::NakedLevels) {
-                        naked_levels::draw(
-                            &self.data_source,
+                        naked_levels::draw_levels(
+                            &self.profile_calculations.naked,
                             frame,
                             interval_to_x,
                             price_to_y,
                             region.x + region.width,
                             chart.scaling,
-                            align_session_start,
                             palette,
                             &self.visual_config.indicator_configs.naked_levels,
                         );
@@ -3318,14 +3339,11 @@ impl canvas::Program<Message> for KlineChart {
                     }
                     if self.indicator_enabled(KlineIndicator::SessionVolumeProfile) {
                         draw_session_volume_profiles(
-                            &self.data_source,
+                            &self.profile_calculations.session,
                             frame,
-                            earliest,
-                            latest,
                             interval_to_x,
                             price_to_y,
                             chart.cell_height,
-                            chart.tick_size,
                             &svp,
                             palette,
                         );
@@ -3334,7 +3352,7 @@ impl canvas::Program<Message> for KlineChart {
                         if let Some(profile) = self.fixed_volume_profile(from, to, &config) {
                             draw_volume_profile(
                                 frame,
-                                profile,
+                                profile.as_ref(),
                                 &interval_to_x,
                                 &price_to_y,
                                 chart.cell_height,
@@ -5022,7 +5040,7 @@ impl ProfileBin {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct SessionProfile {
     start: u64,
     end: u64,
@@ -5109,60 +5127,15 @@ fn build_session_profiles(
     let mut result = grouped
         .into_iter()
         .filter_map(|(start, (bins, high, low))| {
-            let mut rows: Vec<_> = bins
-                .into_iter()
-                .map(|(units, bin)| (Price::from_units(units.saturating_add(row_units / 2)), bin))
-                .filter(|(_, bin)| bin.volume() > 0.0)
-                .collect();
-            rows.sort_by_key(|(price, _)| *price);
-            if rows.is_empty() {
-                return None;
-            }
-
-            let poc_index = rows
-                .iter()
-                .enumerate()
-                .max_by(|(_, a), (_, b)| a.1.volume().total_cmp(&b.1.volume()))
-                .map(|(index, _)| index)?;
-            let total: f64 = rows.iter().map(|(_, bin)| bin.volume()).sum();
-            let target = total * (f64::from(config.value_area_percent.clamp(1.0, 100.0)) / 100.0);
-            let mut included = rows[poc_index].1.volume();
-            let mut low_index = poc_index;
-            let mut high_index = poc_index;
-            while included < target && (low_index > 0 || high_index + 1 < rows.len()) {
-                let below = if low_index > 0 {
-                    rows[low_index - 1].1.volume()
-                } else {
-                    -1.0
-                };
-                let above = if high_index + 1 < rows.len() {
-                    rows[high_index + 1].1.volume()
-                } else {
-                    -1.0
-                };
-                if above >= below {
-                    high_index += 1;
-                    included += rows[high_index].1.volume();
-                } else {
-                    low_index -= 1;
-                    included += rows[low_index].1.volume();
-                }
-            }
-            let weighted: f64 = rows
-                .iter()
-                .map(|(price, bin)| price.to_f64() * bin.volume())
-                .sum();
-            Some(SessionProfile {
-                start,
-                end: start.saturating_add(session_ms),
-                poc: rows[poc_index].0,
-                vah: rows[high_index].0,
-                val: rows[low_index].0,
-                vwap: Price::from_f64(weighted / total.max(f64::EPSILON)),
+            finish_volume_profile(
+                bins,
+                row_units,
+                UnixMs::new(start),
+                UnixMs::new(start.saturating_add(session_ms)),
                 high,
                 low,
-                rows,
-            })
+                config.into(),
+            )
         })
         .collect::<Vec<_>>();
     result.sort_by_key(|profile| profile.start);
@@ -5203,7 +5176,7 @@ impl From<&FixedRangeVolumeProfileConfig> for VolumeProfileVisualSettings {
         Self {
             placement: config.placement,
             mode: config.mode,
-            value_area_percent: config.value_area_percent,
+            value_area_percent: config.value_area_percent.clamp(50.0, 95.0),
             width_percent: config.width_percent,
             row_size_ticks: config.row_size_ticks,
             show_poc: config.show_poc,
@@ -5294,7 +5267,14 @@ fn build_candle_volume_profile(
     if to <= from {
         return None;
     }
-    let bars = || candles.range(from.as_u64()..to.as_u64()).map(|(_, k)| k);
+    let bars = || {
+        candles
+            .range(from.as_u64() / range_levels::HOUR_MS * range_levels::HOUR_MS..to.as_u64())
+            .map(|(_, k)| k)
+    };
+    if bars().any(|bar| !profile_state::valid_profile_candle(bar)) {
+        return None;
+    }
     let high = bars().map(|k| k.high).max()?;
     let low = bars().map(|k| k.low).min()?;
     let style = VolumeProfileVisualSettings::from(config);
@@ -5342,6 +5322,12 @@ fn finish_volume_profile(
     low: Price,
     style: VolumeProfileVisualSettings,
 ) -> Option<SessionProfile> {
+    if bins
+        .values()
+        .any(|bin| !bin.buy.is_finite() || !bin.sell.is_finite() || bin.buy < 0.0 || bin.sell < 0.0)
+    {
+        return None;
+    }
     let mut rows: Vec<_> = bins
         .into_iter()
         .map(|(units, bin)| (Price::from_units(units.saturating_add(row_units / 2)), bin))
@@ -5351,46 +5337,24 @@ fn finish_volume_profile(
     if rows.is_empty() {
         return None;
     }
-    let poc_index = rows
-        .iter()
-        .enumerate()
-        .max_by(|(_, a), (_, b)| a.1.volume().total_cmp(&b.1.volume()))
-        .map(|(index, _)| index)?;
-    let total: f64 = rows.iter().map(|(_, bin)| bin.volume()).sum();
-    let target = total * (f64::from(style.value_area_percent.clamp(50.0, 95.0)) / 100.0);
-    let mut included = rows[poc_index].1.volume();
-    let mut low_index = poc_index;
-    let mut high_index = poc_index;
-    while included < target && (low_index > 0 || high_index + 1 < rows.len()) {
-        let below = if low_index > 0 {
-            rows[low_index - 1].1.volume()
-        } else {
-            -1.0
-        };
-        let above = if high_index + 1 < rows.len() {
-            rows[high_index + 1].1.volume()
-        } else {
-            -1.0
-        };
-        if above >= below {
-            high_index += 1;
-            included += rows[high_index].1.volume();
-        } else {
-            low_index -= 1;
-            included += rows[low_index].1.volume();
-        }
-    }
+    let area = data::analysis::volume_profile::value_area(
+        &rows.iter().map(|(_, bin)| bin.volume()).collect::<Vec<_>>(),
+        f64::from(style.value_area_percent.clamp(1.0, 100.0)) / 100.0,
+    )?;
     let weighted: f64 = rows
         .iter()
         .map(|(price, bin)| price.to_f64() * bin.volume())
         .sum();
+    if !weighted.is_finite() {
+        return None;
+    }
     Some(SessionProfile {
         start: from.as_u64(),
         end: to.as_u64(),
-        poc: rows[poc_index].0,
-        vah: rows[high_index].0,
-        val: rows[low_index].0,
-        vwap: Price::from_f64(weighted / total.max(f64::EPSILON)),
+        poc: rows[area.poc].0,
+        vah: rows[area.high].0,
+        val: rows[area.low].0,
+        vwap: Price::from_f64(weighted / area.total),
         high,
         low,
         rows,
@@ -5399,18 +5363,14 @@ fn finish_volume_profile(
 
 #[allow(clippy::too_many_arguments)]
 fn draw_session_volume_profiles(
-    data_source: &PlotData<KlineDataPoint>,
+    profiles: &[SessionProfile],
     frame: &mut canvas::Frame,
-    earliest: u64,
-    latest: u64,
     interval_to_x: impl Fn(u64) -> f32,
     price_to_y: impl Fn(Price) -> f32,
     cell_height: f32,
-    tick_size: PriceStep,
     config: &SessionVolumeProfileConfig,
     palette: &Palette,
 ) {
-    let profiles = build_session_profiles(data_source, earliest, latest, tick_size, config);
     let style = VolumeProfileVisualSettings::from(config);
     for profile in profiles {
         draw_volume_profile(
@@ -5427,7 +5387,7 @@ fn draw_session_volume_profiles(
 
 fn draw_volume_profile(
     frame: &mut canvas::Frame,
-    profile: SessionProfile,
+    profile: &SessionProfile,
     interval_to_x: &impl Fn(u64) -> f32,
     price_to_y: &impl Fn(Price) -> f32,
     cell_height: f32,
@@ -8017,6 +7977,141 @@ mod tests {
             &KlineChartKind::Candles,
             visual_config,
         )
+    }
+
+    fn fixed_profile_drawing(from: u64, to: u64) -> data::chart::kline::drawing::Drawing {
+        use data::chart::kline::drawing::{Drawing, DrawingGeometry, DrawingStyle};
+        Drawing {
+            id: 1,
+            geometry: DrawingGeometry::FixedRangeVolumeProfile {
+                first: UnixMs::new(from),
+                second: UnixMs::new(to - 300_000),
+            },
+            style: DrawingStyle::default(),
+            visible: true,
+        }
+    }
+
+    #[test]
+    fn profile_snapshots_gate_partial_exports_repair_holes_and_do_not_rebuild_on_reads() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        let hour = range_levels::HOUR_MS;
+        let end = 96 * hour;
+        chart.set_drawings(vec![fixed_profile_drawing(0, end)]);
+        let bars = (0..96)
+            .map(|h| hourly_bar(h, 100.0, 104.0, 10.0).1)
+            .collect::<Vec<_>>();
+        chart.insert_ref_klines(None, false, exchange::Timeframe::H1, &bars);
+        let config = FixedRangeVolumeProfileConfig::default();
+        assert!(
+            chart
+                .fixed_volume_profile(UnixMs::ZERO, UnixMs::new(end), &config)
+                .is_some()
+        );
+        assert_eq!(chart.range_levels().len(), 1);
+        assert!(chart.range_levels()[0].approximate);
+        assert!(chart.profile_source_info().is_some());
+        let builds = chart.profile_calculations.builds;
+        let _ = chart.range_levels();
+        let _ = chart.reference_level_prices();
+        let _ = chart.auction_levels(0, end);
+        let _ = chart.indicator_data_warnings();
+        chart.invalidate(None);
+        assert_eq!(chart.profile_calculations.builds, builds);
+        // Internal H1 hole: keep the partial drawing, suppress all machine consumers.
+        chart.range_hourly.remove(&(24 * hour));
+        chart.profile_calculations.dirty = true;
+        chart.invalidate(None);
+        assert!(
+            chart
+                .fixed_volume_profile(UnixMs::ZERO, UnixMs::new(end), &config)
+                .is_some()
+        );
+        assert!(chart.range_levels().is_empty());
+        assert!(chart.reference_level_prices().is_empty());
+        assert!(chart.auction_levels(0, end).is_empty());
+        assert!(
+            chart
+                .indicator_data_warnings()
+                .iter()
+                .any(|w| w.contains("Fixed profile"))
+        );
+        chart.insert_ref_klines(None, false, exchange::Timeframe::H1, &[bars[24]]);
+        assert_eq!(chart.range_levels().len(), 1);
+        // An old forming snapshot needs a fresh closed receipt, even with a full grid.
+        chart.range_hourly_confirmed.remove(&(48 * hour));
+        chart.profile_calculations.dirty = true;
+        chart.invalidate(None);
+        assert_eq!(
+            chart.missing_profile_hourly(0, end, UnixMs::now().as_u64()),
+            Some((48 * hour, end))
+        );
+        assert!(chart.range_levels().is_empty());
+        chart.insert_ref_klines(None, false, exchange::Timeframe::H1, &[bars[48]]);
+        assert_eq!(chart.range_levels().len(), 1);
+        chart.set_drawings(Vec::new());
+        assert!(chart.range_levels().is_empty());
+        assert!(chart.range_hourly.is_empty());
+    }
+
+    #[test]
+    fn raw_profile_publication_requires_both_range_and_bucket_coverage() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        let end = 300_000;
+        if let PlotData::TimeBased(series) = &mut chart.data_source {
+            series.insert_klines(&[hourly_bar(0, 99.0, 101.0, 2.0).1]);
+            series.insert_trades_existing_buckets(&[
+                test_trade(1, 1_000, 1.0),
+                test_trade(2, 2_000, 1.0),
+            ]);
+            series.mark_range_trades_complete(UnixMs::ZERO, UnixMs::new(end));
+        }
+        chart.set_drawings(vec![fixed_profile_drawing(0, end)]);
+        assert!(
+            chart
+                .fixed_volume_profile(
+                    UnixMs::ZERO,
+                    UnixMs::new(end),
+                    &FixedRangeVolumeProfileConfig::default()
+                )
+                .is_some()
+        );
+        assert!(chart.range_levels().is_empty());
+        chart.mark_trade_range_covered(UnixMs::ZERO, UnixMs::new(end));
+        chart.invalidate(None);
+        assert_eq!(chart.range_levels().len(), 1);
+        assert!(!chart.range_levels()[0].approximate);
+        chart.reset_request_handler();
+        chart.invalidate(None);
+        assert!(chart.range_levels().is_empty());
+    }
+
+    #[test]
+    fn session_view_changes_do_not_rebuild_fixed_or_naked_calculations() {
+        let mut chart = empty_candlestick_chart(
+            &[
+                KlineIndicator::SessionVolumeProfile,
+                KlineIndicator::NakedLevels,
+            ],
+            None,
+        );
+        chart.chart.layout.autoscale = None;
+        chart.chart.bounds = Rectangle {
+            x: 0.0,
+            y: 0.0,
+            width: 600.0,
+            height: 400.0,
+        };
+        chart.chart.latest_x = 1_000_000_000;
+        chart.invalidate(None);
+        let fixed = chart.profile_calculations.fixed_builds;
+        let naked = chart.profile_calculations.naked_builds;
+        let session = chart.profile_calculations.session_builds;
+        chart.chart.translation.x += 10.0 * chart.chart.cell_width;
+        chart.invalidate(None);
+        assert_eq!(chart.profile_calculations.fixed_builds, fixed);
+        assert_eq!(chart.profile_calculations.naked_builds, naked);
+        assert!(chart.profile_calculations.session_builds > session);
     }
 
     #[test]

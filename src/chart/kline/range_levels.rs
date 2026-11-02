@@ -33,6 +33,8 @@ pub struct RangeLevels {
     pub poc: f64,
     pub vah: f64,
     pub val: f64,
+    /// Complete source coverage, but candle volume is distributed over price rows.
+    pub approximate: bool,
 }
 
 impl RangeLevels {
@@ -45,8 +47,8 @@ pub fn uses_candles(from: u64, to: u64) -> bool {
     to.saturating_sub(from) > CANDLE_PROFILE_AFTER_MS
 }
 
-/// Hourly candles of `[from, to)` still to fetch, as a request range. A range that reaches
-/// the present keeps polling its forming candle.
+/// Hourly candles overlapping `[from, to)` still to fetch, as a request range.
+/// A present/future range, or a range ending inside the current H1, keeps polling.
 pub fn missing_hourly(
     hourly: &BTreeMap<u64, Kline>,
     from: u64,
@@ -57,19 +59,26 @@ pub fn missing_hourly(
     if end <= from {
         return None;
     }
-    let mut bars = hourly.range(from..end).map(|(&time, _)| time);
-    let (Some(first), last) = (bars.next(), bars.next_back()) else {
-        return Some((from, end));
-    };
-    let last = last.unwrap_or(first);
-    if first >= from + HOUR_MS {
-        return Some((from, end));
+    let first = from - from % HOUR_MS;
+    let mut expected = first;
+    for (&time, _) in hourly.range(first..end) {
+        if time != expected {
+            return Some((expected, end));
+        }
+        expected = expected.saturating_add(HOUR_MS);
     }
-    if to > now {
-        let polled = (now - now % POLL_MS).max(last + 1);
-        return Some((last, polled));
+    if expected < end {
+        return Some((expected, end));
     }
-    (last + HOUR_MS < end).then_some((last, end))
+
+    // `end` is exclusive: an exact hour boundary only needs the preceding bar.
+    let last = (end - 1) / HOUR_MS * HOUR_MS;
+    if to > now || last.saturating_add(HOUR_MS) > now {
+        let forming = if to > now { now - now % HOUR_MS } else { last };
+        let polled = (now - now % POLL_MS).max(forming.saturating_add(1));
+        return Some((forming, polled));
+    }
+    None
 }
 
 /// Thin dashed lines from each range's end to `right_x`, labelled at their left end.
@@ -108,7 +117,10 @@ pub fn draw(levels: &[RangeLevels], frame: &mut Frame, ctx: &OverlayCtx) {
                 stroke,
             );
             frame.fill_text(canvas::Text {
-                content: format!("{name} {price:.0}"),
+                content: format!(
+                    "{name}{} {price:.0}",
+                    if level.approximate { "~" } else { "" }
+                ),
                 position: Point::new(start + label_size * 0.4, line_y - label_size * 0.15),
                 size: iced::Pixels(label_size),
                 color: color.scale_alpha(1.5),
@@ -157,7 +169,7 @@ mod tests {
         assert_eq!(missing_hourly(&hourly(10..20), from, to, now), None);
         assert_eq!(
             missing_hourly(&hourly(10..15), from, to, now),
-            Some((14 * HOUR_MS, to))
+            Some((15 * HOUR_MS, to))
         );
     }
 
@@ -166,5 +178,66 @@ mod tests {
         let now = 20 * HOUR_MS + 30 * 60_000 + 5_000;
         let got = missing_hourly(&hourly(10..21), 10 * HOUR_MS, 24 * HOUR_MS, now);
         assert_eq!(got, Some((20 * HOUR_MS, now - 5_000)));
+    }
+
+    #[test]
+    fn missing_hourly_repairs_internal_hole_even_with_both_edges_present() {
+        let mut bars = hourly(10..20);
+        bars.remove(&(14 * HOUR_MS));
+        assert_eq!(
+            missing_hourly(&bars, 10 * HOUR_MS, 20 * HOUR_MS, 100 * HOUR_MS),
+            Some((14 * HOUR_MS, 20 * HOUR_MS))
+        );
+    }
+
+    #[test]
+    fn missing_hourly_includes_overlapping_left_bar_and_excludes_exact_right_edge() {
+        let (from, to, now) = (10 * HOUR_MS + 123, 20 * HOUR_MS, 100 * HOUR_MS);
+        assert_eq!(missing_hourly(&hourly(10..20), from, to, now), None);
+        assert_eq!(
+            missing_hourly(&hourly(11..20), from, to, now),
+            Some((10 * HOUR_MS, to))
+        );
+        // A fraction of the next hour makes its candle necessary.
+        assert_eq!(
+            missing_hourly(&hourly(10..20), from, to + 1, now),
+            Some((to, to + 1))
+        );
+    }
+
+    #[test]
+    fn missing_hourly_handles_empty_and_single_candle_ranges() {
+        let from = 10 * HOUR_MS + 1;
+        let to = 11 * HOUR_MS;
+        let now = 100 * HOUR_MS;
+        assert_eq!(
+            missing_hourly(&BTreeMap::new(), from, to, now),
+            Some((10 * HOUR_MS, to))
+        );
+        assert_eq!(missing_hourly(&hourly(10..11), from, to, now), None);
+        assert_eq!(missing_hourly(&BTreeMap::new(), from, from, now), None);
+    }
+
+    #[test]
+    fn missing_hourly_keeps_polling_fixed_end_inside_forming_hour() {
+        let now = 20 * HOUR_MS + 30 * 60_000 + 5_000;
+        let to = 20 * HOUR_MS + 10 * 60_000;
+        assert_eq!(
+            missing_hourly(&hourly(10..21), 10 * HOUR_MS, to, now),
+            Some((20 * HOUR_MS, now - 5_000))
+        );
+        assert_eq!(
+            missing_hourly(&hourly(10..21), 10 * HOUR_MS, to, 21 * HOUR_MS),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_hourly_future_range_polls_new_hour_at_exact_boundary() {
+        let now = 20 * HOUR_MS;
+        assert_eq!(
+            missing_hourly(&hourly(10..20), 10 * HOUR_MS, 24 * HOUR_MS, now),
+            Some((now, now + 1))
+        );
     }
 }

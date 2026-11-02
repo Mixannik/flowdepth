@@ -1625,6 +1625,17 @@ impl State {
             }
         };
 
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &self.content
+            && let Some(info) = chart.profile_source_info()
+        {
+            top_left_buttons = top_left_buttons.push(iced::widget::tooltip(
+                text("Profiles ~").size(12),
+                container(text(info)).padding(8).style(style::tooltip),
+                tooltip::Position::Bottom,
+            ));
+        }
         let mut data_warnings = match &self.content {
             Content::Kline {
                 chart: Some(chart), ..
