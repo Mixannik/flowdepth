@@ -1,4 +1,4 @@
-use super::persistent_cache::{MarketDataCache, market_cache, merge_bubble_summaries};
+use super::persistent_cache::{CacheSlice, MarketDataCache, market_cache, merge_bubble_summaries};
 use data::chart::kline::{BubbleVolumeSummary, VolumeBubbleConfig, cluster_volume_bubble_trades};
 use exchange::adapter::{AdapterError, AdapterHandles, Exchange, StreamKind};
 use exchange::unit::PriceStep;
@@ -234,6 +234,36 @@ const TRADE_NO_PROGRESS_MAX_CONSECUTIVE: usize = 3;
 /// retrying the same tiny tail indefinitely.
 const NO_PROGRESS_REMAINING_EPSILON_MS: u64 = 1000;
 const TRADE_GAP_COALESCE_BRIDGE_MS: u64 = 60_000;
+// Bound repeated decoding while another worker is filling the same recent gap.
+const TRADE_CACHE_RECHECK_MS: u64 = 60_000;
+
+/// Reuse only a continuously covered raw prefix. Reserve its last millisecond:
+/// another REST page can still contain more executions at that timestamp.
+fn reusable_trade_prefix(
+    mut cached: CacheSlice<Trade>,
+    from: UnixMs,
+    to_exclusive: UnixMs,
+) -> Option<(Vec<Trade>, UnixMs)> {
+    let covered_to = cached
+        .gaps
+        .iter()
+        .map(|&(start, _)| start)
+        .min()
+        .unwrap_or(to_exclusive)
+        .min(to_exclusive);
+    let resume = covered_to.saturating_sub(1);
+    if resume <= from
+        || cached.records.is_empty()
+        || cached
+            .records
+            .iter()
+            .any(|t| t.id.is_none() || data::chart::kline::is_aggregate_trade(t))
+    {
+        return None;
+    }
+    cached.records.retain(|t| t.time >= from && t.time < resume);
+    Some((cached.records, resume))
+}
 
 /// Merge nearby uncovered cache slices before REST pagination. The original
 /// gaps are still used to decide which records are new to the caller.
@@ -2803,6 +2833,55 @@ pub fn fetch_trades_batched(
                 if latest_trade_t > target_to {
                     break;
                 }
+                // The initial cache snapshot can be stale by the time this
+                // worker reaches the network: other panels load overlapping
+                // ranges. Reuse their progress instead of downloading it again.
+                // Old aggregates have minute precision and are not safe here.
+                let raw_cutoff =
+                    UnixMs::now().saturating_sub(data::chart::kline::CACHE_AGGREGATE_AFTER_MS);
+                if server.is_none()
+                    && ticker_info.exchange().venue() == exchange::adapter::Venue::Binance
+                    && latest_trade_t >= raw_cutoff
+                {
+                    let probe_end = latest_trade_t
+                        .saturating_add(TRADE_CACHE_RECHECK_MS)
+                        .min(gap_to_exclusive);
+                    let reused = in_quantity_context(context, || {
+                        market_cache().and_then(|cache| {
+                            reusable_trade_prefix(
+                                cache.read_trades(ticker_info, latest_trade_t, probe_end),
+                                latest_trade_t,
+                                probe_end,
+                            )
+                        })
+                    })?;
+                    if let Some((records, resume)) = reused {
+                        let (mut batch, _) = filter_new_fetched_trades(
+                            records,
+                            latest_trade_t,
+                            resume,
+                            &mut last_trade_id,
+                        );
+                        batch.retain(|trade| trade_time_is_in_gaps(trade.time, &gaps));
+                        total_trades = total_trades.saturating_add(batch.len());
+                        final_latest = final_latest.max(resume.min(to_time));
+                        log::info!(
+                            "TRADE CacheReuse | venue={venue} symbol={symbol} req={} from={} resume={} trades={}",
+                            short_id(req_id),
+                            format_time_short(latest_trade_t),
+                            format_time_short(resume),
+                            batch.len()
+                        );
+                        latest_trade_t = resume;
+                        consecutive_no_progress = 0;
+                        prev_request_from = None;
+                        prev_request_to = None;
+                        if !batch.is_empty() {
+                            let () = progress.send(batch).await;
+                        }
+                        continue;
+                    }
+                }
                 // Overall worker timeout covers all network gaps, but cached
                 // batches are emitted immediately and do not consume it.
                 if network_started.elapsed() >= TRADE_WORKER_TIMEOUT {
@@ -3462,6 +3541,124 @@ mod tests {
                 .filter_map(|trade| trade.id)
                 .collect::<Vec<_>>(),
             vec![12]
+        );
+    }
+
+    #[test]
+    fn reused_trade_prefix_preserves_unseen_executions_in_boundary_millisecond() {
+        let from = UnixMs::new(1_000);
+        let end = UnixMs::new(3_000);
+        let slice = CacheSlice {
+            records: vec![trade(Some(1), 1_000), trade(Some(2), 1_999)],
+            gaps: vec![(UnixMs::new(2_000), end)],
+        };
+        let (cached, resume) = reusable_trade_prefix(slice, from, end).unwrap();
+        assert_eq!(resume, UnixMs::new(1_999));
+        let mut last_id = None;
+        let (mut result, _) = filter_new_fetched_trades(cached, from, resume, &mut last_id);
+        // ID 3 was not in the cache yet: reserving timestamp 1999 is essential.
+        let (network, _) = filter_new_fetched_trades(
+            vec![
+                trade(Some(2), 1_999),
+                trade(Some(3), 1_999),
+                trade(Some(4), 2_000),
+            ],
+            resume,
+            end,
+            &mut last_id,
+        );
+        result.extend(network);
+        assert_eq!(
+            result.iter().filter_map(|t| t.id).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(
+            result.iter().map(|t| t.qty.units).sum::<i64>(),
+            4 * result[0].qty.units
+        );
+    }
+
+    #[test]
+    fn cache_recheck_never_skips_own_frontier_a_hole_or_lossy_records() {
+        let from = UnixMs::new(1_000);
+        let end = UnixMs::new(3_000);
+        for gaps in [vec![(from, end)], vec![(UnixMs::new(1_001), end)]] {
+            assert!(
+                reusable_trade_prefix(
+                    CacheSlice {
+                        records: vec![trade(Some(1), 1_000)],
+                        gaps,
+                    },
+                    from,
+                    end
+                )
+                .is_none()
+            );
+        }
+        for id in [None, Some(data::chart::kline::AGGREGATE_ID_BIT | 1)] {
+            assert!(
+                reusable_trade_prefix(
+                    CacheSlice {
+                        records: vec![trade(id, 1_000)],
+                        gaps: Vec::new()
+                    },
+                    from,
+                    end
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            reusable_trade_prefix(
+                CacheSlice {
+                    records: Vec::new(),
+                    gaps: Vec::new()
+                },
+                from,
+                end
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn cache_recheck_advances_in_bounded_steps_and_keeps_final_frontier() {
+        let start = UnixMs::new(1_000);
+        let end = UnixMs::new(121_001);
+        let source = (1..=121)
+            .map(|i| trade(Some(i), i * 1_000))
+            .collect::<Vec<_>>();
+        let mut cursor = start;
+        let mut last_id = None;
+        let mut result = Vec::new();
+        let mut reuses = 0;
+        loop {
+            let probe_end = cursor.saturating_add(TRADE_CACHE_RECHECK_MS).min(end);
+            let slice = CacheSlice {
+                records: source
+                    .iter()
+                    .copied()
+                    .filter(|t| t.time >= cursor && t.time < probe_end)
+                    .collect(),
+                gaps: Vec::new(),
+            };
+            let Some((records, resume)) = reusable_trade_prefix(slice, cursor, probe_end) else {
+                break;
+            };
+            let (batch, _) = filter_new_fetched_trades(records, cursor, resume, &mut last_id);
+            result.extend(batch);
+            assert!(resume > cursor);
+            cursor = resume;
+            reuses += 1;
+            assert!(reuses <= 3);
+        }
+        assert_eq!(cursor, end.saturating_sub(1));
+        let (tail, _) = filter_new_fetched_trades(source.clone(), cursor, end, &mut last_id);
+        result.extend(tail);
+        assert_eq!(result.len(), source.len());
+        assert_eq!(
+            result.iter().filter_map(|t| t.id).collect::<Vec<_>>(),
+            source.iter().filter_map(|t| t.id).collect::<Vec<_>>()
         );
     }
 
