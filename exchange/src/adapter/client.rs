@@ -15,9 +15,13 @@ use std::{collections::HashMap, path::PathBuf, sync::Arc};
 pub const MAX_TRADE_TICKERS_PER_STREAM: usize = 100;
 pub const MAX_KLINE_STREAMS_PER_STREAM: usize = 100;
 
+type KlinePageKey = (TickerInfo, Timeframe, UnixMs, UnixMs);
+type KlineRequests = super::inflight::InFlight<KlinePageKey, Result<KlinePage, AdapterError>>;
+
 #[derive(Clone)]
 pub struct AdapterHandles {
     quantity_context: crate::unit::quantity_context::QuantityContext,
+    kline_requests: Arc<KlineRequests>,
     binance: Option<binance::BinanceHandle>,
     bybit: Option<bybit::BybitHandle>,
     hyperliquid: Option<hyperliquid::HyperliquidHandle>,
@@ -54,6 +58,8 @@ impl AdapterHandles {
             }
         }
 
+        // Replacing an adapter/proxy starts an independent request scope.
+        self.kline_requests = Arc::new(KlineRequests::default());
         Ok(())
     }
 
@@ -64,6 +70,7 @@ impl AdapterHandles {
     ) -> Self {
         let mut out = Self {
             quantity_context: crate::unit::quantity_context::QuantityContext::capture(),
+            kline_requests: Arc::new(KlineRequests::default()),
             binance: None,
             bybit: None,
             hyperliquid: None,
@@ -484,6 +491,28 @@ impl AdapterHandles {
     }
 
     pub async fn fetch_klines_page(
+        &self,
+        ticker_info: TickerInfo,
+        timeframe: Timeframe,
+        from: UnixMs,
+        to: UnixMs,
+    ) -> Result<KlinePage, AdapterError> {
+        let handles = self.clone();
+        self.quantity_context
+            .check_future(async {
+                self.kline_requests
+                    .get_or_insert((ticker_info, timeframe, from, to), || async move {
+                        handles
+                            .fetch_klines_page_unshared(ticker_info, timeframe, from, to)
+                            .await
+                    })
+                    .await
+            })
+            .await
+            .map_err(|error| AdapterError::InvalidRequest(error.to_string()))?
+    }
+
+    async fn fetch_klines_page_unshared(
         &self,
         ticker_info: TickerInfo,
         timeframe: Timeframe,

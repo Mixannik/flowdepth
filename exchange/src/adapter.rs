@@ -1,6 +1,7 @@
 mod client;
 mod http;
 mod hub;
+mod inflight;
 mod limiter;
 pub mod proxy;
 mod ws;

@@ -1,7 +1,7 @@
 use crate::adapter::Venue;
 use std::error::Error;
 
-#[derive(thiserror::Error, Debug)]
+#[derive(thiserror::Error, Debug, Clone)]
 pub enum AdapterError {
     #[error("{0}")]
     FetchError(FetchError),
@@ -31,7 +31,7 @@ pub enum AdapterErrorKind {
     HistoryUnavailable,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FetchError {
     detail: String,
     message: &'static str,
