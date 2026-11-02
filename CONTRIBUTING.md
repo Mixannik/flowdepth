@@ -1,62 +1,41 @@
 # Contributing to Flowdepth
 
-Thanks for helping improve Flowdepth. The public project is named Flowdepth; the Rust package and application binary remain named `flowsurface` for upstream compatibility.
+This repository is an independently maintained research fork. The active development and pull-request target branch is **`feat/delta-table`**. The binary remains named `flowsurface` for compatibility.
 
 ## Development setup
 
-1. Install [Rust with rustup](https://www.rust-lang.org/tools/install).
-2. Clone the repository and enter it:
+Follow the platform requirements in the [README](README.md#getting-started), then:
 
-   ```bash
-   git clone https://github.com/Niketion/flowdepth.git
-   cd flowdepth
-   ```
-
-3. Let rustup install the toolchain pinned in `rust-toolchain.toml`, then build the workspace:
-
-   ```bash
-   rustup show
-   cargo build --workspace --all-targets --all-features --locked
-   ```
-
-On Debian or Ubuntu, install the native build dependencies with:
-
-```bash
-sudo apt install build-essential pkg-config libasound2-dev
+```sh
+git clone --branch feat/delta-table https://github.com/Mixannik/flowdepth.git
+cd flowdepth
+cargo build --release --locked
 ```
 
-See the platform requirements in the [README](./README.md#build-from-source) for macOS, Windows, Arch Linux, and Fedora.
+Use the pinned Rust toolchain and an [isolated application profile](docs/profiles.md) when testing changes to state, cache or layout behavior.
 
-## Quality checks
+## Checks
 
-Run the same checks used by Develop CI before opening a pull request:
-
-```bash
+```sh
 cargo fmt --all -- --check
-cargo check --workspace --all-targets --all-features --locked
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-targets --all-features --locked
+cargo check --workspace --all-targets --locked
+cargo test --release --workspace --locked
 ```
 
-Use `cargo fmt --all` to apply formatting locally.
+Strict Clippy has known outstanding findings. Avoid introducing new warnings and document any check you could not complete. Existing hosted workflows do not constitute validation of every working-branch commit.
 
-## Indicator development
+## Changes and pull requests
 
-See [Indicator modules](docs/indicators.md) for catalog registration, runtime adapters, independent settings editors and the optional GPU interaction tests.
+- Describe the concrete problem and resulting behavior; include reproduction steps and validation.
+- Keep changes focused and explain compatibility effects on layouts, cache formats and units.
+- Add small regression fixtures for calculation and lifecycle bugs where useful.
+- Include real screenshots for UI changes, with private information removed.
+- Discuss major architectural changes in an issue before implementing them.
 
-## Changes, commits, and pull requests
+For market-data discrepancies, specify the exchange, market, symbol, timeframe, **UTC timestamp** and quantity unit. Distinguish source gaps from processing errors. Read the [review guide](REVIEW.md) for current priorities and [indicator documentation](docs/indicators.md) for module registration and settings.
 
-- Keep each commit focused and use a short, imperative subject such as `Fix reconnect status reporting`.
-- Explain the problem, motivation, and user-visible effect in the pull request.
-- Link relevant issues and include screenshots for UI changes.
-- Describe any compatibility impact on saved layouts or cached market data.
-- Keep unrelated refactors out of the same pull request.
-- Open an issue before beginning a major architectural change so its scope and compatibility implications can be discussed.
+## Data and attribution
 
-Pull requests should target `develop` unless a maintainer requests otherwise. A pull request is expected to pass formatting, check, Clippy, and the existing test suite.
+Do not commit personal saved state, credentials, private datasets, market caches, logs or build artifacts. Use synthetic or redistributable fixtures, documenting their source and license as needed.
 
-## Data and secrets
-
-Do not commit proprietary market data, licensed datasets, private user data, exchange credentials, API keys, signing material, or other secrets. Use minimal synthetic or redistributable fixtures when a test needs data, and document its source and license when applicable.
-
-By contributing, you agree that your contribution is distributed under the repository's [GPLv3-or-later license](./LICENSE) and that you will follow the [Code of Conduct](./CODE_OF_CONDUCT.md).
+Preserve upstream attribution. Contributions are distributed under the repository's [GPLv3-or-later license](LICENSE). Follow the [Code of Conduct](CODE_OF_CONDUCT.md) and [security policy](SECURITY.md).
