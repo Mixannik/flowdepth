@@ -597,8 +597,10 @@ pub(super) async fn fetch_historical_oi(
 }
 
 fn oi_request_limit(start: u64, end: u64, interval_ms: u64, maximum: u64) -> u64 {
-    end.saturating_sub(start)
-        .div_ceil(interval_ms)
+    // Both API bounds are inclusive; count grid timestamps, not intervals.
+    (end / interval_ms)
+        .saturating_sub(start.div_ceil(interval_ms))
+        .saturating_add(1)
         .clamp(1, maximum)
 }
 
@@ -959,6 +961,8 @@ mod tests {
     fn open_interest_short_range_never_uses_zero_limit() {
         assert_eq!(oi_request_limit(1_000, 1_001, 300_000, 500), 1);
         assert_eq!(oi_request_limit(1_000, 301_000, 300_000, 500), 1);
+        assert_eq!(oi_request_limit(0, 300_000, 300_000, 500), 2);
+        assert_eq!(oi_request_limit(0, 499 * 300_000, 300_000, 500), 500);
     }
 
     #[test]

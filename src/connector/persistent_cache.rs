@@ -677,7 +677,51 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
     ) -> CacheSlice<OpenInterest> {
         let key = open_interest_dataset_key(ticker_info, timeframe);
-        self.read_records(CacheKind::OpenInterest, &key, from, to_exclusive, from)
+        let mut slice: CacheSlice<OpenInterest> = self.read_records(
+            CacheKind::OpenInterest,
+            &key,
+            from,
+            to_exclusive,
+            from.floor_to(timeframe),
+        );
+        if !slice.is_complete() {
+            // Salvage actual samples (including ones now older than the API's
+            // retention), never the old possibly overclaimed coverage.
+            let legacy_key = dataset_key(
+                ticker_info,
+                &format!("open_interest|timeframe_ms={}", timeframe.to_milliseconds()),
+            );
+            let legacy: CacheSlice<OpenInterest> = self.read_records(
+                CacheKind::OpenInterest,
+                &legacy_key,
+                from,
+                to_exclusive,
+                from.floor_to(timeframe),
+            );
+            let interval = timeframe.to_milliseconds();
+            let reusable = legacy
+                .records
+                .into_iter()
+                .filter(|point| {
+                    interval > 0
+                        && point.time.as_u64() % interval == 0
+                        && slice.gaps.iter().any(|&(a, b)| {
+                            point.time < b && point.time.saturating_add(interval) > a
+                        })
+                })
+                .collect::<Vec<_>>();
+            if !reusable.is_empty() {
+                self.store_open_interest(ticker_info, timeframe, from, to_exclusive, &reusable);
+                slice = self.read_records(
+                    CacheKind::OpenInterest,
+                    &key,
+                    from,
+                    to_exclusive,
+                    from.floor_to(timeframe),
+                );
+            }
+        }
+        slice
     }
 
     pub fn store_open_interest(
@@ -689,7 +733,40 @@ impl MarketDataCache {
         records: &[OpenInterest],
     ) {
         let key = open_interest_dataset_key(ticker_info, timeframe);
-        self.store_records(CacheKind::OpenInterest, &key, from, to_exclusive, records);
+        let interval = timeframe.to_milliseconds();
+        if interval == 0 || from >= to_exclusive {
+            return;
+        }
+        let records = OpenInterest::normalize(
+            records
+                .iter()
+                .filter(|point| point.time >= from.floor_to(timeframe) && point.time < to_exclusive)
+                .copied()
+                .collect(),
+        );
+        // A truncated response or an internal hole is never full coverage.
+        let mut start = 0;
+        for index in 1..=records.len() {
+            if index < records.len()
+                && records[index].time <= records[index - 1].time.saturating_add(interval)
+            {
+                continue;
+            }
+            let run = &records[start..index];
+            let coverage_from = run[0].time.max(from);
+            let coverage_to = run[run.len() - 1]
+                .time
+                .saturating_add(interval)
+                .min(to_exclusive);
+            self.store_records(
+                CacheKind::OpenInterest,
+                &key,
+                coverage_from,
+                coverage_to,
+                run,
+            );
+            start = index;
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1569,7 +1646,10 @@ fn kline_dataset_key(ticker_info: TickerInfo, timeframe: Timeframe) -> String {
 fn open_interest_dataset_key(ticker_info: TickerInfo, timeframe: Timeframe) -> String {
     dataset_key(
         ticker_info,
-        &format!("open_interest|timeframe_ms={}", timeframe.to_milliseconds()),
+        &format!(
+            "open_interest_v2|timeframe_ms={}",
+            timeframe.to_milliseconds()
+        ),
     )
 }
 
@@ -2314,6 +2394,62 @@ mod tests {
             open_interest_dataset_key(ticker_info(), Timeframe::M1),
             open_interest_dataset_key(ticker_info(), Timeframe::M5)
         );
+    }
+
+    #[test]
+    fn oi_cache_keeps_truncated_prefix_and_internal_holes_fetchable() {
+        let dir = TestCacheDir::new();
+        let cache = MarketDataCache::open_at(dir.database_path()).unwrap();
+        let ticker = ticker_info();
+        let from = UnixMs::ZERO;
+        let to = UnixMs::new(1_200_000);
+        let points = [
+            OpenInterest {
+                time: UnixMs::new(300_000),
+                value: 1.0,
+            },
+            OpenInterest {
+                time: UnixMs::new(900_000),
+                value: 3.0,
+            },
+        ];
+        cache.store_open_interest(ticker, Timeframe::M5, from, to, &points);
+        let partial = cache.read_open_interest(ticker, Timeframe::M5, from, to);
+        assert_eq!(
+            partial.gaps,
+            vec![
+                (from, UnixMs::new(300_000)),
+                (UnixMs::new(600_000), UnixMs::new(900_000))
+            ]
+        );
+        cache.store_open_interest(
+            ticker,
+            Timeframe::M5,
+            from,
+            to,
+            &[
+                OpenInterest {
+                    time: from,
+                    value: 0.0,
+                },
+                OpenInterest {
+                    time: UnixMs::new(600_000),
+                    value: 2.0,
+                },
+            ],
+        );
+        assert!(
+            cache
+                .read_open_interest(ticker, Timeframe::M5, from, to)
+                .is_complete()
+        );
+        let old_key = dataset_key(ticker, "open_interest|timeframe_ms=900000");
+        cache.store_records(CacheKind::OpenInterest, &old_key, from, to, &points);
+        let fresh = cache.read_open_interest(ticker, Timeframe::M15, from, to);
+        // Only the correctly aligned legacy sample can be migrated; its old
+        // full-range coverage must not hide the missing prefix.
+        assert_eq!(fresh.records, vec![points[1]]);
+        assert!(!fresh.is_complete());
     }
 
     #[test]

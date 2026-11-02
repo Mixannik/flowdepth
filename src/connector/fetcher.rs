@@ -2198,9 +2198,7 @@ async fn fetch_open_interest_cached(
     };
     let to_exclusive = to.saturating_add(1);
     let Some(cache) = market_cache() else {
-        return handles
-            .fetch_open_interest(ticker_info, timeframe, Some((from, to)))
-            .await;
+        return fetch_open_interest_pages(handles, ticker_info, timeframe, from, to).await;
     };
 
     let cached = cache.read_open_interest(ticker_info, timeframe, from, to_exclusive);
@@ -2208,9 +2206,8 @@ async fn fetch_open_interest_cached(
     let mut combined = cached.records;
     for (gap_from, gap_to_exclusive) in cached.gaps {
         let gap_to = gap_to_exclusive.saturating_sub(1);
-        let fetched = handles
-            .fetch_open_interest(ticker_info, timeframe, Some((gap_from, gap_to)))
-            .await?;
+        let fetched =
+            fetch_open_interest_pages(handles, ticker_info, timeframe, gap_from, gap_to).await?;
         cache.store_open_interest(ticker_info, timeframe, gap_from, gap_to_exclusive, &fetched);
         combined.extend(fetched);
     }
@@ -2225,6 +2222,68 @@ async fn fetch_open_interest_cached(
         );
     }
     Ok(combined)
+}
+
+async fn fetch_open_interest_pages(
+    handles: &AdapterHandles,
+    ticker: TickerInfo,
+    timeframe: Timeframe,
+    from: UnixMs,
+    to: UnixMs,
+) -> Result<Vec<OpenInterest>, AdapterError> {
+    if ticker.exchange().venue() != exchange::adapter::Venue::Binance {
+        // Other adapters have their own limits and pagination contracts.
+        return handles
+            .fetch_open_interest(ticker, timeframe, Some((from, to)))
+            .await;
+    }
+    collect_open_interest_pages(from, to, timeframe.to_milliseconds(), |start, end| {
+        handles.fetch_open_interest(ticker, timeframe, Some((start, end)))
+    })
+    .await
+}
+
+async fn collect_open_interest_pages<F, Fut>(
+    from: UnixMs,
+    to: UnixMs,
+    interval: u64,
+    mut fetch: F,
+) -> Result<Vec<OpenInterest>, AdapterError>
+where
+    F: FnMut(UnixMs, UnixMs) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<OpenInterest>, AdapterError>>,
+{
+    if interval == 0 || from > to {
+        return Err(AdapterError::InvalidRequest(
+            "Invalid OI range or interval".into(),
+        ));
+    }
+    let mut cursor = UnixMs::new(from.as_u64() / interval * interval);
+    let mut records = Vec::new();
+    while cursor <= to {
+        // Binance returns the LAST 500 samples for an oversized range. Restrict
+        // each inclusive window to at most 500 grid points before requesting it.
+        let end = cursor.saturating_add(interval.saturating_mul(499)).min(to);
+        let page = fetch(cursor, end).await?;
+        if page
+            .iter()
+            .any(|point| !point.value.is_finite() || point.value < 0.0)
+        {
+            return Err(AdapterError::ParseError("Invalid OI sample".into()));
+        }
+        records.extend(
+            page.into_iter()
+                .filter(|point| point.time >= cursor && point.time <= end),
+        );
+        let next = UnixMs::new(end.as_u64() / interval * interval).saturating_add(interval);
+        if next <= cursor {
+            break;
+        }
+        cursor = next;
+    }
+    records.sort_unstable_by_key(|point| point.time);
+    records.dedup_by_key(|point| point.time);
+    Ok(records)
 }
 
 pub fn oi_fetch_task(
@@ -3236,6 +3295,72 @@ fn bubble_summaries_from_buckets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oi_pagination_preserves_earlier_history_and_inclusive_endpoint() {
+        use iced::futures::{executor::block_on, future::ready};
+        let interval = 300_000;
+        let source = (0..=1_000)
+            .map(|i| OpenInterest {
+                time: UnixMs::new(i * interval),
+                value: i as f64,
+            })
+            .collect::<Vec<_>>();
+        let mut windows = Vec::new();
+        let fetched = block_on(collect_open_interest_pages(
+            UnixMs::new(123),
+            UnixMs::new(1_000 * interval),
+            interval,
+            |from, to| {
+                windows.push((from, to));
+                // Simulate Binance returning only the last 500 matching points.
+                let mut matching = source
+                    .iter()
+                    .copied()
+                    .filter(|p| p.time >= from && p.time <= to)
+                    .collect::<Vec<_>>();
+                if matching.len() > 500 {
+                    matching.drain(..matching.len() - 500);
+                }
+                ready(Ok(matching))
+            },
+        ))
+        .unwrap();
+        assert_eq!(fetched, source);
+        assert_eq!(windows.len(), 3);
+        assert_eq!(windows[0], (UnixMs::ZERO, UnixMs::new(499 * interval)));
+        assert_eq!(
+            windows[2],
+            (UnixMs::new(1_000 * interval), UnixMs::new(1_000 * interval))
+        );
+    }
+
+    #[test]
+    fn oi_pagination_does_not_invent_points_for_empty_or_short_pages() {
+        use iced::futures::{executor::block_on, future::ready};
+        let result = block_on(collect_open_interest_pages(
+            UnixMs::ZERO,
+            UnixMs::new(600_000),
+            300_000,
+            |_, _| {
+                ready(Ok(vec![OpenInterest {
+                    time: UnixMs::new(300_000),
+                    value: 2.0,
+                }]))
+            },
+        ))
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(
+            block_on(collect_open_interest_pages(
+                UnixMs::new(2),
+                UnixMs::new(1),
+                300_000,
+                |_, _| ready(Ok(Vec::new()))
+            ))
+            .is_err()
+        );
+    }
 
     fn ticker_info() -> TickerInfo {
         TickerInfo::new(
