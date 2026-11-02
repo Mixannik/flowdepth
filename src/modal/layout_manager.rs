@@ -69,6 +69,17 @@ pub struct LayoutManager {
 }
 
 impl LayoutManager {
+    /// Market delivery follows subscriptions, not tab visibility. This also
+    /// ignores late events after the last pane using a stream has been removed.
+    pub fn subscribed_layouts_mut<'a>(
+        &'a mut self,
+        stream: &'a exchange::adapter::StreamKind,
+    ) -> impl Iterator<Item = &'a mut Layout> {
+        self.layouts
+            .iter_mut()
+            .filter(move |layout| layout.dashboard.has_stream(stream))
+    }
+
     pub fn new() -> Self {
         let default_layout = LayoutId {
             unique: Uuid::new_v4(),
@@ -674,6 +685,76 @@ fn template_svg(bytes: &'static [u8]) -> svg::Svg<'static> {
 mod market_layout_tests {
     use super::*;
     use exchange::{Ticker, TickerInfo, adapter::Exchange};
+
+    #[test]
+    fn live_routing_reaches_all_subscribers_independently_of_active_tab() {
+        use exchange::adapter::{StreamKind, StreamTicksize, UniqueStreams};
+        use exchange::{PushFrequency, Timeframe};
+
+        let ticker = |venue| TickerInfo::new(Ticker::new("BTCUSDT", venue), 0.01, 0.001, None);
+        let perp = ticker(Exchange::BinanceLinear);
+        let spot = ticker(Exchange::BinanceSpot);
+        let streams = [
+            StreamKind::Kline {
+                ticker_info: perp,
+                timeframe: Timeframe::M15,
+            },
+            StreamKind::Trades { ticker_info: perp },
+            StreamKind::Depth {
+                ticker_info: perp,
+                depth_aggr: StreamTicksize::Client,
+                push_freq: PushFrequency::ServerDefault,
+            },
+        ];
+        let mut manager = LayoutManager::new();
+        manager.layouts.clear();
+        let ids = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()];
+        for (index, id) in ids.into_iter().enumerate() {
+            let mut dashboard = Dashboard::empty(id);
+            dashboard.streams = if index == 0 {
+                // The same symbol on another market/timeframe is not a match.
+                UniqueStreams::from(
+                    [
+                        StreamKind::Kline {
+                            ticker_info: perp,
+                            timeframe: Timeframe::H4,
+                        },
+                        StreamKind::Trades { ticker_info: spot },
+                    ]
+                    .iter(),
+                )
+            } else {
+                UniqueStreams::from(streams.iter())
+            };
+            manager.insert_layout(
+                LayoutId {
+                    unique: id,
+                    name: index.to_string(),
+                },
+                dashboard,
+            );
+        }
+        // Both subscribers receive each event exactly once, even when the active
+        // tab has no matching pane, or when there is no active tab at all.
+        for active in [Some(ids[0]), Some(ids[1]), Some(ids[2]), None] {
+            manager.active_layout_id = active;
+            for stream in &streams {
+                let recipients = manager
+                    .subscribed_layouts_mut(stream)
+                    .map(|layout| layout.id.unique)
+                    .collect::<Vec<_>>();
+                assert_eq!(recipients, vec![ids[1], ids[2]]);
+            }
+        }
+        // Removing the last subscriber discards queued events for that stream.
+        for layout in &mut manager.layouts {
+            layout.dashboard.streams = UniqueStreams::default();
+        }
+        manager.active_layout_id = Some(ids[0]);
+        for stream in &streams {
+            assert_eq!(manager.subscribed_layouts_mut(stream).count(), 0);
+        }
+    }
 
     #[test]
     fn choosing_market_clones_active_layout_without_mutating_source() {

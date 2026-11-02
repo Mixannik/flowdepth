@@ -2378,22 +2378,16 @@ impl Flowsurface {
             .into()
     }
 
-    /// Delivers a live market event to the active layout and to every inactive layout
-    /// that subscribes to the stream. Inactive layouts are skipped when they lack the
-    /// stream, so their "no matching pane" self-healing never fires spuriously.
+    /// Delivers a live market event to every subscribing layout, regardless of
+    /// which tab is active. Unrelated layouts must not run their NoMatch recovery.
     fn route_to_layouts(
         &mut self,
         stream: &exchange::adapter::StreamKind,
         mut ingest: impl FnMut(&mut Dashboard) -> Task<dashboard::Message>,
     ) -> Task<Message> {
-        let active = self.layout_manager.active_layout_id().map(|id| id.unique);
         let tasks = self
             .layout_manager
-            .layouts
-            .iter_mut()
-            .filter(|layout| {
-                Some(layout.id.unique) == active || layout.dashboard.has_stream(stream)
-            })
+            .subscribed_layouts_mut(stream)
             .map(|layout| {
                 let layout_id = layout.id.unique;
                 ingest(&mut layout.dashboard).map(move |event| Message::Dashboard {
