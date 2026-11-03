@@ -12,7 +12,7 @@ use data::chart::{
     },
     kline::{BubbleCandidate, BubbleVolumeSummary},
 };
-use exchange::unit::qty::{QuantityUnit, volume_size_unit};
+use exchange::unit::qty::{QuantityUnit, SizeUnit, volume_size_unit};
 use exchange::{
     Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume,
     options::{
@@ -42,6 +42,15 @@ const RAW_TRADES_DROPPED_KEY: &str = "raw-trade-cache-dropped";
 // V1 compacted each incoming page independently, losing colliding partial-minute
 // aggregates. Keep those records on disk, but never reuse their coverage.
 const TRADE_DATASET: &str = "trade_aggregated_v2";
+const BINANCE_TRADE_DATASET: &str = "trade_aggregated_v3";
+
+fn trade_dataset(ticker: TickerInfo) -> &'static str {
+    if ticker.exchange().venue() == exchange::adapter::Venue::Binance {
+        BINANCE_TRADE_DATASET
+    } else {
+        TRADE_DATASET
+    }
+}
 
 const META_TABLE: TableDefinition<&str, u64> = TableDefinition::new("cache_meta_v1");
 const COVERAGE_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("cache_coverage_v1");
@@ -567,34 +576,20 @@ impl MarketDataCache {
         from: UnixMs,
         to_exclusive: UnixMs,
     ) -> CacheSlice<Trade> {
-        let key = quantity_dataset_key(ticker_info, TRADE_DATASET);
-        let mut slice: CacheSlice<Trade> =
-            self.read_records(CacheKind::Trade, &key, from, to_exclusive, from);
+        let unit = QuantityUnit::for_market(ticker_info.market_type(), volume_size_unit());
+        self.read_trades_in(ticker_info, from, to_exclusive, unit)
+    }
 
-        // Like klines, coverage alone is not proof: older fetch code persisted coverage past
-        // the trades it actually stored (e.g. 27.10 00:03–00:30 UTC sat empty). Turn
-        // implausibly long silences back into gaps so the fetcher repairs them.
-        let holes = trade_integrity_gaps(&slice.records, from.as_u64(), to_exclusive.as_u64());
-        if !holes.is_empty() {
-            log::warn!(
-                "CACHE TradeIntegrityGap | key={key} records={} detected_gaps={} first_gap={}..{}",
-                slice.records.len(),
-                holes.len(),
-                holes[0].0,
-                holes[0].1
-            );
-            let gaps = slice
-                .gaps
-                .iter()
-                .map(|(gap_from, gap_to)| (gap_from.as_u64(), gap_to.as_u64()))
-                .chain(holes)
-                .collect();
-            slice.gaps = merge_intervals(gaps)
-                .into_iter()
-                .map(|(gap_from, gap_to)| (UnixMs::new(gap_from), UnixMs::new(gap_to)))
-                .collect();
-        }
-        slice
+    fn read_trades_in(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to_exclusive: UnixMs,
+        unit: QuantityUnit,
+    ) -> CacheSlice<Trade> {
+        let key = quantity_dataset_key_in(ticker_info, trade_dataset(ticker_info), unit);
+        let slice = self.read_records(CacheKind::Trade, &key, from, to_exclusive, from);
+        checked_trade_slice(slice, &key, from, to_exclusive)
     }
 
     /// Trades older than two days are stored as per-minute price aggregates (see
@@ -609,9 +604,19 @@ impl MarketDataCache {
         to_exclusive: UnixMs,
         records: &[Trade],
     ) {
-        let unit =
-            QuantityUnit::for_market(ticker_info.exchange().market_type(), volume_size_unit());
-        let key = quantity_dataset_key_in(ticker_info, TRADE_DATASET, unit);
+        let unit = QuantityUnit::for_market(ticker_info.market_type(), volume_size_unit());
+        self.store_trades_in(ticker_info, from, to_exclusive, records, unit);
+    }
+
+    fn store_trades_in(
+        &self,
+        ticker_info: TickerInfo,
+        from: UnixMs,
+        to_exclusive: UnixMs,
+        records: &[Trade],
+        unit: QuantityUnit,
+    ) {
+        let key = quantity_dataset_key_in(ticker_info, trade_dataset(ticker_info), unit);
         let cutoff = UnixMs::now().saturating_sub(data::chart::kline::CACHE_AGGREGATE_AFTER_MS);
         // Only raw source pages can establish new coverage. An aggregate cannot
         // prove which executions of a partially requested minute it represents.
@@ -1612,6 +1617,38 @@ fn dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
 
 // Untagged legacy quantities have unknown units. Keep their bytes, but never
 // reuse their records or coverage as a quantity-aware dataset.
+fn checked_trade_slice(
+    mut slice: CacheSlice<Trade>,
+    key: &str,
+    from: UnixMs,
+    to_exclusive: UnixMs,
+) -> CacheSlice<Trade> {
+    // Like klines, coverage alone is not proof: older fetch code persisted coverage past
+    // the trades it actually stored (e.g. 27.10 00:03–00:30 UTC sat empty). Turn
+    // implausibly long silences back into gaps so the fetcher repairs them.
+    let holes = trade_integrity_gaps(&slice.records, from.as_u64(), to_exclusive.as_u64());
+    if !holes.is_empty() {
+        log::warn!(
+            "CACHE TradeIntegrityGap | key={key} records={} detected_gaps={} first_gap={}..{}",
+            slice.records.len(),
+            holes.len(),
+            holes[0].0,
+            holes[0].1
+        );
+        let gaps = slice
+            .gaps
+            .iter()
+            .map(|(gap_from, gap_to)| (gap_from.as_u64(), gap_to.as_u64()))
+            .chain(holes)
+            .collect();
+        slice.gaps = merge_intervals(gaps)
+            .into_iter()
+            .map(|(gap_from, gap_to)| (UnixMs::new(gap_from), UnixMs::new(gap_to)))
+            .collect();
+    }
+    slice
+}
+
 fn quantity_dataset_key_in(ticker_info: TickerInfo, suffix: &str, unit: QuantityUnit) -> String {
     dataset_key(
         ticker_info,
@@ -1661,10 +1698,15 @@ fn bubble_dataset_key(
     cluster_window_ms: u32,
     cluster_price_ticks: u32,
 ) -> String {
+    let history_version = if ticker_info.exchange().venue() == exchange::adapter::Venue::Binance {
+        "|history=v3"
+    } else {
+        ""
+    };
     quantity_dataset_key(
         ticker_info,
         &format!(
-            "bubble_summary|algorithm=v2|timeframe_ms={timeframe_ms}|price_step_units={price_step_units}|max_candidates={max_candidates_per_candle}|cluster_ms={cluster_window_ms}|cluster_ticks={cluster_price_ticks}"
+            "bubble_summary|algorithm=v2|timeframe_ms={timeframe_ms}|price_step_units={price_step_units}|max_candidates={max_candidates_per_candle}|cluster_ms={cluster_window_ms}|cluster_ticks={cluster_price_ticks}{history_version}"
         ),
     )
 }
@@ -1913,7 +1955,6 @@ pub fn merge_bubble_summaries(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exchange::SizeUnit;
 
     fn minute_fixture() -> Vec<Trade> {
         (0..80)
@@ -2062,6 +2103,164 @@ mod tests {
         let missing = cache.read_trades(ticker, UnixMs::new(180_000), UnixMs::new(240_000));
         assert!(missing.records.is_empty());
         assert!(!missing.is_complete());
+    }
+
+    #[test]
+    fn fd004_binance_replay_matches_live_history_and_reopened_compaction() {
+        use exchange::{
+            Ticker,
+            adapter::Exchange,
+            unit::{
+                Qty,
+                qty::{QtyNormalization, RawQtyUnit},
+            },
+        };
+
+        for (symbol, market, contract_size, raw_unit) in [
+            ("BTCUSDT", Exchange::BinanceSpot, None, RawQtyUnit::Base),
+            ("BTCUSDT", Exchange::BinanceLinear, None, RawQtyUnit::Base),
+            (
+                "BTCUSD",
+                Exchange::BinanceInverse,
+                Some(100.0),
+                RawQtyUnit::Contracts,
+            ),
+        ] {
+            let ticker = TickerInfo::new(Ticker::new(symbol, market), 0.1, 0.001, contract_size);
+            for preference in [SizeUnit::Base, SizeUnit::Quote] {
+                let unit = QuantityUnit::for_market(ticker.market_type(), preference);
+                let (expected_unit, buy, sell) = match (market, preference) {
+                    (Exchange::BinanceInverse, _) => (QuantityUnit::Quote, 43_000.0, 23_000.0),
+                    (_, SizeUnit::Base) => (QuantityUnit::Base, 4.30, 2.30),
+                    (_, SizeUnit::Quote) => (QuantityUnit::Quote, 430_000.0, 230_000.0),
+                };
+                assert_eq!(unit, expected_unit);
+                let normalizer = QtyNormalization::with_raw_qty_unit(
+                    unit == QuantityUnit::Quote,
+                    ticker,
+                    raw_unit,
+                );
+                let mut trades = minute_fixture();
+                for trade in &mut trades {
+                    trade.price = exchange::unit::Price::from_f64(100_000.0);
+                    let raw = if market == Exchange::BinanceInverse {
+                        (trade.qty.to_f64() * 100.0).round()
+                    } else {
+                        trade.qty.to_f64()
+                    };
+                    trade.qty = normalizer.normalize_qty(raw, trade.price.to_f64());
+                }
+                let buy = Qty::from_f64(buy);
+                let sell = Qty::from_f64(sell);
+                let expected = (
+                    buy.units,
+                    sell.units,
+                    (buy + sell).units,
+                    (buy - sell).units,
+                );
+                assert_fd004_replay(ticker, unit, &trades, expected);
+            }
+        }
+    }
+
+    fn assert_fd004_replay(
+        ticker: TickerInfo,
+        unit: QuantityUnit,
+        trades: &[Trade],
+        expected: (i64, i64, i64, i64),
+    ) {
+        use crate::chart::kline::tests::replay_binance_footprint;
+
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        assert_eq!(
+            replay_binance_footprint(ticker, &[trades, trades], true),
+            expected
+        );
+
+        let from = UnixMs::new(60_000);
+        let to = UnixMs::new(120_001);
+        let pages = [
+            (from, UnixMs::new(90_001), &trades[..43]),
+            (UnixMs::new(90_000), to, &trades[40..]),
+        ];
+        for order in [[0, 1], [1, 0]] {
+            let path = path.with_extension(format!("{}.redb", order[0]));
+            let (left, right, first) = pages[order[0]];
+            let (next_left, next_right, second) = pages[order[1]];
+            assert_eq!(
+                replay_binance_footprint(ticker, &[first, second], false),
+                expected
+            );
+            {
+                let cache = MarketDataCache::open_at(path.clone()).unwrap();
+                cache.store_trades_in(ticker, left, right, first, unit);
+                let partial = cache.read_trades_in(ticker, from, to, unit);
+                assert!(!partial.is_complete());
+                assert_eq!(trade_signature(&partial.records), trade_signature(first));
+            }
+            {
+                let cache = MarketDataCache::open_at(path.clone()).unwrap();
+                cache.store_trades_in(ticker, next_left, next_right, second, unit);
+                cache.store_trades_in(ticker, from, to, trades, unit);
+            }
+            let cache = MarketDataCache::open_at(path).unwrap();
+            let compacted = cache.read_trades_in(ticker, from, to, unit);
+            assert!(compacted.is_complete());
+            assert!(compacted.records.len() < trades.len());
+            assert_eq!(
+                replay_binance_footprint(ticker, &[&compacted.records], false),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn binance_trade_cache_reopens_without_trusting_legacy_coverage() {
+        use exchange::{Ticker, adapter::Exchange};
+
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        let from = UnixMs::now().saturating_sub(1000);
+        let to = from.saturating_add(1);
+        let trades: Vec<_> = (0..1002)
+            .map(|id| Trade {
+                id: Some(id),
+                is_sell: id % 2 == 1,
+                ..timed_trade(from.as_u64())
+            })
+            .collect();
+        for (symbol, market) in [
+            ("BTCUSDT", Exchange::BinanceSpot),
+            ("BTCUSDT", Exchange::BinanceLinear),
+            ("BTCUSD", Exchange::BinanceInverse),
+        ] {
+            let ticker = TickerInfo::new(Ticker::new(symbol, market), 0.1, 0.001, None);
+            let old_key = quantity_dataset_key(ticker, TRADE_DATASET);
+            {
+                let cache = MarketDataCache::open_at(path.clone()).unwrap();
+                cache.store_records(CacheKind::Trade, &old_key, from, to, &trades[..1000]);
+            }
+            {
+                let cache = MarketDataCache::open_at(path.clone()).unwrap();
+                let missing = cache.read_trades(ticker, from, to);
+                assert!(!missing.is_complete());
+                assert!(missing.records.is_empty());
+                cache.store_trades(ticker, from, to, &trades);
+                cache.store_trades(ticker, from, to, &trades);
+            }
+            let cache = MarketDataCache::open_at(path.clone()).unwrap();
+            let loaded = cache.read_trades(ticker, from, to);
+            assert!(loaded.is_complete());
+            assert_eq!(trade_signature(&loaded.records), trade_signature(&trades));
+            assert_eq!(
+                cache
+                    .read_records::<Trade>(CacheKind::Trade, &old_key, from, to, from)
+                    .records
+                    .len(),
+                1000
+            );
+        }
     }
 
     #[test]

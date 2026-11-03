@@ -8070,7 +8070,7 @@ fn price_padding_from_pixels(cell_height: f32, tick_size: f32) -> f32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     fn hourly_bar(hour: u64, low: f64, high: f64, volume: f64) -> (u64, Kline) {
@@ -8229,6 +8229,10 @@ mod tests {
             0.001,
             None,
         );
+        replay_chart(ticker)
+    }
+
+    fn replay_chart(ticker: TickerInfo) -> KlineChart {
         let bars = [0, 300000].map(|at| Kline {
             time: UnixMs::new(at),
             open: Price::from_f64(100.0),
@@ -8249,6 +8253,36 @@ mod tests {
             None,
         )
     }
+    pub(crate) fn replay_binance_footprint(
+        ticker: TickerInfo,
+        pages: &[&[Trade]],
+        live: bool,
+    ) -> (i64, i64, i64, i64) {
+        let mut chart = replay_chart(ticker);
+        for (index, page) in pages.iter().enumerate() {
+            if live {
+                chart.insert_trades(page);
+            } else {
+                chart.insert_raw_trades(page.to_vec(), index + 1 == pages.len());
+            }
+        }
+        let PlotData::TimeBased(series) = &chart.data_source else {
+            panic!("expected time-based footprint");
+        };
+        series.datapoints[&UnixMs::ZERO]
+            .footprint
+            .trades
+            .values()
+            .fold((0, 0, 0, 0), |(buy, sell, volume, delta), row| {
+                (
+                    buy + row.buy_qty.units,
+                    sell + row.sell_qty.units,
+                    volume + row.total_qty().units,
+                    delta + row.delta_qty().units,
+                )
+            })
+    }
+
     fn ws03_token(chart: &KlineChart) -> crate::market_service::RecoveryToken {
         use exchange::adapter::{StreamKind, WsGeneration, WsSessionId, WsSource};
         crate::market_service::RecoveryToken {

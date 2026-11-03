@@ -35,6 +35,7 @@ pub struct LinePlot<V, T> {
     pub show_points: bool,
     pub point_radius_factor: f32,
     pub interpolation: LineInterpolation,
+    max_gap: u64,
     /// Horizontal shift in bucket units (screen-space).
     /// Positive values move points right, negative values move left.
     pub x_shift_buckets: i32,
@@ -61,6 +62,7 @@ impl<V, T> LinePlot<V, T> {
             show_points: true,
             point_radius_factor: 0.2,
             interpolation: LineInterpolation::Linear,
+            max_gap: u64::MAX,
             x_shift_buckets: 0,
             is_valid: None,
             invalid_point_message: None,
@@ -96,6 +98,11 @@ impl<V, T> LinePlot<V, T> {
         self
     }
 
+    pub fn max_gap(mut self, max_gap: u64) -> Self {
+        self.max_gap = max_gap;
+        self
+    }
+
     pub fn with_tooltip<F>(mut self, tooltip: F) -> Self
     where
         F: Fn(&T, Option<&T>) -> PlotTooltip + 'static,
@@ -117,6 +124,7 @@ where
         if self.interpolation == LineInterpolation::StepAfter
             && let Some((x, y)) = datapoints.last_in(0..=*range.start())
             && x < *range.start()
+            && range.start().saturating_sub(x) < self.max_gap
             && self.is_valid.as_ref().is_none_or(|f| f(y))
         {
             let value = (self.value)(y);
@@ -189,8 +197,12 @@ where
         let mut prev = if self.interpolation == LineInterpolation::StepAfter {
             datapoints
                 .last_in(0..=*range.start())
-                .filter(|(x, y)| *x < *range.start() && self.is_valid.as_ref().is_none_or(|f| f(y)))
-                .map(|(_, y)| (x_for(*range.start()), scale.to_y((self.value)(y))))
+                .filter(|(x, y)| {
+                    *x < *range.start()
+                        && range.start().saturating_sub(*x) < self.max_gap
+                        && self.is_valid.as_ref().is_none_or(|f| f(y))
+                })
+                .map(|(x, y)| (x, x_for(*range.start()), scale.to_y((self.value)(y))))
         } else {
             None
         };
@@ -199,7 +211,9 @@ where
             if valid {
                 let sx = x_for(x);
                 let sy = scale.to_y((self.value)(y));
-                if let Some((px, py)) = prev {
+                if let Some((previous_x, px, py)) = prev
+                    && x.saturating_sub(previous_x) <= self.max_gap
+                {
                     match self.interpolation {
                         LineInterpolation::Linear => frame.stroke(
                             &Path::line(iced::Point::new(px, py), iced::Point::new(sx, sy)),
@@ -221,7 +235,7 @@ where
                 if let Some(r) = radius {
                     frame.fill(&Path::circle(iced::Point::new(sx, sy), r), color);
                 }
-                prev = Some((sx, sy));
+                prev = Some((x, sx, sy));
             } else {
                 prev = None;
             }
@@ -230,6 +244,10 @@ where
 
     fn tooltip_fn(&self) -> Option<&TooltipFn<S::Y>> {
         self.tooltip.as_ref()
+    }
+
+    fn max_sample_gap(&self) -> Option<u64> {
+        (self.max_gap != u64::MAX).then_some(self.max_gap)
     }
 
     fn is_point_valid(&self, y: &S::Y) -> bool {

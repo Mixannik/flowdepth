@@ -305,6 +305,10 @@ pub trait Plot<S: Series> {
 
     fn tooltip_fn(&self) -> Option<&TooltipFn<S::Y>>;
 
+    fn max_sample_gap(&self) -> Option<u64> {
+        None
+    }
+
     fn tooltip(&self, y: &S::Y, next: Option<&S::Y>, _theme: &Theme) -> Option<PlotTooltip> {
         self.tooltip_fn().map(|tt| tt(y, next))
     }
@@ -494,15 +498,28 @@ where
                     });
 
                 if let Some((x, y)) = hovered {
-                    let next = self.series.next_after(x).map(|(_, v)| v);
+                    let max_gap = self.plot.max_sample_gap();
+                    let next = self
+                        .series
+                        .next_after(x)
+                        .filter(|(next_x, _)| {
+                            max_gap.is_none_or(|gap| next_x.saturating_sub(x) <= gap)
+                        })
+                        .map(|(_, v)| v);
 
-                    if self.plot.is_point_valid(y) {
+                    if max_gap.is_some_and(|gap| rounded_x.saturating_sub(x) >= gap) {
+                        PlotTooltip::warning("No sample for this interval")
+                            .draw_static(frame, theme, bounds);
+                    } else if self.plot.is_point_valid(y) {
                         if let Some(tooltip) = self.plot.tooltip(y, next, theme) {
                             tooltip.draw(frame, theme, bounds, cursor_position.x);
                         }
                     } else if let Some(msg) = self.plot.invalid_point_message() {
                         PlotTooltip::warning(msg).draw_static(frame, theme, bounds);
                     }
+                } else if visible && self.plot.max_sample_gap().is_some() {
+                    PlotTooltip::warning("No sample for this interval")
+                        .draw_static(frame, theme, bounds);
                 }
             } else if let Some(cursor_position) = cursor.position_in(bounds) {
                 // horizontal snap uses label extents
@@ -532,8 +549,22 @@ where
                     Basis::Tick(_) => self.series.first_in(earliest..=latest),
                 }
             {
-                if self.plot.is_point_valid(y) {
-                    let next = self.series.next_after(x).map(|(_, v)| v);
+                if self
+                    .plot
+                    .max_sample_gap()
+                    .is_some_and(|gap| latest.saturating_sub(x) >= gap)
+                {
+                    PlotTooltip::warning("No recent sample").draw_static(frame, theme, bounds);
+                } else if self.plot.is_point_valid(y) {
+                    let next = self
+                        .series
+                        .next_after(x)
+                        .filter(|(next_x, _)| {
+                            self.plot
+                                .max_sample_gap()
+                                .is_none_or(|gap| next_x.saturating_sub(x) <= gap)
+                        })
+                        .map(|(_, v)| v);
 
                     if let Some(tooltip) = self.plot.tooltip(y, next, theme) {
                         tooltip.draw_static(frame, theme, bounds);

@@ -609,13 +609,70 @@ async fn fetch_intraday_trades(
     ticker_info: TickerInfo,
     from: UnixMs,
 ) -> Result<Vec<Trade>, AdapterError> {
-    fetch_recovery_trade_page(
+    complete_intraday_trade_page(
         hub,
-        ticker_info,
-        crate::adapter::TradePageCursor::Time(from),
+        from,
+        |hub, cursor| Box::pin(fetch_recovery_trade_page(hub, ticker_info, cursor)),
+        |trade| (trade.id, trade.time),
     )
     .await
 }
+
+async fn complete_intraday_trade_page<C, T>(
+    context: &mut C,
+    from: UnixMs,
+    mut fetch: impl for<'a> FnMut(
+        &'a mut C,
+        crate::adapter::TradePageCursor,
+    ) -> std::pin::Pin<
+        Box<dyn Future<Output = Result<Vec<T>, AdapterError>> + Send + 'a>,
+    >,
+    key: impl Fn(&T) -> (Option<u64>, UnixMs),
+) -> Result<Vec<T>, AdapterError> {
+    use crate::adapter::TradePageCursor;
+
+    let mut trades = fetch(context, TradePageCursor::Time(from)).await?;
+    if trades.len() < AGG_TRADE_PAGE_LIMIT {
+        return Ok(trades);
+    }
+
+    // The caller marks the last millisecond covered. Finish that millisecond
+    // before returning the batch, even if it spans several REST pages.
+    for _ in 0..128 {
+        let (last_id, last_time) = key(trades.last().expect("saturated trade page"));
+        let next = last_id.and_then(|id| id.checked_add(1)).ok_or_else(|| {
+            AdapterError::ParseError("Invalid Binance aggregate trade cursor".into())
+        })?;
+        let page = fetch(context, TradePageCursor::AggregateId(next)).await?;
+        let page_len = page.len();
+        let mut expected = next;
+        for trade in page {
+            let (id, time) = key(&trade);
+            if id != Some(expected) || time < last_time {
+                return Err(AdapterError::ParseError(
+                    "Binance aggregate trade continuation is discontinuous".into(),
+                ));
+            }
+            if time > last_time {
+                return Ok(trades);
+            }
+            trades.push(trade);
+            expected = expected.checked_add(1).ok_or_else(|| {
+                AdapterError::ParseError("Binance aggregate trade cursor overflow".into())
+            })?;
+        }
+        if page_len < AGG_TRADE_PAGE_LIMIT {
+            return Err(AdapterError::ParseError(
+                "Binance aggregate trade continuation has no later timestamp".into(),
+            ));
+        }
+    }
+    Err(AdapterError::ParseError(
+        "Binance aggregate trade continuation exceeded page limit".into(),
+    ))
+}
+
+const AGG_TRADE_PAGE_LIMIT: usize = 1000;
 
 /// Recovery uses an inclusive ID cursor after the first time-based page. Never
 /// advance a timestamp past a saturated millisecond. See Binance aggTrades API.
@@ -633,7 +690,7 @@ pub(super) async fn fetch_recovery_trade_page(
         MarketKind::InversePerps => (format!("{INVERSE_PERP_DOMAIN}/dapi/v1/aggTrades"), 20),
     };
 
-    let mut url = format!("{base_url}?symbol={symbol_str}&limit=1000");
+    let mut url = format!("{base_url}?symbol={symbol_str}&limit={AGG_TRADE_PAGE_LIMIT}");
     match cursor {
         crate::adapter::TradePageCursor::Time(from) => {
             url.push_str(&format!("&startTime={}", from.as_u64()))
@@ -903,6 +960,64 @@ fn intraday_window_covers(start_ms: u64, now_ms: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn intraday_saturated_millisecond_is_completed_by_id() {
+        use super::{Price, Trade, UnixMs, complete_intraday_trade_page};
+        use crate::adapter::TradePageCursor;
+
+        let from = UnixMs::new(1000);
+        let trade = |id: u64, time| Trade {
+            id: Some(id),
+            time,
+            is_sell: id % 2 == 1,
+            price: Price::from_f64(100.0),
+            qty: crate::unit::Qty::from_f64(1.0),
+        };
+        let first = (0..1000).map(|id| trade(id, from)).collect::<Vec<_>>();
+        let continuation = vec![
+            trade(1000, from),
+            trade(1001, from),
+            trade(1002, UnixMs::new(1001)),
+        ];
+        let run = async |repeat_page| {
+            complete_intraday_trade_page(
+                &mut (),
+                from,
+                |_, cursor| {
+                    Box::pin(std::future::ready(Ok(match cursor {
+                        TradePageCursor::Time(time) if time == from => first.clone(),
+                        TradePageCursor::AggregateId(1000) if repeat_page => first.clone(),
+                        TradePageCursor::AggregateId(1000) => continuation.clone(),
+                        _ => panic!("unexpected cursor"),
+                    })))
+                },
+                |trade| (trade.id, trade.time),
+            )
+            .await
+        };
+
+        assert!(run(true).await.is_err());
+        let trades = run(false).await.unwrap();
+        assert_eq!(
+            trades
+                .iter()
+                .map(|trade| trade.id.unwrap())
+                .collect::<Vec<_>>(),
+            (0..1002).collect::<Vec<_>>()
+        );
+        assert!(trades.iter().all(|trade| trade.time == from));
+        for is_sell in [false, true] {
+            assert_eq!(
+                trades
+                    .iter()
+                    .filter(|trade| trade.is_sell == is_sell)
+                    .map(|trade| trade.qty.to_f64())
+                    .sum::<f64>(),
+                501.0
+            );
+        }
+    }
+
     use super::{
         archive_bool, archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
         oi_request_limit, remember_missing_historical_trade_archive,

@@ -71,6 +71,7 @@ impl OpenInterestIndicator {
             .show_points(true)
             .point_radius_factor(0.2)
             .interpolation(LineInterpolation::StepAfter)
+            .max_gap(source.map_or(u64::MAX, |timeframe| timeframe.to_milliseconds()))
             .padding(0.08)
             .with_tooltip(tooltip);
 

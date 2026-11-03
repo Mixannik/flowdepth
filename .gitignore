@@ -2,6 +2,12 @@
 /target
 /.vscode
 /.local
+/profiles/
+/app-dev/
+/.env
+/.env.*
+!/.env.example
+/*.exe
 *.log
 *.zip
 *.bat

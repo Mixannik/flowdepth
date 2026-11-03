@@ -2773,6 +2773,8 @@ pub fn fetch_trades_batched(
     req_id: Uuid,
 ) -> impl Straw<TradeFetchOutcome, Vec<Trade>, AdapterError> {
     let context = handles.quantity_context();
+    let direct_binance =
+        server.is_none() && ticker_info.exchange().venue() == exchange::adapter::Venue::Binance;
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
 
@@ -3016,7 +3018,10 @@ pub fn fetch_trades_batched(
                             }
                         })?;
 
-                        if latest_trade_t <= prev_latest_trade_t {
+                        if direct_binance {
+                            latest_trade_t = covered_to_exclusive;
+                            consecutive_no_progress = 0;
+                        } else if latest_trade_t <= prev_latest_trade_t {
                             consecutive_no_progress += 1;
                             let remaining_ms = target_to.saturating_diff(latest_trade_t);
                             log::warn!(
@@ -3065,7 +3070,9 @@ pub fn fetch_trades_batched(
                         if !batch.is_empty() {
                             let () = progress.send(batch).await;
                         }
-                        if latest_trade_t >= target_to {
+                        if (direct_binance && latest_trade_t >= gap_to_exclusive)
+                            || (!direct_binance && latest_trade_t >= target_to)
+                        {
                             break;
                         }
                     }
@@ -3242,7 +3249,9 @@ async fn fetch_bubble_summaries(
         timeframe_ms
     );
 
-    while latest_trade_t < to_time {
+    let direct_binance = ticker_info.exchange().venue() == exchange::adapter::Venue::Binance;
+    let mut verified_to_exclusive = from_time;
+    while latest_trade_t < to_time || (direct_binance && latest_trade_t == to_time) {
         request_count += 1;
         let batch_started = Instant::now();
         let request_from = latest_trade_t;
@@ -3295,7 +3304,13 @@ async fn fetch_bubble_summaries(
             format_duration_ms(batch_started.elapsed().as_millis() as u64)
         );
 
-        if latest_trade_t <= prev_latest_trade_t {
+        if direct_binance {
+            verified_to_exclusive = latest_trade_t.min(to_time).saturating_add(1);
+            if latest_trade_t >= to_time {
+                break;
+            }
+            latest_trade_t = verified_to_exclusive;
+        } else if latest_trade_t <= prev_latest_trade_t {
             log::warn!(
                 "BUBBLE Summary Stop | reason=no_progress latest={} target_to={} requests={request_count}",
                 format_time_short(latest_trade_t),
@@ -3335,11 +3350,9 @@ async fn fetch_bubble_summaries(
         format_duration_ms(started.elapsed().as_millis() as u64)
     );
 
-    let verified_to_exclusive = if latest_trade_t > from_time {
-        latest_trade_t.min(to_time).saturating_add(1)
-    } else {
-        from_time
-    };
+    if !direct_binance && latest_trade_t > from_time {
+        verified_to_exclusive = latest_trade_t.min(to_time).saturating_add(1);
+    }
 
     Ok((summaries, trades_seen, raw_discarded, verified_to_exclusive))
 }
