@@ -198,6 +198,20 @@ impl BinanceHandle {
             .await
     }
 
+    pub async fn fetch_recovery_trade_page(
+        &self,
+        ticker: TickerInfo,
+        cursor: crate::adapter::TradePageCursor,
+    ) -> Result<Vec<Trade>, AdapterError> {
+        self.request_port
+            .request(move |reply| BinanceCommand::RecoveryTradePage {
+                ticker,
+                cursor,
+                reply,
+            })
+            .await
+    }
+
     pub async fn fetch_trades(
         &self,
         ticker: TickerInfo,
@@ -373,6 +387,17 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
         Box::pin(
             async move { fetch::fetch_depth_snapshot(self.hub_for_market(market), ticker).await },
         )
+    }
+
+    fn fetch_recovery_trade_page(
+        &mut self,
+        ticker: TickerInfo,
+        cursor: crate::adapter::TradePageCursor,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<Trade>, AdapterError>> {
+        let market = ticker.market_type();
+        Box::pin(async move {
+            fetch::fetch_recovery_trade_page(self.hub_for_market(market), ticker, cursor).await
+        })
     }
 
     fn fetch_trades(

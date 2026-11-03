@@ -609,6 +609,21 @@ async fn fetch_intraday_trades(
     ticker_info: TickerInfo,
     from: UnixMs,
 ) -> Result<Vec<Trade>, AdapterError> {
+    fetch_recovery_trade_page(
+        hub,
+        ticker_info,
+        crate::adapter::TradePageCursor::Time(from),
+    )
+    .await
+}
+
+/// Recovery uses an inclusive ID cursor after the first time-based page. Never
+/// advance a timestamp past a saturated millisecond. See Binance aggTrades API.
+pub(super) async fn fetch_recovery_trade_page(
+    hub: &mut HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    cursor: crate::adapter::TradePageCursor,
+) -> Result<Vec<Trade>, AdapterError> {
     let ticker = ticker_info.ticker;
     let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
 
@@ -619,7 +634,12 @@ async fn fetch_intraday_trades(
     };
 
     let mut url = format!("{base_url}?symbol={symbol_str}&limit=1000");
-    url.push_str(&format!("&startTime={}", from.as_u64()));
+    match cursor {
+        crate::adapter::TradePageCursor::Time(from) => {
+            url.push_str(&format!("&startTime={}", from.as_u64()))
+        }
+        crate::adapter::TradePageCursor::AggregateId(id) => url.push_str(&format!("&fromId={id}")),
+    }
 
     let de_trades: Vec<DeTrade> = hub.http_json_with_limiter(&url, weight, None, None).await?;
 

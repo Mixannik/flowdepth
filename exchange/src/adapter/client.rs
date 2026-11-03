@@ -609,6 +609,30 @@ impl AdapterHandles {
         }
     }
 
+    /// Uncached, ID-pageable aggregate history for exact recovery. Other venues
+    /// remain unsupported until their completeness/cursor contracts are proven.
+    pub async fn fetch_recovery_trade_page(
+        &self,
+        ticker: TickerInfo,
+        cursor: crate::adapter::TradePageCursor,
+    ) -> Result<Vec<Trade>, AdapterError> {
+        self.quantity_context
+            .check_future(async {
+                if ticker.exchange().venue() != Venue::Binance {
+                    return Err(AdapterError::InvalidRequest(
+                        "Verified trade recovery unsupported".into(),
+                    ));
+                }
+                self.binance
+                    .as_ref()
+                    .ok_or_else(|| Self::missing_venue_error(Venue::Binance))?
+                    .fetch_recovery_trade_page(ticker, cursor)
+                    .await
+            })
+            .await
+            .map_err(|e| AdapterError::InvalidRequest(e.to_string()))?
+    }
+
     pub async fn fetch_trades(
         &self,
         ticker_info: TickerInfo,

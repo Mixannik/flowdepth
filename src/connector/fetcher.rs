@@ -4068,3 +4068,241 @@ mod quantity_context_tests {
         println!("context-child-checked");
     }
 }
+
+/// Source proof is deliberately separate from generic Completed/cache coverage.
+/// Only fresh ID-contiguous aggregate pages with a witness AFTER the range qualify.
+#[derive(Debug, Clone)]
+pub struct VerifiedTradeHistory {
+    pub(crate) ticker: TickerInfo,
+    pub(crate) context: QuantityContext,
+    pub(crate) from: UnixMs,
+    pub(crate) to: UnixMs,
+    pub(crate) trades: Vec<Trade>,
+}
+
+fn recovery_incomplete(reason: &str) -> AdapterError {
+    AdapterError::InvalidRequest(format!("Trade recovery partial/unsupported: {reason}"))
+}
+
+pub async fn fetch_verified_trade_history(
+    handles: &AdapterHandles,
+    ticker: TickerInfo,
+    from: UnixMs,
+    to: UnixMs,
+) -> Result<VerifiedTradeHistory, AdapterError> {
+    // The legacy USD-M live buffer uses RAW trades; aggTrades cannot restore its
+    // exact timestamp/order/size semantics. Do not promote it to complete.
+    if !matches!(
+        ticker.exchange(),
+        Exchange::BinanceSpot | Exchange::BinanceInverse
+    ) {
+        return Err(recovery_incomplete(
+            "live/history representation has no exact recovery contract",
+        ));
+    }
+    let context = handles.quantity_context();
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        collect_verified_trade_history(ticker, context, from, to, |cursor| {
+            handles.fetch_recovery_trade_page(ticker, cursor)
+        }),
+    )
+    .await
+    .map_err(|_| recovery_incomplete("timeout"))?;
+    context
+        .ensure_current()
+        .map_err(|_| recovery_incomplete("stale quantity context"))?;
+    result
+}
+
+async fn collect_verified_trade_history<F, Fut>(
+    ticker: TickerInfo,
+    context: QuantityContext,
+    from: UnixMs,
+    to: UnixMs,
+    mut page: F,
+) -> Result<VerifiedTradeHistory, AdapterError>
+where
+    F: FnMut(exchange::adapter::TradePageCursor) -> Fut,
+    Fut: std::future::Future<Output = Result<Vec<Trade>, AdapterError>>,
+{
+    use exchange::adapter::TradePageCursor;
+    if from >= to {
+        return Err(recovery_incomplete("unknown/invalid boundaries"));
+    }
+    let mut cursor = TradePageCursor::Time(from);
+    let mut trades = Vec::new();
+    let mut previous: Option<Trade> = None;
+    for _ in 0..128 {
+        let batch = page(cursor).await?;
+        if batch.is_empty() {
+            return Err(recovery_incomplete("no right-boundary witness"));
+        }
+        for trade in batch {
+            let id = trade
+                .id
+                .ok_or_else(|| recovery_incomplete("missing aggregate ID"))?;
+            if trade.time < from
+                || trade.price.units <= 0
+                || !trade.qty.to_f64().is_finite()
+                || trade.qty.to_f64() <= 0.0
+            {
+                return Err(recovery_incomplete("invalid record"));
+            }
+            if let Some(old) = previous {
+                let old_id = old.id.unwrap();
+                if id == old_id
+                    && trade.time == old.time
+                    && trade.price == old.price
+                    && trade.qty == old.qty
+                    && trade.is_sell == old.is_sell
+                {
+                    continue;
+                }
+                if old_id.checked_add(1) != Some(id) || trade.time < old.time {
+                    return Err(recovery_incomplete(
+                        "ID gap, conflict or non-monotonic time",
+                    ));
+                }
+            }
+            if trade.time >= to {
+                return Ok(VerifiedTradeHistory {
+                    ticker,
+                    context,
+                    from,
+                    to,
+                    trades,
+                });
+            }
+            previous = Some(trade);
+            trades.push(trade);
+            if trades.len() > 100_000 {
+                return Err(recovery_incomplete("bounded recovery record limit"));
+            }
+        }
+        let next = previous
+            .and_then(|t| t.id)
+            .and_then(|id| id.checked_add(1))
+            .ok_or_else(|| recovery_incomplete("no cursor progress"))?;
+        cursor = TradePageCursor::AggregateId(next);
+    }
+    Err(recovery_incomplete("bounded recovery page limit"))
+}
+
+#[cfg(test)]
+mod ws03_tests {
+    use super::*;
+    use std::collections::VecDeque;
+    fn test_ticker() -> TickerInfo {
+        TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", Exchange::BinanceSpot),
+            0.1,
+            0.001,
+            None,
+        )
+    }
+    fn trade(id: u64, at: u64) -> Trade {
+        Trade {
+            id: Some(id),
+            time: UnixMs::new(at),
+            is_sell: id % 2 == 1,
+            price: exchange::unit::Price::from_f64(100.0),
+            qty: exchange::unit::Qty::from_f64(1.0),
+        }
+    }
+    #[tokio::test]
+    async fn ws03_id_paging_keeps_entire_saturated_millisecond_and_both_boundaries() {
+        let mut pages = VecDeque::from([
+            (0..1000).map(|id| trade(id, 1000)).collect::<Vec<_>>(),
+            vec![
+                trade(999, 1000),
+                trade(1000, 1000),
+                trade(1001, 1999),
+                trade(1002, 2000),
+            ],
+        ]);
+        let mut requests = Vec::new();
+        let full = collect_verified_trade_history(
+            test_ticker(),
+            QuantityContext::capture(),
+            UnixMs::new(1000),
+            UnixMs::new(2000),
+            |cursor| {
+                requests.push(cursor);
+                std::future::ready(Ok(pages.pop_front().expect("extra request")))
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(requests[0], exchange::adapter::TradePageCursor::Time(t) if t == UnixMs::new(1000))
+        );
+        assert!(matches!(
+            requests[1],
+            exchange::adapter::TradePageCursor::AggregateId(1000)
+        ));
+        assert_eq!(full.trades.len(), 1002);
+        assert_eq!(full.trades.first().unwrap().time, UnixMs::new(1000));
+        assert_eq!(full.trades.last().unwrap().time, UnixMs::new(1999));
+        let buy: f64 = full
+            .trades
+            .iter()
+            .filter(|t| !t.is_sell)
+            .map(|t| t.qty.to_f64())
+            .sum();
+        let sell: f64 = full
+            .trades
+            .iter()
+            .filter(|t| t.is_sell)
+            .map(|t| t.qty.to_f64())
+            .sum();
+        assert_eq!(
+            (buy, sell, buy + sell, buy - sell),
+            (501.0, 501.0, 1002.0, 0.0)
+        );
+    }
+    #[tokio::test]
+    async fn ws03_partial_id_gap_conflict_empty_and_error_never_yield_proof() {
+        for batch in [
+            vec![],
+            vec![trade(1, 1000), trade(3, 2000)],
+            vec![trade(1, 1000), trade(1, 1001)],
+            vec![trade(1, 1000)],
+        ] {
+            let mut pages = VecDeque::from([batch, vec![]]);
+            assert!(
+                collect_verified_trade_history(
+                    test_ticker(),
+                    QuantityContext::capture(),
+                    UnixMs::new(1000),
+                    UnixMs::new(2000),
+                    |_| { std::future::ready(Ok(pages.pop_front().unwrap_or_default())) }
+                )
+                .await
+                .is_err()
+            );
+        }
+        assert!(
+            collect_verified_trade_history(
+                test_ticker(),
+                QuantityContext::capture(),
+                UnixMs::new(1000),
+                UnixMs::new(2000),
+                |_| { std::future::ready(Err(recovery_incomplete("unsupported"))) }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            collect_verified_trade_history(
+                test_ticker(),
+                QuantityContext::capture(),
+                UnixMs::new(2000),
+                UnixMs::new(1000),
+                |_| { std::future::ready(Ok(vec![])) }
+            )
+            .await
+            .is_err()
+        );
+    }
+}

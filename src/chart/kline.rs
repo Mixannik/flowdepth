@@ -133,6 +133,25 @@ fn deduplicate_incoming_trades(
         .collect()
 }
 
+fn complete_model_buckets(ts: &TimeSeries<KlineDataPoint>, from: UnixMs, to: UnixMs) -> bool {
+    let interval = ts.interval.to_milliseconds();
+    if interval == 0
+        || from.floor_to(ts.interval) != from
+        || to.floor_to(ts.interval) != to
+        || from >= to
+    {
+        return false;
+    }
+    let mut next = from;
+    for (&time, _) in ts.datapoints.range(from..to) {
+        if time != next {
+            return false;
+        }
+        next = next.saturating_add(interval);
+    }
+    next == to
+}
+
 fn exclude_historical_overlap_with_live(
     incoming: Vec<Trade>,
     live_buckets: &FxHashSet<UnixMs>,
@@ -320,6 +339,8 @@ pub struct KlineChart {
     fetching_trades: (bool, Option<Handle>),
     pub(crate) kind: KlineChartKind,
     request_handler: RequestHandler,
+    ws_integrity_revision: Option<u64>,
+    recovered_trades: Option<crate::market_service::RecoveryToken>,
     study_configurator: study::Configurator<FootprintStudy>,
     last_tick: Instant,
     visual_config: Config,
@@ -476,6 +497,8 @@ impl KlineChart {
                     indicators,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
+                    ws_integrity_revision: None,
+                    recovered_trades: None,
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
@@ -561,6 +584,8 @@ impl KlineChart {
                     indicators,
                     fetching_trades: (false, None),
                     request_handler: RequestHandler::default(),
+                    ws_integrity_revision: None,
+                    recovered_trades: None,
                     kind: kind.clone(),
                     study_configurator: study::Configurator::new(),
                     last_tick: Instant::now(),
@@ -1193,6 +1218,170 @@ impl KlineChart {
         None
     }
 
+    /// Independent of historical coverage/loading. No Connected or Completed
+    /// event is evidence that a lost execution sequence has been repaired.
+    fn revoke_trade_recovery(&mut self) {
+        if let Some(proof) = self.recovered_trades.take() {
+            self.ws_integrity_revision = Some(proof.revision);
+        }
+    }
+
+    pub fn has_trade_recovery(&self, fault: &crate::market_service::IntegrityFault) -> bool {
+        self.recovered_trades.as_ref().is_some_and(|t| {
+            t.context.is_current()
+                && t.revision == fault.revision
+                && crate::market_service::same_integrity_source(&t.stream, &fault.stream)
+        })
+    }
+
+    pub fn trade_recovery_plan(
+        &self,
+        fault: &crate::market_service::IntegrityFault,
+        watermark: Option<UnixMs>,
+        pane: uuid::Uuid,
+        binding: uuid::Uuid,
+        context: exchange::unit::quantity_context::QuantityContext,
+    ) -> Option<crate::market_service::RecoveryToken> {
+        use exchange::adapter::{Exchange, RecoveryProof};
+        if fault.auxiliary
+            || !matches!(fault.stream, exchange::adapter::StreamKind::Trades { .. })
+            || self.has_trade_recovery(fault)
+            || !matches!(
+                self.chart.ticker_info.exchange(),
+                Exchange::BinanceSpot | Exchange::BinanceInverse
+            )
+            || self.chart.ticker_info.ticker != fault.stream.ticker_info().ticker
+        {
+            return None;
+        }
+        let PlotData::TimeBased(ts) = &self.data_source else {
+            return None;
+        };
+        let evidence = fault.resumed.as_ref()?;
+        let RecoveryProof::TradesResumed { last, .. } = evidence.proof else {
+            return None;
+        };
+        let from = fault.known_trade_from?.floor_to(ts.interval);
+        // Recover WHOLE CLOSED buckets, including BOTH boundary milliseconds.
+        // No raw/aggregate mixture and no racing forming bucket is allowed.
+        let to = last
+            .floor_to(ts.interval)
+            .saturating_add(ts.interval.to_milliseconds());
+        if watermark? < to
+            || to <= from
+            || to.saturating_diff(from) / ts.interval.to_milliseconds() > 1000
+            || !complete_model_buckets(ts, from, to)
+        {
+            return None;
+        }
+        Some(crate::market_service::RecoveryToken {
+            request: uuid::Uuid::new_v4(),
+            pane,
+            binding,
+            stream: fault.stream,
+            revision: fault.revision,
+            lost_session: fault.session,
+            lost_generation: fault.generation,
+            successor: evidence.source,
+            from,
+            to,
+            context,
+        })
+    }
+
+    /// Apply an uncached source proof atomically to complete existing buckets.
+    /// Partial fetches never call this method; no old data is removed on failure.
+    pub fn apply_trade_recovery(
+        &mut self,
+        token: &crate::market_service::RecoveryToken,
+        history: &fetcher::VerifiedTradeHistory,
+    ) -> Result<(), &'static str> {
+        if !token.context.is_current()
+            || token.context != history.context
+            || history.ticker != self.chart.ticker_info
+            || token.from != history.from
+            || token.to != history.to
+            || self.chart.ticker_info.ticker != token.stream.ticker_info().ticker
+            || !matches!(
+                self.chart.ticker_info.exchange(),
+                exchange::adapter::Exchange::BinanceSpot
+                    | exchange::adapter::Exchange::BinanceInverse
+            )
+        {
+            return Err("stale or incompatible source");
+        }
+        let PlotData::TimeBased(ts) = &self.data_source else {
+            return Err("tick charts unsupported");
+        };
+        if !complete_model_buckets(ts, token.from, token.to) {
+            return Err("model buckets missing");
+        }
+        let mut replacement = self
+            .raw_trades
+            .iter()
+            .filter(|t| t.time < token.from || t.time >= token.to)
+            .copied()
+            .collect::<Vec<_>>();
+        if replacement.len() + history.trades.len() > MAX_RAW_TRADES {
+            return Err("raw retention limit");
+        }
+        let incoming: FxHashMap<_, _> = history
+            .trades
+            .iter()
+            .filter_map(|t| t.id.map(|id| (id, t)))
+            .collect();
+        for old in &self.raw_trades {
+            if let Some(new) = old.id.and_then(|id| incoming.get(&id)) {
+                if old.time != new.time
+                    || old.price != new.price
+                    || old.qty != new.qty
+                    || old.is_sell != new.is_sell
+                {
+                    return Err("conflicting live/history aggregate identity");
+                }
+            } else if old.time >= token.from && old.time < token.to {
+                return Err("retained live record absent from source proof");
+            }
+        }
+        replacement.extend_from_slice(&history.trades);
+        replacement.sort_by_key(|t| (t.time, t.id));
+        let PlotData::TimeBased(ts) = &mut self.data_source else {
+            unreachable!()
+        };
+        for (&time, dp) in ts.datapoints.range_mut(token.from..token.to) {
+            dp.clear_trades();
+            dp.bubble_summary = BubbleVolumeSummary::default();
+            self.live_trade_buckets.insert(time);
+        }
+        ts.insert_trades_existing_buckets(&history.trades);
+        ts.mark_range_trades_complete(token.from, token.to.saturating_sub(1));
+        ts.update_poc_status();
+        self.raw_trades = replacement;
+        self.mark_trade_range_covered(token.from, token.to.saturating_sub(1));
+        for indicator in self.indicators.values_mut().filter_map(Option::as_mut) {
+            indicator.rebuild_from_source(&self.data_source);
+            indicator.clear_all_caches();
+        }
+        self.recovered_trades = Some(token.clone());
+        self.profile_calculations.dirty = true;
+        self.chart.cache.clear_all();
+        Ok(())
+    }
+
+    pub fn set_ws_integrity_revision(&mut self, revision: Option<u64>) {
+        if self.ws_integrity_revision == revision {
+            return;
+        }
+        self.ws_integrity_revision = revision;
+        if revision.is_some() {
+            self.request_handler
+                .supersede_all_pending("ws_integrity_lost");
+            // Dropping the handle cancels the running per-chart trade worker.
+            self.fetching_trades = (false, None);
+        }
+        self.chart.cache.clear_all();
+    }
+
     pub fn reset_request_handler(&mut self) {
         self.profile_calculations.dirty = true;
         let old_generation = self.request_handler.generation_id();
@@ -1219,6 +1408,7 @@ impl KlineChart {
     /// Drops all derived historical market data so it is rebuilt from a fresh
     /// persistent-cache/network pass on the next chart tick.
     pub fn invalidate_market_data_cache(&mut self) {
+        self.revoke_trade_recovery();
         self.profile_calculations.dirty = true;
         self.request_handler = RequestHandler::default();
         log::warn!("CHART Reset | reason=cache_invalidated request_history=discarded");
@@ -1901,6 +2091,7 @@ impl KlineChart {
     }
 
     pub fn change_tick_size(&mut self, new_step: PriceStep) {
+        self.revoke_trade_recovery();
         self.profile_calculations.dirty = true;
         let chart = self.mut_state();
 
@@ -1925,6 +2116,7 @@ impl KlineChart {
     }
 
     pub fn set_basis(&mut self, new_basis: Basis) -> Option<Action> {
+        self.revoke_trade_recovery();
         self.profile_calculations.dirty = true;
         let previous_basis = self.chart.basis;
 
@@ -1988,6 +2180,22 @@ impl KlineChart {
     }
 
     pub fn insert_trades(&mut self, buffer: &[Trade]) {
+        if let Some(recovered) = &self.recovered_trades
+            && buffer.iter().any(|t| {
+                t.time >= recovered.from
+                    && t.time < recovered.to
+                    && !self.raw_trades.iter().any(|old| {
+                        old.id == t.id
+                            && old.time == t.time
+                            && old.price == t.price
+                            && old.qty == t.qty
+                            && old.is_sell == t.is_sell
+                    })
+            })
+        {
+            self.ws_integrity_revision = Some(recovered.revision);
+            self.recovered_trades = None;
+        }
         self.profile_calculations.dirty = true;
         let buffer = deduplicate_incoming_trades(
             &self.raw_trades,
@@ -2448,6 +2656,9 @@ impl KlineChart {
     /// Levels of this chart's fixed-range profiles that continue to the right edge, for
     /// this chart and for the other charts of its ticker.
     pub fn range_levels(&self) -> Vec<range_levels::RangeLevels> {
+        if self.ws_integrity_revision.is_some() {
+            return Vec::new();
+        }
         self.prepared_range_levels()
     }
 
@@ -3151,30 +3362,33 @@ impl canvas::Program<Message> for KlineChart {
                         },
                     );
 
-                    let signals = studies.iter().find_map(|study| match study {
-                        FootprintStudy::Signals {
-                            absorption,
-                            trapped,
-                            exhaustion,
-                            stacked,
-                            unfinished,
-                            near_levels,
-                            failed_auctions,
-                        } => Some((
-                            signals::Enabled {
-                                absorption: *absorption,
-                                trapped: *trapped,
-                                exhaustion: *exhaustion,
-                            },
-                            zones::Enabled {
-                                stacked: *stacked,
-                                unfinished: *unfinished,
-                            },
-                            *near_levels,
-                            *failed_auctions,
-                        )),
-                        _ => None,
-                    });
+                    let signals = studies
+                        .iter()
+                        .find_map(|study| match study {
+                            FootprintStudy::Signals {
+                                absorption,
+                                trapped,
+                                exhaustion,
+                                stacked,
+                                unfinished,
+                                near_levels,
+                                failed_auctions,
+                            } => Some((
+                                signals::Enabled {
+                                    absorption: *absorption,
+                                    trapped: *trapped,
+                                    exhaustion: *exhaustion,
+                                },
+                                zones::Enabled {
+                                    stacked: *stacked,
+                                    unfinished: *unfinished,
+                                },
+                                *near_levels,
+                                *failed_auctions,
+                            )),
+                            _ => None,
+                        })
+                        .filter(|_| self.ws_integrity_revision.is_none());
                     if self.indicator_enabled(KlineIndicator::OiBars)
                         && let Some(oi) = self.indicators[KlineIndicator::OpenInterest]
                             .as_ref()
@@ -7977,6 +8191,203 @@ mod tests {
             &KlineChartKind::Candles,
             visual_config,
         )
+    }
+
+    #[test]
+    fn ws_integrity_cancels_requests_and_preserves_trades_coverage_and_quarantine_on_completion() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        let from = UnixMs::new(1000);
+        let to = UnixMs::new(2000);
+        chart.mark_trade_range_covered(from, to);
+        chart.insert_trades(&[test_trade(1, 1200, 2.0)]);
+        let before = chart.raw_trades.len();
+        let req = uuid::Uuid::new_v4();
+        assert!(chart.register_backfill_request(
+            req,
+            FetchRange::Trades(UnixMs::new(3000), UnixMs::new(4000))
+        ));
+        let generation = chart.current_generation();
+        chart.set_ws_integrity_revision(Some(1));
+        assert!(chart.current_generation() > generation);
+        assert!(chart.is_fetch_stale(req));
+        assert_eq!(chart.raw_trades.len(), before);
+        assert!(chart.covered_trade_ranges.contains(&(from, to)));
+        chart.complete_backfill(None, Default::default());
+        assert_eq!(chart.ws_integrity_revision, Some(1));
+        assert!(chart.range_levels().is_empty());
+        let generation = chart.current_generation();
+        chart.set_ws_integrity_revision(Some(1));
+        assert_eq!(chart.current_generation(), generation);
+        chart.set_ws_integrity_revision(Some(2));
+        assert!(chart.current_generation() > generation);
+    }
+
+    fn ws03_spot_chart() -> KlineChart {
+        let ticker = TickerInfo::new(
+            exchange::Ticker::new("BTCUSDT", exchange::adapter::Exchange::BinanceSpot),
+            0.1,
+            0.001,
+            None,
+        );
+        let bars = [0, 300000].map(|at| Kline {
+            time: UnixMs::new(at),
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(101.0),
+            low: Price::from_f64(99.0),
+            close: Price::from_f64(100.0),
+            volume: exchange::Volume::TotalOnly(Qty::from_f64(14.0)),
+        });
+        KlineChart::new(
+            ViewConfig::default(),
+            Basis::Time(exchange::Timeframe::M5),
+            PriceStep::from(ticker.min_ticksize),
+            &bars,
+            vec![],
+            &[],
+            ticker,
+            &KlineChartKind::Candles,
+            None,
+        )
+    }
+    fn ws03_token(chart: &KlineChart) -> crate::market_service::RecoveryToken {
+        use exchange::adapter::{StreamKind, WsGeneration, WsSessionId, WsSource};
+        crate::market_service::RecoveryToken {
+            request: uuid::Uuid::new_v4(),
+            pane: uuid::Uuid::new_v4(),
+            binding: uuid::Uuid::new_v4(),
+            stream: StreamKind::Trades {
+                ticker_info: chart.chart.ticker_info,
+            },
+            revision: 1,
+            lost_session: WsSessionId(7),
+            lost_generation: WsGeneration(2),
+            successor: WsSource {
+                session: WsSessionId(7),
+                generation: WsGeneration(3),
+                auxiliary: false,
+            },
+            from: UnixMs::ZERO,
+            to: UnixMs::new(300000),
+            context: exchange::unit::quantity_context::QuantityContext::capture(),
+        }
+    }
+    #[test]
+    fn ws03_atomic_overlap_rebuild_preserves_sides_boundaries_and_unaffected_bucket() {
+        let mut chart = ws03_spot_chart();
+        let token = ws03_token(&chart);
+        let mut right = test_trade(4, 299999, 5.0);
+        right.is_sell = true;
+        let left = test_trade(1, 0, 2.0);
+        let outside = test_trade(5, 300000, 7.0);
+        chart.insert_trades(&[left, right, outside]);
+        let mut missing_sell = test_trade(3, 1000, 4.0);
+        missing_sell.is_sell = true;
+        let history = fetcher::VerifiedTradeHistory {
+            ticker: chart.chart.ticker_info,
+            context: token.context,
+            from: token.from,
+            to: token.to,
+            trades: vec![left, test_trade(2, 1000, 3.0), missing_sell, right],
+        };
+        chart.set_ws_integrity_revision(Some(1));
+        chart.apply_trade_recovery(&token, &history).unwrap();
+        let PlotData::TimeBased(ts) = &chart.data_source else {
+            panic!()
+        };
+        let totals = |at| {
+            ts.datapoints[&UnixMs::new(at)]
+                .footprint
+                .trades
+                .values()
+                .fold((0.0, 0.0), |(buy, sell), row| {
+                    (buy + row.buy_qty.to_f64(), sell + row.sell_qty.to_f64())
+                })
+        };
+        assert_eq!(totals(0), (5.0, 9.0));
+        assert_eq!(totals(300000), (7.0, 0.0));
+        assert_eq!(
+            ts.datapoints[&UnixMs::ZERO].trade_coverage,
+            data::chart::kline::TradeCoverage::Complete
+        );
+        assert_eq!(chart.raw_trades.len(), 5);
+        // Redelivery and a later legacy history batch cannot double-count the repaired range.
+        chart.insert_trades(&[left, right]);
+        chart.insert_raw_trades(history.trades.clone(), true);
+        assert_eq!(chart.raw_trades.len(), 5);
+        let PlotData::TimeBased(ts) = &chart.data_source else {
+            panic!()
+        };
+        let dp = &ts.datapoints[&UnixMs::ZERO];
+        assert_eq!(
+            dp.footprint
+                .trades
+                .values()
+                .map(|r| r.total_qty().to_f64())
+                .sum::<f64>(),
+            14.0
+        );
+        assert_eq!(
+            dp.footprint
+                .trades
+                .values()
+                .map(|r| r.delta_qty().to_f64())
+                .sum::<f64>(),
+            -4.0
+        );
+        let mut transformed = ws03_spot_chart();
+        transformed.apply_trade_recovery(&token, &history).unwrap();
+        assert!(transformed.recovered_trades.is_some());
+        let _ = transformed.set_basis(Basis::Time(exchange::Timeframe::M1));
+        assert!(transformed.recovered_trades.is_none());
+        assert_eq!(transformed.ws_integrity_revision, Some(1));
+        // An absent late execution is new evidence of incompleteness, not a silent add.
+        chart.insert_trades(&[test_trade(99, 299999, 1.0)]);
+        assert!(chart.recovered_trades.is_none());
+        assert_eq!(chart.ws_integrity_revision, Some(1));
+    }
+    #[test]
+    fn ws03_conflict_missing_bucket_and_unknown_bounds_never_replace_data() {
+        let mut chart = ws03_spot_chart();
+        let token = ws03_token(&chart);
+        chart.insert_trades(&[test_trade(1, 0, 2.0)]);
+        let bad = fetcher::VerifiedTradeHistory {
+            ticker: chart.chart.ticker_info,
+            context: token.context,
+            from: token.from,
+            to: token.to,
+            trades: vec![test_trade(1, 0, 9.0)],
+        };
+        assert!(chart.apply_trade_recovery(&token, &bad).is_err());
+        assert_eq!(chart.raw_trades[0].qty, Qty::from_f64(2.0));
+        assert!(chart.recovered_trades.is_none());
+        let PlotData::TimeBased(ts) = &mut chart.data_source else {
+            panic!()
+        };
+        ts.datapoints.remove(&UnixMs::ZERO);
+        assert!(chart.apply_trade_recovery(&token, &bad).is_err());
+        use exchange::adapter::{WsGeneration, WsSessionId};
+        let fault = crate::market_service::IntegrityFault {
+            stream: token.stream,
+            auxiliary: false,
+            session: WsSessionId(7),
+            generation: WsGeneration(2),
+            revision: 1,
+            first_detected_at: UnixMs::new(1),
+            known_trade_from: None,
+            resumed: None,
+            current_books: Vec::new(),
+        };
+        assert!(
+            chart
+                .trade_recovery_plan(
+                    &fault,
+                    Some(UnixMs::new(300000)),
+                    token.pane,
+                    token.binding,
+                    token.context
+                )
+                .is_none()
+        );
     }
 
     fn fixed_profile_drawing(from: u64, to: u64) -> data::chart::kline::drawing::Drawing {

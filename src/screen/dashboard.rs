@@ -42,6 +42,13 @@ use iced::{
 };
 use std::{collections::HashMap, sync::Arc, time::Instant, vec};
 
+/// Ownership fence for existing backfill tasks; not proof of data recovery.
+#[derive(Debug, Clone)]
+pub struct BackfillFence {
+    integrity_revision: u64,
+    pane_bindings: Vec<(uuid::Uuid, uuid::Uuid)>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     HistoryUnavailable {
@@ -79,7 +86,7 @@ pub enum Message {
         data: FetchedData,
     },
     BackfillFetchUpdate {
-        pane_ids: Vec<uuid::Uuid>,
+        fence: BackfillFence,
         stream: StreamKind,
         show_activity: bool,
         update: fetcher::FetchUpdate,
@@ -113,7 +120,8 @@ pub struct Dashboard {
     pending_backfills: HashMap<(StreamKind, u64, u64), std::time::Instant>,
     /// Abort handles for active backfill trade tasks. Stored to prevent
     /// the tasks from being aborted when the handle is dropped prematurely.
-    backfill_handles: Vec<iced::task::Handle>,
+    backfill_handles: Vec<(StreamKind, iced::task::Handle)>,
+    ws_integrity_revisions: HashMap<StreamKind, u64>,
     /// Pending WS disconnect awaiting reconnect to compute real backfill gap.
     pending_disconnect: Option<PendingDisconnect>,
 }
@@ -147,6 +155,7 @@ impl Default for Dashboard {
             last_live_t: HashMap::new(),
             pending_backfills: HashMap::new(),
             backfill_handles: Vec::new(),
+            ws_integrity_revisions: HashMap::new(),
             pending_disconnect: None,
         }
     }
@@ -634,6 +643,7 @@ impl Dashboard {
             last_live_t: HashMap::new(),
             pending_backfills: HashMap::new(),
             backfill_handles: Vec::new(),
+            ws_integrity_revisions: HashMap::new(),
             pending_disconnect: None,
         }
     }
@@ -1075,12 +1085,18 @@ impl Dashboard {
                 );
             }
             Message::BackfillFetchUpdate {
-                pane_ids,
+                fence,
                 stream,
                 show_activity,
                 update,
             } => {
-                self.apply_backfill_update(main_window.id, pane_ids, stream, show_activity, update);
+                self.apply_fenced_backfill_update(
+                    main_window.id,
+                    fence,
+                    stream,
+                    show_activity,
+                    update,
+                );
             }
             Message::ResolveStreams(pane_id, streams) => {
                 return (
@@ -1788,6 +1804,109 @@ impl Dashboard {
             });
     }
 
+    pub fn trade_recovery_plans(
+        &self,
+        main_window: window::Id,
+        integrity: &crate::market_service::MarketIntegrity,
+        context: exchange::unit::quantity_context::QuantityContext,
+    ) -> Vec<crate::market_service::RecoveryToken> {
+        self.iter_all_panes(main_window)
+            .flat_map(|(_, _, state)| {
+                integrity.faults().iter().filter_map(move |fault| {
+                    let pane::Content::Kline {
+                        chart: Some(chart), ..
+                    } = &state.content
+                    else {
+                        return None;
+                    };
+                    if !state.matches_stream(&fault.stream) {
+                        return None;
+                    }
+                    chart.trade_recovery_plan(
+                        fault,
+                        integrity.watermark(&fault.stream),
+                        state.unique_id(),
+                        state.backfill_binding(),
+                        context,
+                    )
+                })
+            })
+            .collect()
+    }
+
+    pub fn has_recovery_owner(
+        &self,
+        main_window: window::Id,
+        token: &crate::market_service::RecoveryToken,
+    ) -> bool {
+        self.get_pane_state_by_uuid(main_window, token.pane)
+            .is_some_and(|state| {
+                state.backfill_binding() == token.binding
+                    && state.matches_stream(&token.stream)
+                    && matches!(state.content, pane::Content::Kline { chart: Some(_), .. })
+            })
+    }
+
+    pub fn apply_trade_recovery(
+        &mut self,
+        main_window: window::Id,
+        token: &crate::market_service::RecoveryToken,
+        history: &fetcher::VerifiedTradeHistory,
+    ) -> Result<(), &'static str> {
+        if !self.has_recovery_owner(main_window, token) {
+            return Err("stale recovery consumer");
+        }
+        let state = self
+            .get_mut_pane_state_by_uuid(main_window, token.pane)
+            .ok_or("removed consumer")?;
+        let pane::Content::Kline {
+            chart: Some(chart), ..
+        } = &mut state.content
+        else {
+            return Err("unsupported consumer");
+        };
+        chart.apply_trade_recovery(token, history)
+    }
+
+    fn ws_integrity_revision(&self, stream: StreamKind) -> u64 {
+        self.ws_integrity_revisions
+            .iter()
+            .filter(|(source, _)| crate::market_service::same_integrity_source(source, &stream))
+            .map(|(_, revision)| *revision)
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn sync_ws_integrity(
+        &mut self,
+        main_window: window::Id,
+        faults: &[crate::market_service::IntegrityFault],
+    ) {
+        let mut changed = Vec::new();
+        for fault in faults.iter().filter(|fault| !fault.auxiliary) {
+            if self.ws_integrity_revision(fault.stream) < fault.revision {
+                self.ws_integrity_revisions
+                    .insert(fault.stream, fault.revision);
+                changed.push(fault.stream);
+            }
+        }
+        if !changed.is_empty() {
+            // Cancellation only; range selection, cache and repair algorithms stay unchanged.
+            self.backfill_handles.retain(|(stream, _)| {
+                !changed
+                    .iter()
+                    .any(|changed| crate::market_service::same_integrity_source(changed, stream))
+            });
+            self.pending_backfills.retain(|(stream, _, _), _| {
+                !changed
+                    .iter()
+                    .any(|changed| crate::market_service::same_integrity_source(changed, stream))
+            });
+        }
+        self.iter_all_panes_mut(main_window)
+            .for_each(|(_, _, state)| state.sync_ws_integrity(faults));
+    }
+
     pub fn invalidate_market_data_cache(&mut self, main_window: &Window) {
         // Dropping the handles aborts old backfill workers so they cannot
         // repopulate the cache immediately after it has been cleared.
@@ -2062,6 +2181,31 @@ impl Dashboard {
         pane_state.status = pane::Status::Ready;
     }
 
+    fn apply_fenced_backfill_update(
+        &mut self,
+        main_window: window::Id,
+        fence: BackfillFence,
+        stream: StreamKind,
+        show_activity: bool,
+        update: fetcher::FetchUpdate,
+    ) {
+        if fence.integrity_revision != self.ws_integrity_revision(stream) {
+            return;
+        }
+        let pane_ids = fence
+            .pane_bindings
+            .into_iter()
+            .filter_map(|(id, binding)| {
+                self.get_pane_state_by_uuid(main_window, id)
+                    .filter(|state| {
+                        state.matches_stream(&stream) && state.backfill_binding() == binding
+                    })
+                    .map(|_| id)
+            })
+            .collect();
+        self.apply_backfill_update(main_window, pane_ids, stream, show_activity, update);
+    }
+
     fn apply_backfill_update(
         &mut self,
         main_window: window::Id,
@@ -2334,7 +2478,9 @@ impl Dashboard {
                     }
                 }
 
-                if let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id) {
+                if pane_ids.contains(&pane_id)
+                    && let Some(pane_state) = self.get_mut_pane_state_by_uuid(main_window, pane_id)
+                {
                     pane_state.status = pane::Status::Ready;
                     pane_state.notifications.push(Toast::error(
                         DashboardError::Fetch(error, req_id).to_string(),
@@ -3185,7 +3331,7 @@ impl Dashboard {
         }
 
         let mut fetch_tasks: Vec<Task<Message>> = Vec::new();
-        let mut new_backfill_handles: Vec<iced::task::Handle> = Vec::new();
+        let mut new_backfill_handles: Vec<(StreamKind, iced::task::Handle)> = Vec::new();
 
         for stream in streams {
             // Depth streams are stateful snapshots — no historical gap to fill.
@@ -3399,7 +3545,7 @@ impl Dashboard {
                         &mut |handle| {
                             // Store the abort handle to prevent the backfill
                             // task from being aborted while it is queued.
-                            new_backfill_handles.push(handle);
+                            new_backfill_handles.push((*stream, handle));
                         },
                         0,
                     );
@@ -3412,9 +3558,20 @@ impl Dashboard {
                         target_panes.len()
                     );
 
+                    let integrity_revision = self.ws_integrity_revision(stream_kind);
+                    let pane_bindings = target_panes
+                        .iter()
+                        .filter_map(|id| {
+                            self.get_pane_state_by_uuid(main_window, *id)
+                                .map(|state| (*id, state.backfill_binding()))
+                        })
+                        .collect::<Vec<_>>();
                     sequential_task = sequential_task.chain(task.map(move |update| {
                         Message::BackfillFetchUpdate {
-                            pane_ids: target_panes.clone(),
+                            fence: BackfillFence {
+                                pane_bindings: pane_bindings.clone(),
+                                integrity_revision,
+                            },
                             stream: stream_kind,
                             show_activity,
                             update,
@@ -3793,5 +3950,127 @@ mod startup_load_status_tests {
         assert_eq!(status.initializing_panes, 0);
         assert_eq!(status.loading_panes, 0);
         assert!(status.is_ready());
+    }
+}
+
+#[cfg(test)]
+mod ws_integrity_tests {
+    use super::*;
+    use crate::market_service::IntegrityFault;
+    use exchange::{
+        Ticker,
+        adapter::{Exchange, WsGeneration, WsSessionId},
+    };
+
+    fn stream(symbol: &str) -> StreamKind {
+        StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new(symbol, Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        }
+    }
+    fn fault(stream: StreamKind, revision: u64) -> IntegrityFault {
+        IntegrityFault {
+            stream,
+            auxiliary: false,
+            session: WsSessionId(1),
+            generation: WsGeneration(revision),
+            revision,
+            first_detected_at: UnixMs::new(100),
+            known_trade_from: None,
+            resumed: None,
+            current_books: Vec::new(),
+        }
+    }
+    fn failure(id: uuid::Uuid, from: u64, to: u64) -> fetcher::FetchUpdate {
+        fetcher::FetchUpdate::Error {
+            pane_id: id,
+            error: "old recovery failed".into(),
+            req_id: None,
+            fetch: Some(FetchRange::Trades(UnixMs::new(from), UnixMs::new(to))),
+        }
+    }
+
+    #[test]
+    fn repeated_loss_fences_old_backfill_without_clearing_new_pending_or_other_symbol() {
+        let window = window::Id::unique();
+        let btc = stream("BTCUSDT");
+        let eth = stream("ETHUSDT");
+        let mut dashboard = Dashboard::default();
+        let id = dashboard.panes.iter().next().unwrap().1.unique_id();
+        let binding = dashboard.panes.iter().next().unwrap().1.backfill_binding();
+        dashboard
+            .get_mut_pane_state_by_uuid(window, id)
+            .unwrap()
+            .streams = ResolvedStream::Ready(vec![btc]);
+        dashboard.sync_ws_integrity(window, &[fault(btc, 1)]);
+        let old = BackfillFence {
+            integrity_revision: 1,
+            pane_bindings: vec![(id, binding)],
+        };
+        dashboard
+            .pending_backfills
+            .insert((eth, 10, 20), Instant::now());
+        dashboard.sync_ws_integrity(window, &[fault(btc, 2)]);
+        dashboard
+            .pending_backfills
+            .insert((btc, 10, 20), Instant::now());
+        dashboard.apply_fenced_backfill_update(window, old.clone(), btc, true, failure(id, 10, 20));
+        dashboard.apply_fenced_backfill_update(
+            window,
+            old,
+            btc,
+            true,
+            fetcher::FetchUpdate::Status {
+                pane_id: id,
+                status: fetcher::FetchTaskStatus::Completed {
+                    req_id: None,
+                    fetch: Some(FetchRange::Trades(UnixMs::new(10), UnixMs::new(20))),
+                    trade_outcome: Some(Default::default()),
+                },
+            },
+        );
+        assert!(dashboard.pending_backfills.contains_key(&(btc, 10, 20)));
+        assert!(dashboard.pending_backfills.contains_key(&(eth, 10, 20)));
+        assert!(
+            dashboard
+                .get_pane_state_by_uuid(window, id)
+                .unwrap()
+                .notifications
+                .is_empty()
+        );
+        assert_eq!(dashboard.ws_integrity_revision(btc), 2);
+    }
+
+    #[test]
+    fn backfill_for_previous_panel_binding_cannot_touch_reconfigured_panel() {
+        let window = window::Id::unique();
+        let btc = stream("BTCUSDT");
+        let mut dashboard = Dashboard::default();
+        let id = dashboard.panes.iter().next().unwrap().1.unique_id();
+        let binding = dashboard.panes.iter().next().unwrap().1.backfill_binding();
+        let fence = BackfillFence {
+            integrity_revision: 0,
+            pane_bindings: vec![(id, binding)],
+        };
+        let state = dashboard.get_mut_pane_state_by_uuid(window, id).unwrap();
+        let _ = state.set_content_and_streams(
+            vec![stream("ETHUSDT").ticker_info()],
+            ContentKind::TimeAndSales,
+        );
+        let _ = state.set_content_and_streams(vec![btc.ticker_info()], ContentKind::TimeAndSales);
+        state.streams = ResolvedStream::Ready(vec![btc]);
+        assert_ne!(binding, state.backfill_binding());
+        dashboard.apply_fenced_backfill_update(window, fence, btc, true, failure(id, 10, 20));
+        assert!(
+            dashboard
+                .get_pane_state_by_uuid(window, id)
+                .unwrap()
+                .notifications
+                .is_empty()
+        );
     }
 }

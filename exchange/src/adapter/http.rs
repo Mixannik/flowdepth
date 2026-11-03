@@ -49,6 +49,11 @@ pub(super) enum FetchCommand<M> {
         ticker: Ticker,
         reply: ResponseTx<DepthPayload>,
     },
+    RecoveryTradePage {
+        ticker: TickerInfo,
+        cursor: crate::adapter::TradePageCursor,
+        reply: ResponseTx<Vec<Trade>>,
+    },
     Trades {
         ticker: TickerInfo,
         from_time: UnixMs,
@@ -349,6 +354,15 @@ pub(super) trait FetchCommandHandler<M> {
         Box::pin(async { Err(unsupported_fetch("Depth snapshot fetch")) })
     }
 
+    fn fetch_recovery_trade_page(
+        &mut self,
+        ticker: TickerInfo,
+        cursor: crate::adapter::TradePageCursor,
+    ) -> BoxFuture<'_, Result<Vec<Trade>, AdapterError>> {
+        let _ = (ticker, cursor);
+        Box::pin(async { Err(unsupported_fetch("Verified aggregate trade pages")) })
+    }
+
     fn fetch_trades(
         &mut self,
         ticker_info: TickerInfo,
@@ -428,6 +442,14 @@ where
         }
         FetchCommand::DepthSnapshot { ticker, reply } => {
             let result = handler.fetch_depth_snapshot(ticker).await;
+            let _ = reply.send(result);
+        }
+        FetchCommand::RecoveryTradePage {
+            ticker,
+            cursor,
+            reply,
+        } => {
+            let result = handler.fetch_recovery_trade_page(ticker, cursor).await;
             let _ = reply.send(result);
         }
         FetchCommand::Trades {

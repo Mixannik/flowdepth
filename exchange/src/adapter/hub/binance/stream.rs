@@ -889,6 +889,16 @@ struct DepthAdapter {
 }
 
 impl WsAdapter for DepthAdapter {
+    fn book_sync_proof(&self) -> Option<(StreamKind, crate::UnixMs, u64)> {
+        (matches!(self.sync_machine.state, DepthSyncState::Live)
+            && self.sync_machine.current.last_update_id > 0)
+            .then_some((
+                self.stream,
+                self.sync_machine.current.time,
+                self.sync_machine.current.last_update_id,
+            ))
+    }
+
     fn heartbeat_policy(&self) -> HeartbeatPolicy {
         binance_heartbeat_policy(self.market)
     }

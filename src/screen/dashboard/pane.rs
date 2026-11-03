@@ -187,6 +187,8 @@ pub struct State {
     pub notifications: Vec<Toast>,
     pub streams: ResolvedStream,
     pub status: Status,
+    ws_integrity_faults: Vec<crate::market_service::IntegrityFault>,
+    backfill_binding: uuid::Uuid,
     history_warnings: Vec<(Option<crate::connector::fetcher::FetchRange>, String)>,
     pub link_group: Option<LinkGroup>,
     gex_liquidity_missing_logged: bool,
@@ -445,6 +447,7 @@ impl State {
         tickers: Vec<TickerInfo>,
         kind: ContentKind,
     ) -> Vec<StreamKind> {
+        self.backfill_binding = uuid::Uuid::new_v4();
         self.history_warnings.clear();
         if !(self.content.kind() == kind) {
             self.settings.selected_basis = None;
@@ -981,6 +984,72 @@ impl State {
         } = &mut self.content
         {
             chart.mark_request_failed(req_id, error);
+        }
+    }
+
+    pub fn backfill_binding(&self) -> uuid::Uuid {
+        self.backfill_binding
+    }
+
+    pub fn sync_ws_integrity(&mut self, faults: &[crate::market_service::IntegrityFault]) {
+        let liquidations = matches!(self.content, Content::TimeAndSales(_));
+        self.ws_integrity_faults = faults
+            .iter()
+            .filter(|fault| {
+                (match &self.streams {
+                    ResolvedStream::Ready(streams) => streams.iter().any(|stream| {
+                        crate::market_service::same_integrity_source(stream, &fault.stream)
+                    }),
+                    ResolvedStream::Waiting { streams, .. }
+                    | ResolvedStream::Blocked { streams, .. } => streams.iter().any(|persisted| {
+                        persisted
+                            .clone()
+                            .into_stream_kinds(|ticker| {
+                                (*ticker == fault.stream.ticker_info().ticker)
+                                    .then_some(fault.stream.ticker_info())
+                            })
+                            .is_ok_and(|streams| {
+                                streams.iter().any(|stream| {
+                                    crate::market_service::same_integrity_source(
+                                        stream,
+                                        &fault.stream,
+                                    )
+                                })
+                            })
+                    }),
+                }) && (!fault.auxiliary || liquidations)
+            })
+            .cloned()
+            .collect();
+        // A model proof belongs to this chart instance, not every consumer of
+        // the same symbol. A current book proof heals only a ladder's current view.
+        let current_streams = self
+            .streams
+            .ready_iter()
+            .map(|s| s.copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        self.ws_integrity_faults
+            .retain(|fault| match &self.content {
+                Content::Kline {
+                    chart: Some(chart), ..
+                } if !fault.auxiliary => !chart.has_trade_recovery(fault),
+                Content::Ladder(_) if matches!(fault.stream, StreamKind::Depth { .. }) => !fault
+                    .current_books
+                    .iter()
+                    .any(|proof| current_streams.contains(&proof.stream)),
+                _ => true,
+            });
+        let revision = self
+            .ws_integrity_faults
+            .iter()
+            .filter(|f| !f.auxiliary)
+            .map(|f| f.revision)
+            .max();
+        if let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut self.content
+        {
+            chart.set_ws_integrity_revision(revision);
         }
     }
 
@@ -1636,6 +1705,29 @@ impl State {
                 tooltip::Position::Bottom,
             ));
         }
+        if !self.ws_integrity_faults.is_empty() {
+            let details = self.ws_integrity_faults.iter().map(|fault| format!(
+                "{}: {}. Session {}, generation {}. Data incomplete; recovery not verified.",
+                crate::connector::fetcher::format_stream(&fault.stream),
+                if fault.auxiliary { "liquidation history incomplete; no replay proof" }
+                else if matches!(fault.stream, StreamKind::Depth { .. }) {
+                    if fault.current_books.iter().any(|proof| self.matches_stream(&proof.stream)) { "current book synchronized; book history/raw sequence still incomplete" }
+                    else { "current book unsynchronized; book history/raw sequence incomplete" }
+                } else if matches!(fault.stream, StreamKind::Trades { .. }) && fault.stream.ticker_info().exchange() == exchange::adapter::Exchange::BinanceLinear {
+                    "raw trade history incomplete; aggregate backfill cannot prove raw recovery"
+                } else { "history incomplete; dependent signals blocked" },
+                fault.session.0, fault.generation.0,
+            )).collect::<Vec<_>>().join("\n");
+            top_left_buttons = top_left_buttons.push(iced::widget::tooltip(
+                text("WS data incomplete").size(12).style(|theme: &Theme| {
+                    iced::widget::text::Style {
+                        color: Some(theme.palette().warning.base.color),
+                    }
+                }),
+                container(text(details)).padding(8).style(style::tooltip),
+                tooltip::Position::Bottom,
+            ));
+        }
         let mut data_warnings = match &self.content {
             Content::Kline {
                 chart: Some(chart), ..
@@ -2218,6 +2310,7 @@ impl State {
                                 }
                             }
                             modal::stream::Action::BasisSelected(new_basis) => {
+                                self.backfill_binding = uuid::Uuid::new_v4();
                                 modifier.update_kind_with_basis(new_basis);
                                 self.settings.selected_basis = Some(new_basis);
 
@@ -2924,6 +3017,8 @@ impl Default for State {
             streams: ResolvedStream::waiting(vec![]),
             notifications: vec![],
             status: Status::Ready,
+            ws_integrity_faults: Vec::new(),
+            backfill_binding: uuid::Uuid::new_v4(),
             history_warnings: Vec::new(),
             link_group: None,
             gex_liquidity_missing_logged: false,
@@ -3620,6 +3715,178 @@ mod tests {
             0.001,
             None,
         )
+    }
+
+    #[test]
+    fn ws_integrity_survives_toast_dismissal_and_history_completion_and_is_auxiliary_scoped() {
+        let stream = StreamKind::Trades {
+            ticker_info: ticker(),
+        };
+        let mut state = State::default();
+        state.streams = ResolvedStream::Ready(vec![stream]);
+        let mut fault = crate::market_service::IntegrityFault {
+            stream,
+            auxiliary: true,
+            session: exchange::adapter::WsSessionId(1),
+            generation: exchange::adapter::WsGeneration(1),
+            revision: 1,
+            first_detected_at: UnixMs::new(100),
+            known_trade_from: None,
+            resumed: None,
+            current_books: Vec::new(),
+        };
+        state.sync_ws_integrity(&[fault.clone()]);
+        assert!(state.ws_integrity_faults.is_empty());
+        state.content = Content::TimeAndSales(None);
+        state.sync_ws_integrity(&[fault.clone()]);
+        assert_eq!(state.ws_integrity_faults, vec![fault.clone()]);
+        state.notifications.clear();
+        state.mark_backfill_completed(None, Default::default());
+        state.clear_history_warning(None);
+        assert_eq!(state.ws_integrity_faults, vec![fault.clone()]);
+        fault.auxiliary = false;
+        fault.revision = 2;
+        state.sync_ws_integrity(&[fault.clone()]);
+        assert_eq!(state.ws_integrity_faults, vec![fault.clone()]);
+        state.streams = ResolvedStream::waiting(vec![stream.into()]);
+        state.sync_ws_integrity(&[fault.clone()]);
+        assert_eq!(state.ws_integrity_faults, vec![fault]);
+    }
+
+    #[test]
+    fn ws03_current_book_unlocks_only_ladder_and_verified_trade_history_only_its_chart() {
+        use exchange::adapter::{
+            RecoveryProof, WsGeneration, WsRecoveryEvidence, WsSessionId, WsSource,
+        };
+        use exchange::unit::Price;
+        let ti = TickerInfo::new(
+            Ticker::new("BTCUSDT", Exchange::BinanceSpot),
+            0.1,
+            0.001,
+            None,
+        );
+        let depth = StreamKind::Depth {
+            ticker_info: ti,
+            depth_aggr: Default::default(),
+            push_freq: Default::default(),
+        };
+        let proof = WsRecoveryEvidence {
+            source: WsSource {
+                session: WsSessionId(7),
+                generation: WsGeneration(3),
+                auxiliary: false,
+            },
+            stream: depth,
+            proof: RecoveryProof::BookSynchronized {
+                at: UnixMs::new(1000),
+                sequence: 9,
+            },
+        };
+        let book_fault = crate::market_service::IntegrityFault {
+            stream: depth,
+            auxiliary: false,
+            session: WsSessionId(7),
+            generation: WsGeneration(2),
+            revision: 1,
+            first_detected_at: UnixMs::new(1),
+            known_trade_from: None,
+            resumed: None,
+            current_books: vec![proof.clone()],
+        };
+        let mut ladder = State::default();
+        ladder.content = Content::Ladder(None);
+        ladder.streams = ResolvedStream::Ready(vec![depth]);
+        let other = StreamKind::Depth {
+            ticker_info: ti,
+            depth_aggr: Default::default(),
+            push_freq: exchange::PushFrequency::Custom(Timeframe::MS100),
+        };
+        let mut other_fault = book_fault.clone();
+        other_fault.current_books[0].stream = other;
+        ladder.sync_ws_integrity(&[other_fault]);
+        assert_eq!(ladder.ws_integrity_faults.len(), 1);
+        ladder.sync_ws_integrity(&[book_fault.clone()]);
+        assert!(ladder.ws_integrity_faults.is_empty());
+        ladder.content = Content::placeholder(ContentKind::HeatmapChart);
+        ladder.sync_ws_integrity(&[book_fault]);
+        assert_eq!(ladder.ws_integrity_faults.len(), 1);
+        let trade_stream = StreamKind::Trades { ticker_info: ti };
+        let mut state = State::default();
+        state.streams = ResolvedStream::Ready(vec![trade_stream]);
+        let bars = [Kline {
+            time: UnixMs::ZERO,
+            open: Price::from_f64(100.0),
+            high: Price::from_f64(101.0),
+            low: Price::from_f64(99.0),
+            close: Price::from_f64(100.0),
+            volume: exchange::Volume::TotalOnly(exchange::unit::Qty::from_f64(1.0)),
+        }];
+        let chart = KlineChart::new(
+            data::chart::ViewConfig::default(),
+            Basis::Time(Timeframe::M1),
+            ti.min_ticksize.into(),
+            &bars,
+            vec![],
+            &[],
+            ti,
+            &data::chart::KlineChartKind::Candles,
+            None,
+        );
+        state.content = Content::Kline {
+            chart: Some(chart),
+            indicators: vec![],
+            layout: Default::default(),
+            kind: data::chart::KlineChartKind::Candles,
+            drawings: vec![],
+        };
+        let fault = crate::market_service::IntegrityFault {
+            stream: trade_stream,
+            auxiliary: false,
+            session: WsSessionId(7),
+            generation: WsGeneration(2),
+            revision: 2,
+            first_detected_at: UnixMs::new(1),
+            known_trade_from: Some(UnixMs::ZERO),
+            resumed: None,
+            current_books: Vec::new(),
+        };
+        state.sync_ws_integrity(&[fault.clone()]);
+        assert_eq!(state.ws_integrity_faults.len(), 1);
+        let context = exchange::unit::quantity_context::QuantityContext::capture();
+        let token = crate::market_service::RecoveryToken {
+            request: uuid::Uuid::new_v4(),
+            pane: state.unique_id(),
+            binding: state.backfill_binding(),
+            stream: trade_stream,
+            revision: 2,
+            lost_session: WsSessionId(7),
+            lost_generation: WsGeneration(2),
+            successor: proof.source,
+            from: UnixMs::ZERO,
+            to: UnixMs::new(60000),
+            context,
+        };
+        let history = crate::connector::fetcher::VerifiedTradeHistory {
+            ticker: ti,
+            context,
+            from: token.from,
+            to: token.to,
+            trades: vec![],
+        };
+        let Content::Kline {
+            chart: Some(chart), ..
+        } = &mut state.content
+        else {
+            panic!()
+        };
+        chart.apply_trade_recovery(&token, &history).unwrap();
+        state.sync_ws_integrity(&[fault.clone()]);
+        assert!(state.ws_integrity_faults.is_empty());
+        let mut repeated = fault;
+        repeated.revision = 3;
+        repeated.generation = WsGeneration(3);
+        state.sync_ws_integrity(&[repeated]);
+        assert_eq!(state.ws_integrity_faults.len(), 1);
     }
 
     #[test]

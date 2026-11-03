@@ -1,4 +1,7 @@
-use crate::adapter::{AdapterError, Event, StreamKind};
+use crate::adapter::{
+    AdapterError, Event, LostEventKind, LostWsEvent, RecoveryProof, StreamKind, WsGeneration,
+    WsIntegrityLoss, WsRecoveryEvidence, WsSessionId, WsSource,
+};
 use crate::proxy::{Proxy, ProxyStream};
 use crate::unit::qty::QtyNormalization;
 use crate::{Ticker, TickerInfo, Trade, UnixMs};
@@ -27,7 +30,10 @@ use futures::StreamExt;
 #[cfg(not(feature = "unbounded-channel"))]
 use futures::channel::mpsc::Sender;
 use futures::channel::mpsc::{UnboundedReceiver, UnboundedSender};
-use std::sync::{Arc, LazyLock};
+use std::sync::{
+    Arc, LazyLock,
+    atomic::{AtomicU64, Ordering},
+};
 use std::time::Duration;
 
 const HEARTBEAT_SEND_FAILED_REASON: &str = "Failed to send heartbeat ping";
@@ -142,6 +148,192 @@ impl<T> Drop for ChannelStream<T> {
     }
 }
 
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Aborting the parent stream must also cancel its independently spawned reader.
+#[derive(Default)]
+struct SessionReader(Option<tokio::task::JoinHandle<()>>);
+
+impl SessionReader {
+    async fn stop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            if !handle.is_finished() {
+                handle.abort();
+            }
+            if let Err(error) = handle.await
+                && !error.is_cancelled()
+            {
+                log::error!("WebSocket I/O task failed: {error}");
+            }
+        }
+    }
+}
+
+impl Drop for SessionReader {
+    fn drop(&mut self) {
+        if let Some(handle) = &self.0 {
+            handle.abort();
+        }
+    }
+}
+
+#[derive(Debug)]
+enum DeliveryFailure {
+    Closed,
+    Full(Vec<LostWsEvent>),
+}
+
+/// The only ordinary event delivery path. On Full, preserve the failed event
+/// and the unattempted suffix and unwind the generation immediately.
+fn send_events(
+    tx: &mut AnySender<Event>,
+    events: impl IntoIterator<Item = Event>,
+) -> Result<(), DeliveryFailure> {
+    let mut events = events.into_iter();
+    while let Some(event) = events.next() {
+        if let Err(error) = tx.send(event) {
+            if error.is_disconnected() {
+                return Err(DeliveryFailure::Closed);
+            }
+            let lost = std::iter::once(error.into_inner())
+                .chain(events)
+                .map(lost_event)
+                .collect();
+            return Err(DeliveryFailure::Full(lost));
+        }
+    }
+    Ok(())
+}
+
+/// Evidence follows the actual delivered payload through the SAME checked FIFO.
+/// If either payload or proof overflows, WS-01 tears down this generation.
+fn send_generation_events(
+    tx: &mut AnySender<Event>,
+    events: Vec<Event>,
+    source: WsSource,
+    book: Option<(StreamKind, UnixMs, u64)>,
+    published: &mut Vec<StreamKind>,
+) -> Result<(), DeliveryFailure> {
+    let mut proofs = Vec::new();
+    for event in &events {
+        let candidate = match event {
+            Event::TradesReceived(stream, _, trades) if !trades.is_empty() => {
+                let first = trades.iter().map(|t| t.time).min().unwrap();
+                let last = trades.iter().map(|t| t.time).max().unwrap();
+                Some((*stream, RecoveryProof::TradesResumed { first, last }))
+            }
+            Event::DepthReceived(stream, _, _) => book
+                .filter(|(s, _, _)| s == stream)
+                .map(|(s, at, sequence)| (s, RecoveryProof::BookSynchronized { at, sequence })),
+            _ => None,
+        };
+        if let Some((stream, proof)) = candidate
+            && !published.contains(&stream)
+            && !proofs
+                .iter()
+                .any(|p: &WsRecoveryEvidence| p.stream == stream)
+        {
+            proofs.push(WsRecoveryEvidence {
+                source,
+                stream,
+                proof,
+            });
+        }
+    }
+    send_events(tx, events)?;
+    for proof in proofs {
+        let stream = proof.stream;
+        send_events(tx, [Event::RecoveryEvidence(proof)])?;
+        published.push(stream);
+    }
+    Ok(())
+}
+
+fn lost_event(event: Event) -> LostWsEvent {
+    use LostEventKind as K;
+    let ticker_info = match &event {
+        Event::OrderFlow(event) => Some(event.ticker_info()),
+        _ => None,
+    };
+    let (kind, streams, records, times): (_, Arc<[StreamKind]>, _, Vec<UnixMs>) = match event {
+        Event::Connected(streams) => (K::Connected, streams, 0, vec![]),
+        Event::Disconnected(streams, _) => (K::Disconnected, streams, 0, vec![]),
+        Event::DepthReceived(stream, at, _) => (K::Depth, Arc::from([stream]), 1, vec![at]),
+        Event::KlineReceived(stream, kline) => (K::Kline, Arc::from([stream]), 1, vec![kline.time]),
+        Event::TradesReceived(stream, _, trades) => (
+            K::Trades,
+            Arc::from([stream]),
+            trades.len(),
+            trades.iter().map(|t| t.time).collect(),
+        ),
+        Event::LiquidationsReceived(stream, trades) => (
+            K::Liquidations,
+            Arc::from([stream]),
+            trades.len(),
+            trades.iter().map(|t| t.time).collect(),
+        ),
+        Event::OrderFlow(event) => {
+            use crate::orderflow::OrderFlowEvent as O;
+            let at = match event {
+                O::Trade(t) => t.trade_time,
+                O::BookDelta(d) => d.exchange_time,
+                O::Quality { at, .. } | O::Reconnect { at, .. } => at,
+            };
+            (K::OrderFlow, Arc::from([]), 1, vec![at])
+        }
+        Event::OrderFlowTrades(trades) => {
+            let mut streams = Vec::new();
+            for trade in &trades {
+                let stream = StreamKind::Trades {
+                    ticker_info: trade.ticker_info,
+                };
+                if !streams.contains(&stream) {
+                    streams.push(stream);
+                }
+            }
+            (
+                K::OrderFlowTrades,
+                streams.into(),
+                trades.len(),
+                trades.iter().map(|t| t.trade_time).collect(),
+            )
+        }
+        Event::RecoveryEvidence(evidence) => {
+            (K::RecoveryEvidence, Arc::from([evidence.stream]), 0, vec![])
+        }
+        Event::IntegrityLost(_) => unreachable!("integrity markers use reliable delivery"),
+    };
+    LostWsEvent {
+        kind,
+        streams,
+        ticker_info,
+        records,
+        first_known_utc: times.iter().copied().min(),
+        last_known_utc: times.iter().copied().max(),
+    }
+}
+
+/// Reader termination precedes any wait on the bounded output. SinkExt::send
+/// registers the receiver wakeup, including closure; dropping ChannelStream
+/// aborts the parent future and cancels this wait.
+async fn report_integrity_loss(
+    tx: &mut AnySender<Event>,
+    reader: &mut SessionReader,
+    loss: WsIntegrityLoss,
+) -> Result<(), DeliveryFailure> {
+    reader.stop().await;
+    let event = Event::IntegrityLost(loss);
+    match tx {
+        #[cfg(not(feature = "unbounded-channel"))]
+        AnySender::Bounded(tx) => futures::SinkExt::send(tx, event)
+            .await
+            .map_err(|_| DeliveryFailure::Closed),
+        AnySender::Unbounded(tx) => tx
+            .unbounded_send(event)
+            .map_err(|_| DeliveryFailure::Closed),
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(super) struct WsSession {
     streams: Arc<[StreamKind]>,
@@ -162,6 +354,12 @@ pub(super) trait WsAdapter {
     /// policy owns all venue-specific timing and wire-format decisions, while
     /// the shared transport handles frame activity and control replies.
     fn heartbeat_policy(&self) -> HeartbeatPolicy;
+
+    /// Only adapters with a proven snapshot/diff boundary opt in. The session
+    /// stamps identity and publishes proof only after a matching DepthReceived.
+    fn book_sync_proof(&self) -> Option<(StreamKind, UnixMs, u64)> {
+        None
+    }
 
     /// Connects to the WebSocket and returns a transport for it.
     /// This will be retried indefinitely until it succeeds, with an exponential backoff
@@ -193,7 +391,7 @@ pub(super) trait WsAdapter {
     ///
     /// Adapters parse incoming data and return resulting `Event`s.
     /// The session loop sends them to the output channel.
-    /// If the output channel is full, events are silently dropped
+    /// Queue overflow terminates the generation and produces an IntegrityLost marker.
     ///
     /// **Flush model**: non-trade adapters return events here directly.
     /// Trade adapters only buffer into [`TradeBuffer`] here and return
@@ -229,19 +427,28 @@ impl WsSession {
         let streams = Arc::clone(&self.streams);
         let silent = self.silent;
 
+        let session = WsSessionId(NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed));
         let task = tokio::spawn(async move {
             if streams.is_empty() {
-                let _ = event_tx.send(Event::Disconnected(
-                    streams,
-                    "Empty stream payload".to_string(),
-                ));
+                // A fresh queue has room for this single event; Closed ends the task.
+                if send_events(
+                    &mut event_tx,
+                    [Event::Disconnected(
+                        streams,
+                        "Empty stream payload".to_string(),
+                    )],
+                )
+                .is_err()
+                {
+                    return;
+                }
                 return;
             }
 
             let mut backoff = ReconnectBackoff::new();
             let mut disconnect_count: u32 = 0;
             let mut last_disconnect_instant: Option<std::time::Instant> = None;
-            let mut attempt: u32 = 0;
+            let mut attempt: u64 = 0;
 
             loop {
                 attempt += 1;
@@ -250,189 +457,223 @@ impl WsSession {
                     backoff.peek_delay()
                 );
 
-                let transport = match adapter.connect().await {
-                    Ok(t) => t,
-                    Err(reason) => {
-                        disconnect_count += 1;
-                        log::warn!(
-                            "WS ConnectFailed | reason={reason} count={disconnect_count} backoff_next={:?}",
-                            backoff.peek_delay()
-                        );
-                        if !silent {
-                            let _ =
-                                event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
-                        }
-                        let delay = backoff.delay();
-                        backoff.record_failure();
-                        log::info!("WS ReconnectScheduled | attempt={attempt} delay={delay:?}");
-                        tokio::time::sleep(delay).await;
-                        continue;
-                    }
+                let source = WsSource {
+                    session,
+                    generation: WsGeneration(attempt),
+                    auxiliary: silent,
                 };
-
-                let heartbeat_policy = adapter.heartbeat_policy();
-
-                let (frame_tx, mut frame_rx) = {
-                    let (tx, rx) = futures::channel::mpsc::unbounded();
-                    (AnySender::Unbounded(tx), AnyReceiver::Unbounded(rx))
-                };
-                let io_handle = tokio::spawn(transport.read_frame(heartbeat_policy, frame_tx));
-
-                for event in adapter.on_connected().await {
-                    let _ = event_tx.send(event);
-                }
-                if !silent {
-                    let _ = event_tx.send(Event::Connected(Arc::clone(&streams)));
-                }
-
-                let tick_interval = adapter.tick_interval();
-                let tick_sleep = tokio::time::sleep(tick_interval);
-                tokio::pin!(tick_sleep);
-
-                // Track connection stability for backoff reset.
-                let connected_at = std::time::Instant::now();
-                let stability_timer = tokio::time::sleep(ReconnectBackoff::STABLE_THRESHOLD);
-                tokio::pin!(stability_timer);
-                let mut is_stable = false;
-                let mut data_received = false;
-
-                let disconnect_reason = loop {
-                    tokio::select! {
-                        biased;
-                        // Raw trade streams can remain continuously ready on active symbols.
-                        // Service the batching timer first so detector traffic cannot starve
-                        // legacy TradesReceived events used by bubbles, footprint and CVD.
-                        _ = &mut tick_sleep => {
-                            for event in adapter.on_tick().await {
-                                let _ = event_tx.send(event);
+                let mut published = Vec::new();
+                let mut reader = SessionReader::default();
+                let mut disconnected_callback_called = false;
+                let mut reconnect_delay = None;
+                let outcome: Result<(), DeliveryFailure> = async {
+                    let transport = match adapter.connect().await {
+                        Ok(t) => t,
+                        Err(reason) => {
+                            disconnect_count += 1;
+                            log::warn!(
+                                "WS ConnectFailed | reason={reason} count={disconnect_count} backoff_next={:?}",
+                                backoff.peek_delay()
+                            );
+                            if !silent {
+                                send_events(&mut event_tx, [Event::Disconnected(Arc::clone(&streams), reason)])?;
                             }
-                            tick_sleep
-                                .as_mut()
-                                .reset(tokio::time::Instant::now() + tick_interval);
+                            reconnect_delay = Some(backoff.delay());
+                            backoff.record_failure();
+                            return Ok(());
                         }
-                        frame = frame_rx.next() => {
-                            let mut disconnect_reason: Option<String> = None;
+                    };
 
-                            match frame {
-                                Some(Ok(payload)) => {
-                                    if !payload.is_empty() {
-                                        match adapter.on_text(&payload).await {
-                                            Ok(events) => {
-                                                let had_events = !events.is_empty();
-                                                for event in events {
-                                                    let _ = event_tx.send(event);
-                                                }
-                                                if had_events {
-                                                    data_received = true;
-                                                    backoff.record_success();
-                                                }
-                                            }
-                                            Err(reason) => {
-                                                disconnect_reason = Some(reason);
-                                            }
-                                        }
-                                    }
+                    let heartbeat_policy = adapter.heartbeat_policy();
 
-                                    if disconnect_reason.is_none() {
-                                        let mut drained = 0;
-                                        while drained < MAX_DRAIN_PER_TICK {
-                                            let Some(drain) = frame_rx.try_recv() else { break };
-                                            drained += 1;
-                                            match drain {
-                                                Ok(payload) => {
-                                                    match adapter.on_text(&payload).await {
-                                                        Ok(events) => {
-                                                            let had_events = !events.is_empty();
-                                                            for event in events {
-                                                                let _ = event_tx.send(event);
-                                                            }
-                                                            if had_events {
-                                                                data_received = true;
-                                                                backoff.record_success();
-                                                            }
-                                                        }
-                                                        Err(reason) => {
-                                                            disconnect_reason = Some(reason);
-                                                            break;
-                                                        }
+                    let (frame_tx, mut frame_rx) = {
+                        let (tx, rx) = futures::channel::mpsc::unbounded();
+                        (AnySender::Unbounded(tx), AnyReceiver::Unbounded(rx))
+                    };
+                    reader.0 = Some(tokio::spawn(transport.read_frame(heartbeat_policy, frame_tx)));
+
+                    let events = adapter.on_connected().await;
+                    send_generation_events(&mut event_tx, events, source, adapter.book_sync_proof(), &mut published)?;
+                    if !silent {
+                        send_events(&mut event_tx, [Event::Connected(Arc::clone(&streams))])?;
+                    }
+
+                    let tick_interval = adapter.tick_interval();
+                    let tick_sleep = tokio::time::sleep(tick_interval);
+                    tokio::pin!(tick_sleep);
+
+                    // Track connection stability for backoff reset.
+                    let connected_at = std::time::Instant::now();
+                    let stability_timer = tokio::time::sleep(ReconnectBackoff::STABLE_THRESHOLD);
+                    tokio::pin!(stability_timer);
+                    let mut is_stable = false;
+                    let mut data_received = false;
+
+                    let disconnect_reason = loop {
+                        tokio::select! {
+                            biased;
+                            // Raw trade streams can remain continuously ready on active symbols.
+                            // Service the batching timer first so detector traffic cannot starve
+                            // legacy TradesReceived events used by bubbles, footprint and CVD.
+                            _ = &mut tick_sleep => {
+                                let events = adapter.on_tick().await;
+                    send_generation_events(&mut event_tx, events, source, adapter.book_sync_proof(), &mut published)?;
+                                tick_sleep
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + tick_interval);
+                            }
+                            frame = frame_rx.next() => {
+                                let mut disconnect_reason: Option<String> = None;
+
+                                match frame {
+                                    Some(Ok(payload)) => {
+                                        if !payload.is_empty() {
+                                            match adapter.on_text(&payload).await {
+                                                Ok(events) => {
+                                                    let had_events = !events.is_empty();
+                                                    send_generation_events(&mut event_tx, events, source, adapter.book_sync_proof(), &mut published)?;
+                                                    if had_events {
+                                                        data_received = true;
+                                                        backoff.record_success();
                                                     }
                                                 }
                                                 Err(reason) => {
                                                     disconnect_reason = Some(reason);
-                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if disconnect_reason.is_none() {
+                                            let mut drained = 0;
+                                            while drained < MAX_DRAIN_PER_TICK {
+                                                let Some(drain) = frame_rx.try_recv() else { break };
+                                                drained += 1;
+                                                match drain {
+                                                    Ok(payload) => {
+                                                        match adapter.on_text(&payload).await {
+                                                            Ok(events) => {
+                                                                let had_events = !events.is_empty();
+                                                                send_generation_events(&mut event_tx, events, source, adapter.book_sync_proof(), &mut published)?;
+                                                                if had_events {
+                                                                    data_received = true;
+                                                                    backoff.record_success();
+                                                                }
+                                                            }
+                                                            Err(reason) => {
+                                                                disconnect_reason = Some(reason);
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(reason) => {
+                                                        disconnect_reason = Some(reason);
+                                                        break;
+                                                    }
                                                 }
                                             }
                                         }
                                     }
+                                    Some(Err(reason)) => {
+                                        disconnect_reason = Some(reason);
+                                    }
+                                    None => {
+                                        disconnect_reason = Some(
+                                            "I/O task exited".to_string(),
+                                        );
+                                    }
                                 }
-                                Some(Err(reason)) => {
-                                    disconnect_reason = Some(reason);
-                                }
-                                None => {
-                                    disconnect_reason = Some(
-                                        "I/O task exited".to_string(),
-                                    );
-                                }
-                            }
 
-                            if let Some(reason) = disconnect_reason {
-                                break Some(reason);
+                                if let Some(reason) = disconnect_reason {
+                                    break Some(reason);
+                                }
                             }
-                        }
-                        _ = &mut stability_timer, if !is_stable => {
-                            is_stable = true;
-                            let connected_for = connected_at.elapsed();
-                            log::info!(
-                                "WS Stable | connected_for={connected_for:?}"
-                            );
-                            if backoff.is_inflated() {
+                            _ = &mut stability_timer, if !is_stable => {
+                                is_stable = true;
+                                let connected_for = connected_at.elapsed();
                                 log::info!(
-                                    "WS BackoffReset | reason=connected_stable connected_for={connected_for:?}"
+                                    "WS Stable | connected_for={connected_for:?}"
                                 );
-                                backoff.record_success();
+                                if backoff.is_inflated() {
+                                    log::info!(
+                                        "WS BackoffReset | reason=connected_stable connected_for={connected_for:?}"
+                                    );
+                                    backoff.record_success();
+                                }
                             }
                         }
-                    }
-                };
-
-                if io_handle.is_finished() {
-                    if let Err(e) = io_handle.await {
-                        log::error!("WebSocket I/O task panicked (reconnecting): {e}");
-                    }
-                } else {
-                    io_handle.abort();
-                }
-
-                if let Some(reason) = disconnect_reason {
-                    disconnect_count += 1;
-
-                    // Only inflate backoff for genuine failures (no data received).
-                    // Stable connections that received data before dropping should
-                    // not increase the reconnection delay.
-                    if !data_received {
-                        backoff.record_failure();
-                    }
-
-                    let since_last_str = match last_disconnect_instant {
-                        Some(t) => format!("{:?}", t.elapsed()),
-                        None => "none".to_string(),
                     };
-                    last_disconnect_instant = Some(std::time::Instant::now());
 
-                    log::warn!(
-                        "WS ReconnectDiag | reason={reason} count={disconnect_count} since_last={since_last_str} backoff_next={:?}",
-                        backoff.peek_delay()
-                    );
+                    reader.stop().await;
 
-                    for event in adapter.on_disconnected(&reason).await {
-                        let _ = event_tx.send(event);
+                    if let Some(reason) = disconnect_reason {
+                        disconnect_count += 1;
+
+                        // Only inflate backoff for genuine failures (no data received).
+                        // Stable connections that received data before dropping should
+                        // not increase the reconnection delay.
+                        if !data_received {
+                            backoff.record_failure();
+                        }
+
+                        let since_last_str = match last_disconnect_instant {
+                            Some(t) => format!("{:?}", t.elapsed()),
+                            None => "none".to_string(),
+                        };
+                        last_disconnect_instant = Some(std::time::Instant::now());
+
+                        log::warn!(
+                            "WS ReconnectDiag | reason={reason} count={disconnect_count} since_last={since_last_str} backoff_next={:?}",
+                            backoff.peek_delay()
+                        );
+
+                        disconnected_callback_called = true;
+                        send_events(&mut event_tx, adapter.on_disconnected(&reason).await)?;
+                        if !silent {
+                            send_events(&mut event_tx, [Event::Disconnected(Arc::clone(&streams), reason)])?;
+                        }
                     }
-                    if !silent {
-                        let _ = event_tx.send(Event::Disconnected(Arc::clone(&streams), reason));
+
+                    Ok(())
+                }.await;
+                match outcome {
+                    Ok(()) => {}
+                    Err(DeliveryFailure::Closed) => {
+                        reader.stop().await;
+                        return;
+                    }
+                    Err(DeliveryFailure::Full(mut lost_events)) => {
+                        let detected_at = UnixMs::now();
+                        reader.stop().await;
+                        // Flush/reset adapter-owned buffers without publishing any more
+                        // ordinary events from the failed generation.
+                        if !disconnected_callback_called {
+                            lost_events.extend(
+                                adapter
+                                    .on_disconnected("WS output queue overflow")
+                                    .await
+                                    .into_iter()
+                                    .map(lost_event),
+                            );
+                        }
+                        let loss = WsIntegrityLoss {
+                            session,
+                            generation: WsGeneration(attempt),
+                            streams: Arc::clone(&streams),
+                            auxiliary: silent,
+                            detected_at,
+                            lost_events,
+                            complete_loss_extent_known: false,
+                        };
+                        if report_integrity_loss(&mut event_tx, &mut reader, loss)
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
                     }
                 }
 
-                let delay = backoff.delay();
+                let delay = reconnect_delay.unwrap_or_else(|| backoff.delay());
                 log::info!("WS ReconnectScheduled | attempt={attempt} delay={delay:?}");
                 tokio::time::sleep(delay).await;
             }
@@ -1133,5 +1374,390 @@ impl TradeBuffer {
         }
 
         events
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::channel::oneshot;
+
+    fn scope() -> Arc<[StreamKind]> {
+        Arc::from([StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("BTCUSDT", crate::adapter::Exchange::BinanceLinear),
+                0.1,
+                0.001,
+                None,
+            ),
+        }])
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    fn loss(lost_events: Vec<LostWsEvent>) -> WsIntegrityLoss {
+        WsIntegrityLoss {
+            session: WsSessionId(7),
+            generation: WsGeneration(3),
+            streams: scope(),
+            auxiliary: true,
+            detected_at: UnixMs::new(100),
+            lost_events,
+            complete_loss_extent_known: false,
+        }
+    }
+
+    struct OnDrop(Option<oneshot::Sender<()>>);
+    impl Drop for OnDrop {
+        fn drop(&mut self) {
+            if let Some(tx) = self.0.take() {
+                let _ = tx.send(());
+            }
+        }
+    }
+
+    async fn reader() -> (SessionReader, oneshot::Receiver<()>) {
+        let (started_tx, started_rx) = oneshot::channel();
+        let (stopped_tx, stopped_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = OnDrop(Some(stopped_tx));
+            started_tx.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        });
+        started_rx.await.unwrap();
+        (SessionReader(Some(task)), stopped_rx)
+    }
+
+    // A watchdog only; scheduling/order is controlled by polls and oneshot barriers.
+    async fn completes<T>(future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(Duration::from_secs(5), future)
+            .await
+            .expect("task hung")
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    fn full(tx: &mut AnySender<Event>) -> Vec<LostWsEvent> {
+        // futures mpsc grants a reserved slot to the sender in addition to capacity.
+        match send_events(tx, (0..16).map(|_| Event::Connected(scope()))) {
+            Err(DeliveryFailure::Full(lost)) => lost,
+            other => panic!("expected Full: {other:?}"),
+        }
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    #[tokio::test]
+    async fn overflow_stops_reader_before_wait_and_marker_precedes_new_generation() {
+        let (mut tx, mut rx) = channel(1);
+        let lost = full(&mut tx);
+        assert_eq!(lost.len(), 14);
+        assert!(lost.iter().all(|e| e.kind == LostEventKind::Connected));
+        let (mut reader, stopped) = reader().await;
+        let (waiting_tx, waiting_rx) = oneshot::channel();
+        let producer = tokio::spawn(async move {
+            let mut report = Box::pin(report_integrity_loss(&mut tx, &mut reader, loss(lost)));
+            assert!(futures::poll!(&mut report).is_pending());
+            waiting_tx.send(()).unwrap();
+            report.await.unwrap();
+            // Reliable send may wait for a flush; consumer controls progress.
+            send_events(
+                &mut tx,
+                [Event::Disconnected(scope(), "new generation".into())],
+            )
+            .unwrap();
+        });
+        completes(waiting_rx).await.unwrap();
+        completes(stopped).await.unwrap();
+        assert!(matches!(rx.next().await, Some(Event::Connected(_))));
+        assert!(matches!(rx.next().await, Some(Event::Connected(_))));
+        let Some(Event::IntegrityLost(marker)) = rx.next().await else {
+            panic!("missing marker")
+        };
+        assert_eq!(marker.session, WsSessionId(7));
+        assert_eq!(marker.generation, WsGeneration(3));
+        assert_eq!(marker.lost_events.len(), 14);
+        assert!(marker.auxiliary);
+        assert!(!marker.complete_loss_extent_known);
+        assert!(matches!(
+            completes(rx.next()).await,
+            Some(Event::Disconnected(_, _))
+        ));
+        completes(producer).await.unwrap();
+        assert!(rx.next().await.is_none());
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    #[tokio::test]
+    async fn receiver_closure_wakes_pending_marker_send() {
+        let (mut tx, rx) = channel(1);
+        let lost = full(&mut tx);
+        let mut reader = SessionReader::default();
+        let mut report = Box::pin(report_integrity_loss(&mut tx, &mut reader, loss(lost)));
+        assert!(futures::poll!(&mut report).is_pending());
+        drop(rx);
+        assert!(matches!(
+            completes(report).await,
+            Err(DeliveryFailure::Closed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn closed_is_distinct_from_full() {
+        let (mut tx, rx) = channel(1);
+        drop(rx);
+        assert!(matches!(
+            send_events(&mut tx, [Event::Connected(scope())]),
+            Err(DeliveryFailure::Closed)
+        ));
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    #[tokio::test]
+    async fn dropping_subscription_cancels_pending_marker() {
+        let (mut tx, rx) = channel(1);
+        let lost = full(&mut tx);
+        let (waiting_tx, waiting_rx) = oneshot::channel();
+        let (cancelled_tx, cancelled_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _guard = OnDrop(Some(cancelled_tx));
+            let mut reader = SessionReader::default();
+            let mut report = Box::pin(report_integrity_loss(&mut tx, &mut reader, loss(lost)));
+            assert!(futures::poll!(&mut report).is_pending());
+            waiting_tx.send(()).unwrap();
+            report.await.unwrap();
+        });
+        let stream = ChannelStream { receiver: rx, task };
+        completes(waiting_rx).await.unwrap();
+        drop(stream);
+        completes(cancelled_rx).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dropping_subscription_also_cancels_running_reader() {
+        let (reader, stopped) = reader().await;
+        let (tx, rx) = channel::<Event>(1);
+        let (started_tx, started_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _reader = reader;
+            let _tx = tx;
+            started_tx.send(()).unwrap();
+            futures::future::pending::<()>().await;
+        });
+        let stream = ChannelStream { receiver: rx, task };
+        completes(started_rx).await.unwrap();
+        drop(stream);
+        completes(stopped).await.unwrap();
+    }
+
+    #[test]
+    fn lost_trade_bounds_use_payload_min_max_not_bucket_time() {
+        let scopes = scope();
+        let trade = |at| Trade {
+            id: Some(at),
+            time: UnixMs::new(at),
+            is_sell: false,
+            price: crate::Price::from_f64(100.0),
+            qty: crate::unit::Qty::from_f64(1.0),
+        };
+        let summary = lost_event(Event::TradesReceived(
+            scopes[0],
+            UnixMs::new(99),
+            vec![trade(30), trade(10), trade(20)].into_boxed_slice(),
+        ));
+        assert_eq!(summary.kind, LostEventKind::Trades);
+        assert_eq!(summary.records, 3);
+        assert_eq!(summary.first_known_utc, Some(UnixMs::new(10)));
+        assert_eq!(summary.last_known_utc, Some(UnixMs::new(30)));
+        assert_eq!(&*summary.streams, &*scopes);
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    #[tokio::test]
+    async fn overflow_keeps_unsent_suffix_and_other_subscription_is_independent() {
+        let (mut tx, mut rx) = channel(1);
+        let (mut other_tx, mut other_rx) = channel(1);
+        let _ = full(&mut tx);
+        let second = StreamKind::Trades {
+            ticker_info: TickerInfo::new(
+                Ticker::new("ETHUSDT", crate::adapter::Exchange::BinanceLinear),
+                0.01,
+                0.001,
+                None,
+            ),
+        };
+        let events = [
+            Event::OrderFlow(crate::orderflow::OrderFlowEvent::Quality {
+                ticker_info: scope()[0].ticker_info(),
+                at: UnixMs::new(30),
+                quality: crate::orderflow::OrderFlowDataQuality::Gap,
+            }),
+            Event::LiquidationsReceived(second, Box::new([])),
+            Event::Disconnected(Arc::from([second]), "closed".into()),
+        ];
+        let Err(DeliveryFailure::Full(lost)) = send_events(&mut tx, events) else {
+            panic!("not full")
+        };
+        assert_eq!(lost.len(), 3);
+        assert_eq!(lost[0].ticker_info, Some(scope()[0].ticker_info()));
+        assert_eq!(lost[0].first_known_utc, Some(UnixMs::new(30)));
+        assert_eq!(lost[1].kind, LostEventKind::Liquidations);
+        assert_eq!(&*lost[1].streams, &[second]);
+        assert_eq!(lost[1].first_known_utc, None);
+        assert_eq!(lost[2].kind, LostEventKind::Disconnected);
+        send_events(&mut other_tx, [Event::Connected(Arc::from([second]))]).unwrap();
+        assert!(matches!(other_rx.next().await, Some(Event::Connected(_))));
+        // Failed events did not enter the queue, including the unattempted suffix.
+        assert!(matches!(rx.next().await, Some(Event::Connected(_))));
+        assert!(matches!(rx.next().await, Some(Event::Connected(_))));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn ws03_proof_follows_payload_with_exact_source() {
+        let (mut tx, mut rx) = channel(8);
+        let source = WsSource {
+            session: WsSessionId(8),
+            generation: WsGeneration(4),
+            auxiliary: false,
+        };
+        let trade = Trade {
+            id: Some(1),
+            time: UnixMs::new(100),
+            is_sell: false,
+            price: crate::Price::from_f64(100.0),
+            qty: crate::unit::Qty::from_f64(1.0),
+        };
+        let mut published = Vec::new();
+        send_generation_events(
+            &mut tx,
+            vec![Event::TradesReceived(
+                scope()[0],
+                UnixMs::new(99),
+                Box::new([trade]),
+            )],
+            source,
+            None,
+            &mut published,
+        )
+        .unwrap();
+        assert!(matches!(rx.next().await, Some(Event::TradesReceived(..))));
+        let Some(Event::RecoveryEvidence(proof)) = rx.next().await else {
+            panic!("missing proof")
+        };
+        assert_eq!(proof.source, source);
+        assert_eq!(
+            proof.proof,
+            RecoveryProof::TradesResumed {
+                first: UnixMs::new(100),
+                last: UnixMs::new(100)
+            }
+        );
+        send_generation_events(
+            &mut tx,
+            vec![Event::TradesReceived(
+                scope()[0],
+                UnixMs::new(99),
+                Box::new([trade]),
+            )],
+            source,
+            None,
+            &mut published,
+        )
+        .unwrap();
+        assert!(matches!(rx.next().await, Some(Event::TradesReceived(..))));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[cfg(not(feature = "unbounded-channel"))]
+    #[tokio::test]
+    async fn ws03_proof_overflow_is_reported_as_loss_not_a_successful_boundary() {
+        let (mut tx, mut rx) = channel(0);
+        let source = WsSource {
+            session: WsSessionId(8),
+            generation: WsGeneration(4),
+            auxiliary: false,
+        };
+        let trade = Trade {
+            id: Some(1),
+            time: UnixMs::new(100),
+            is_sell: false,
+            price: crate::Price::from_f64(100.0),
+            qty: crate::unit::Qty::from_f64(1.0),
+        };
+        let mut published = Vec::new();
+        let Err(DeliveryFailure::Full(lost)) = send_generation_events(
+            &mut tx,
+            vec![Event::TradesReceived(
+                scope()[0],
+                UnixMs::new(99),
+                Box::new([trade]),
+            )],
+            source,
+            None,
+            &mut published,
+        ) else {
+            panic!("expected proof overflow")
+        };
+        assert!(published.is_empty());
+        assert_eq!(lost.len(), 1);
+        assert_eq!(lost[0].kind, LostEventKind::RecoveryEvidence);
+        assert!(matches!(rx.next().await, Some(Event::TradesReceived(..))));
+        assert!(rx.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn ws03_book_proof_requires_matching_delivered_snapshot() {
+        let (mut tx, mut rx) = channel(8);
+        let source = WsSource {
+            session: WsSessionId(8),
+            generation: WsGeneration(4),
+            auxiliary: false,
+        };
+        let stream = StreamKind::Depth {
+            ticker_info: scope()[0].ticker_info(),
+            depth_aggr: Default::default(),
+            push_freq: Default::default(),
+        };
+        let book = Some((stream, UnixMs::new(1000), 9));
+        let mut published = Vec::new();
+        send_generation_events(&mut tx, vec![], source, book, &mut published).unwrap();
+        assert!(rx.try_recv().is_none());
+        send_generation_events(
+            &mut tx,
+            vec![Event::DepthReceived(
+                stream,
+                UnixMs::new(1000),
+                Arc::new(crate::depth::Depth::default()),
+            )],
+            source,
+            book,
+            &mut published,
+        )
+        .unwrap();
+        assert!(matches!(rx.next().await, Some(Event::DepthReceived(..))));
+        let Some(Event::RecoveryEvidence(proof)) = rx.next().await else {
+            panic!()
+        };
+        assert_eq!(proof.source, source);
+        assert_eq!(
+            proof.proof,
+            RecoveryProof::BookSynchronized {
+                at: UnixMs::new(1000),
+                sequence: 9
+            }
+        );
+    }
+
+    #[cfg(feature = "unbounded-channel")]
+    #[tokio::test]
+    async fn existing_unbounded_feature_keeps_order_and_reports_closed() {
+        let (mut tx, mut rx) = channel(1);
+        send_events(&mut tx, (0..1024).map(|_| Event::Connected(scope()))).unwrap();
+        for _ in 0..1024 {
+            assert!(matches!(rx.next().await, Some(Event::Connected(_))));
+        }
+        drop(rx);
+        assert!(matches!(
+            send_events(&mut tx, [Event::Connected(scope())]),
+            Err(DeliveryFailure::Closed)
+        ));
     }
 }

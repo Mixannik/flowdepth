@@ -33,6 +33,7 @@ pub struct Toast {
     title: String,
     body: String,
     status: Status,
+    persistent: bool,
 }
 
 impl Toast {
@@ -41,6 +42,7 @@ impl Toast {
             title: title.into(),
             body: body.into(),
             status,
+            persistent: false,
         }
     }
 
@@ -49,6 +51,7 @@ impl Toast {
             title: "Error".to_string(),
             body: body.into(),
             status: Status::Danger,
+            persistent: false,
         }
     }
 
@@ -57,6 +60,7 @@ impl Toast {
             title: "Warning".to_string(),
             body: body.into(),
             status: Status::Warning,
+            persistent: false,
         }
     }
 
@@ -65,7 +69,18 @@ impl Toast {
             title: "Info".to_string(),
             body: body.into(),
             status: Status::Primary,
+            persistent: false,
         }
+    }
+
+    /// Keep a data-integrity warning visible until the user dismisses it.
+    pub fn persistent(mut self) -> Self {
+        self.persistent = true;
+        self
+    }
+
+    pub fn is_persistent(&self) -> bool {
+        self.persistent
     }
 
     pub fn title(&self) -> &str {
@@ -84,6 +99,7 @@ impl Toast {
 pub struct Manager<'a, Message> {
     content: Element<'a, Message>,
     toasts: Vec<Element<'a, Message>>,
+    persistent: Vec<bool>,
     timeout_secs: u64,
     on_close: Box<dyn Fn(usize) -> Message + 'a>,
     alignment: Alignment,
@@ -99,6 +115,7 @@ where
         alignment: Alignment,
         on_close: impl Fn(usize) -> Message + 'a,
     ) -> Self {
+        let persistent = toasts.iter().map(Toast::is_persistent).collect();
         let toasts = toasts
             .iter()
             .enumerate()
@@ -142,6 +159,7 @@ where
             content: content.into(),
             alignment,
             toasts,
+            persistent,
             timeout_secs: DEFAULT_TIMEOUT,
             on_close: Box::new(on_close),
         }
@@ -306,6 +324,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Manager<'_, Message> {
                 toasts: &mut self.toasts,
                 state: toasts_state,
                 instants,
+                persistent: &self.persistent,
                 on_close: &self.on_close,
                 timeout_secs: self.timeout_secs,
             }))
@@ -324,6 +343,7 @@ struct Overlay<'a, 'b, Message> {
     toasts: &'b mut [Element<'a, Message>],
     state: &'b mut [Tree],
     instants: &'b mut [Option<Instant>],
+    persistent: &'b [bool],
     on_close: &'b dyn Fn(usize) -> Message,
     timeout_secs: u64,
 }
@@ -360,6 +380,9 @@ impl<Message> overlay::Overlay<Message, Theme, Renderer> for Overlay<'_, '_, Mes
                 .iter_mut()
                 .enumerate()
                 .for_each(|(index, maybe_instant)| {
+                    if self.persistent[index] {
+                        return;
+                    }
                     if let Some(instant) = maybe_instant.as_mut() {
                         let remaining =
                             time::seconds(self.timeout_secs).saturating_sub(instant.elapsed());

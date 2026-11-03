@@ -527,8 +527,84 @@ impl Exchange {
     }
 }
 
+/// Identity is process-local; a generation is one connection attempt within a session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsSessionId(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsGeneration(pub u64);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WsSource {
+    pub session: WsSessionId,
+    pub generation: WsGeneration,
+    pub auxiliary: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryProof {
+    /// Delivered first trade batch of a generation. Not proof of history completeness.
+    TradesResumed { first: UnixMs, last: UnixMs },
+    /// A delivered coherent current snapshot, after buffered diffs were checked.
+    /// Does not recover historical book changes or a raw trade sequence.
+    BookSynchronized { at: UnixMs, sequence: u64 },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WsRecoveryEvidence {
+    pub source: WsSource,
+    pub stream: StreamKind,
+    pub proof: RecoveryProof,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum TradePageCursor {
+    Time(UnixMs),
+    AggregateId(u64),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LostEventKind {
+    RecoveryEvidence,
+    Connected,
+    Disconnected,
+    Depth,
+    Trades,
+    Kline,
+    Liquidations,
+    OrderFlow,
+    OrderFlowTrades,
+}
+
+/// One produced but undelivered event. Bounds describe only its known payload,
+/// not the entire gap (unparsed frames and the offline interval remain unknown).
+#[derive(Debug, Clone)]
+pub struct LostWsEvent {
+    pub kind: LostEventKind,
+    pub streams: Arc<[StreamKind]>,
+    /// Normalized order-flow events lack a full StreamKind configuration.
+    pub ticker_info: Option<TickerInfo>,
+    pub records: usize,
+    pub first_known_utc: Option<UnixMs>,
+    pub last_known_utc: Option<UnixMs>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WsIntegrityLoss {
+    pub session: WsSessionId,
+    pub generation: WsGeneration,
+    pub streams: Arc<[StreamKind]>,
+    pub auxiliary: bool,
+    pub detected_at: UnixMs,
+    pub lost_events: Vec<LostWsEvent>,
+    /// Always false for queue overflow: unread frames / offline data are unknown.
+    pub complete_loss_extent_known: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum Event {
+    RecoveryEvidence(WsRecoveryEvidence),
+    IntegrityLost(WsIntegrityLoss),
     Connected(Arc<[StreamKind]>),
     Disconnected(Arc<[StreamKind]>, String),
     DepthReceived(StreamKind, UnixMs, Arc<Depth>),

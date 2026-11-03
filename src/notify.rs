@@ -135,9 +135,14 @@ fn aggregate_toast(base: &Toast, suppressed_count: u32) -> Toast {
         format!("{suppressed_count} retries")
     };
 
-    Toast::custom(
+    let toast = Toast::custom(
         base.title().to_string(),
         format!("{} (still failing, {retries})", base.body()),
         base.status(),
-    )
+    );
+    if base.is_persistent() {
+        toast.persistent()
+    } else {
+        toast
+    }
 }

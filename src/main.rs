@@ -186,6 +186,9 @@ struct Flowsurface {
     windowing_mode: WindowingMode,
     market_connectivity: market_service::MarketConnectivity,
     iceberg_detectors: connector::iceberg::IcebergDetectorRegistry,
+    market_integrity: market_service::MarketIntegrity,
+    recovery_jobs: Vec<(market_service::RecoveryToken, iced::task::Handle)>,
+    recovery_attempts: Vec<(market_service::RecoveryToken, std::time::Instant)>,
     debug_terminal: debug_terminal::State,
     gex_coordinator: connector::gex::GexDataCoordinator,
     deribit_options_client: Option<exchange::options::deribit::DeribitOptionsClient>,
@@ -321,6 +324,10 @@ enum Message {
         exchange::unit::quantity_context::QuantityContext,
         exchange::Event,
     ),
+    TradeRecoveryCompleted {
+        token: market_service::RecoveryToken,
+        result: Result<connector::fetcher::VerifiedTradeHistory, String>,
+    },
     Dashboard {
         /// If `None`, the active layout is used for the event.
         layout_id: Option<uuid::Uuid>,
@@ -508,6 +515,9 @@ impl Flowsurface {
             windowing_mode,
             market_connectivity: market_service::MarketConnectivity::new(),
             iceberg_detectors: connector::iceberg::IcebergDetectorRegistry::default(),
+            market_integrity: market_service::MarketIntegrity::default(),
+            recovery_jobs: Vec::new(),
+            recovery_attempts: Vec::new(),
             debug_terminal: debug_terminal::State::new(saved_state.debug_terminal_enabled),
             gex_coordinator: connector::gex::GexDataCoordinator::default(),
             deribit_options_client,
@@ -637,13 +647,211 @@ impl Flowsurface {
         }
     }
 
+    fn sync_ws_integrity(&mut self) {
+        let streams = self.all_market_streams();
+        self.market_integrity.sync_subscriptions(&streams);
+        self.recovery_jobs.retain(|(token, _)| {
+            self.market_integrity.token_is_current(token)
+                && self
+                    .layout_manager
+                    .iter_dashboards()
+                    .any(|d| d.has_recovery_owner(self.main_window.id, token))
+        });
+        self.recovery_attempts.retain(|(token, _)| {
+            self.market_integrity.token_is_current(token)
+                && self
+                    .layout_manager
+                    .iter_dashboards()
+                    .any(|d| d.has_recovery_owner(self.main_window.id, token))
+        });
+        if self.market_integrity.faults().is_empty() {
+            return;
+        }
+        self.iceberg_detectors.set_integrity_blocks(
+            &self.market_integrity.blocked_detector_tickers(),
+            exchange::UnixMs::now(),
+        );
+        for dashboard in self.layout_manager.iter_dashboards_mut() {
+            dashboard.sync_ws_integrity(self.main_window.id, self.market_integrity.faults());
+        }
+        // Remove previously shared derived levels immediately, before another
+        // healthy chart can use them as reference for a new signal.
+        let all = self
+            .layout_manager
+            .layouts
+            .iter()
+            .flat_map(|layout| layout.dashboard.range_levels(self.main_window.id))
+            .collect::<Vec<_>>();
+        for layout in &mut self.layout_manager.layouts {
+            layout
+                .dashboard
+                .set_shared_range_levels(self.main_window.id, &all);
+        }
+    }
+
+    fn schedule_trade_recovery(&mut self, now: std::time::Instant) -> Task<Message> {
+        if self.data_sources.server.is_some() {
+            return Task::none();
+        }
+        let context = self.data_sources.exchange.quantity_context();
+        let plans = self
+            .layout_manager
+            .iter_dashboards()
+            .flat_map(|d| {
+                d.trade_recovery_plans(self.main_window.id, &self.market_integrity, context)
+            })
+            .collect::<Vec<_>>();
+        let mut tasks = Vec::new();
+        for token in plans {
+            if !self.market_integrity.token_is_current(&token)
+                || self
+                    .recovery_jobs
+                    .iter()
+                    .any(|(old, _)| old.pane == token.pane)
+                || self.recovery_attempts.iter().any(|(old, at)| {
+                    old.same_work(&token) && now.duration_since(*at) < Duration::from_secs(30)
+                })
+            {
+                continue;
+            }
+            // Bound concurrent REST jobs; each job also bounds pages, records and time.
+            if self.recovery_jobs.len() >= 2 {
+                break;
+            }
+            self.recovery_attempts
+                .retain(|(old, _)| old.pane != token.pane);
+            self.recovery_attempts.push((token.clone(), now));
+            let handles = self.data_sources.exchange.clone();
+            let work = token.clone();
+            let (task, handle) = Task::perform(
+                async move {
+                    connector::fetcher::fetch_verified_trade_history(
+                        &handles,
+                        work.stream.ticker_info(),
+                        work.from,
+                        work.to,
+                    )
+                    .await
+                    .map_err(|e| e.to_string())
+                },
+                {
+                    let token = token.clone();
+                    move |result| Message::TradeRecoveryCompleted {
+                        token: token.clone(),
+                        result,
+                    }
+                },
+            )
+            .abortable();
+            self.recovery_jobs.push((token, handle.abort_on_drop()));
+            tasks.push(task);
+        }
+        Task::batch(tasks)
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
+        // Ordinary WS traffic changes no subscriptions or integrity state. All
+        // structural/fetch updates are fenced before handling and before view.
+        let sync = !matches!(&message, Message::MarketWsEvent(_, event)
+            if !matches!(event, exchange::Event::IntegrityLost(_) | exchange::Event::RecoveryEvidence(_)))
+            || (!self.market_integrity.faults().is_empty()
+                && matches!(
+                    &message,
+                    Message::MarketWsEvent(_, exchange::Event::TradesReceived(..))
+                ));
+        if sync {
+            self.sync_ws_integrity();
+        }
+        let task = self.update_message(message);
+        if sync {
+            self.sync_ws_integrity();
+        }
+        task
+    }
+
+    fn update_message(&mut self, message: Message) -> Task<Message> {
         match message {
+            Message::TradeRecoveryCompleted { token, result } => {
+                let Some(index) = self.recovery_jobs.iter().position(|(t, _)| t == &token) else {
+                    return Task::none();
+                };
+                self.recovery_jobs.remove(index);
+                if !self.market_integrity.token_is_current(&token) {
+                    return Task::none();
+                }
+                match result {
+                    Ok(history) => {
+                        for dashboard in self.layout_manager.iter_dashboards_mut() {
+                            if dashboard.has_recovery_owner(self.main_window.id, &token) {
+                                if let Err(reason) = dashboard.apply_trade_recovery(
+                                    self.main_window.id,
+                                    &token,
+                                    &history,
+                                ) {
+                                    log::warn!(
+                                        "WS TradeRecoveryNotApplied | request={} reason={reason}",
+                                        token.request
+                                    );
+                                }
+                                break;
+                            }
+                        }
+                    }
+                    Err(reason) => log::warn!(
+                        "WS TradeRecoveryIncomplete | request={} reason={reason}",
+                        token.request
+                    ),
+                }
+                return Task::none();
+            }
             Message::MarketWsEvent(context, event) => {
                 if !context.is_current() {
                     return Task::none();
                 }
                 let main_window_id = self.main_window.id;
+
+                if let exchange::Event::RecoveryEvidence(evidence) = &event {
+                    self.market_integrity.record_evidence(evidence);
+                    return Task::none();
+                }
+
+                if let exchange::Event::IntegrityLost(loss) = &event {
+                    if !self.market_integrity.record_loss(loss) {
+                        return Task::none();
+                    }
+                    let streams = loss
+                        .streams
+                        .iter()
+                        .map(crate::connector::fetcher::format_stream)
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    log::error!("WS IntegrityLost | {loss:?}");
+                    self.notifications.push(
+                        Toast::warn(format!(
+                            "Потеря WebSocket-данных: {streams}. {} UTC. \
+                         Сессия {}, поколение {}, {}: не доставлено событий — {}. \
+                         Полнота данных не подтверждена; восстановление не гарантировано. \
+                         Не полагайтесь на расчёты затронутого периода.",
+                            chrono::DateTime::from_timestamp_millis(
+                                loss.detected_at.as_u64() as i64
+                            )
+                            .unwrap_or_default()
+                            .format("%Y-%m-%d %H:%M:%S%.3f"),
+                            loss.session.0,
+                            loss.generation.0,
+                            if loss.auxiliary {
+                                "вспомогательный поток"
+                            } else {
+                                "основной поток"
+                            },
+                            loss.lost_events.len(),
+                        ))
+                        .persistent(),
+                    );
+                    // Integrity is separate from connectivity; neither Connected nor
+                    // the existing backfill completion proves recovery.
+                    return Task::none();
+                }
 
                 if let exchange::Event::Connected(streams) = &event {
                     log::info!("WS Connected | streams={}", streams.len());
@@ -719,7 +927,9 @@ impl Flowsurface {
                 }
 
                 match event {
-                    exchange::Event::Connected(..)
+                    exchange::Event::RecoveryEvidence(..)
+                    | exchange::Event::IntegrityLost(..)
+                    | exchange::Event::Connected(..)
                     | exchange::Event::Disconnected(..)
                     | exchange::Event::OrderFlow(..)
                     | exchange::Event::OrderFlowTrades(..) => {
@@ -736,6 +946,7 @@ impl Flowsurface {
                         });
                     }
                     exchange::Event::TradesReceived(stream, update_t, buffer) => {
+                        self.market_integrity.observe_trades(stream, &buffer);
                         let now = exchange::UnixMs::now();
                         let first_trade_t = buffer.first().map(|trade| trade.time);
                         let last_trade_t = buffer.last().map(|trade| trade.time);
@@ -1000,8 +1211,9 @@ impl Flowsurface {
                         .collect::<Vec<_>>(),
                 );
 
+                let recovery_task = self.schedule_trade_recovery(now);
                 return Task::batch(
-                    [connectivity_task, chart_tick, startup_task]
+                    [connectivity_task, chart_tick, startup_task, recovery_task]
                         .into_iter()
                         .chain(gex_tasks)
                         .chain(proxy_tasks)

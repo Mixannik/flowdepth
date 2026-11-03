@@ -2,7 +2,7 @@
 
 use data::orderflow::iceberg::{BinanceIcebergDetector, IcebergDetectorConfig, IcebergEvent};
 use exchange::{TickerInfo, UnixMs, orderflow::OrderFlowEvent, unit::PriceStep};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 const RELEASE_GRACE_MS: u64 = 5_000;
 
@@ -21,9 +21,28 @@ struct SharedDetector {
 #[derive(Default)]
 pub struct IcebergDetectorRegistry {
     detectors: FxHashMap<DetectorKey, SharedDetector>,
+    integrity_blocked: FxHashSet<exchange::Ticker>,
 }
 
 impl IcebergDetectorRegistry {
+    /// Keep old confirmed events, but discard in-flight episodes and prevent a
+    /// later Healthy/snapshot event from silently re-enabling a damaged source.
+    pub fn set_integrity_blocks(&mut self, tickers: &[TickerInfo], at: UnixMs) {
+        let blocked: FxHashSet<_> = tickers.iter().map(|info| info.ticker).collect();
+        for (key, shared) in &mut self.detectors {
+            if blocked.contains(&key.ticker_info.ticker)
+                && !self.integrity_blocked.contains(&key.ticker_info.ticker)
+            {
+                shared.engine.ingest(OrderFlowEvent::Quality {
+                    ticker_info: key.ticker_info,
+                    at,
+                    quality: exchange::orderflow::OrderFlowDataQuality::Gap,
+                });
+            }
+        }
+        self.integrity_blocked = blocked;
+    }
+
     pub fn sync_requirements(
         &mut self,
         requirements: Vec<(DetectorKey, IcebergDetectorConfig)>,
@@ -74,6 +93,9 @@ impl IcebergDetectorRegistry {
 
     pub fn ingest(&mut self, event: OrderFlowEvent) -> Vec<IcebergEvent> {
         let ticker_info = event.ticker_info();
+        if self.integrity_blocked.contains(&ticker_info.ticker) {
+            return Vec::new();
+        }
         self.detectors
             .iter_mut()
             .filter(|(key, shared)| key.ticker_info == ticker_info && shared.consumers > 0)
@@ -120,6 +142,59 @@ mod tests {
             ticker_info,
             tick_size: ticker_info.min_ticksize.into(),
         }
+    }
+
+    #[test]
+    fn ws_integrity_blocks_healthy_and_new_detector_instances_but_not_other_markets() {
+        use exchange::orderflow::{AggressorSide, NormalizedTradeEvent, OrderFlowDataQuality};
+        let btc = key();
+        let mut eth = key();
+        eth.ticker_info.ticker = Ticker::new("ETHUSDT", Exchange::BinanceLinear);
+        let config = IcebergDetectorConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let mut registry = IcebergDetectorRegistry::default();
+        registry.sync_requirements(vec![(btc, config), (eth, config)], UnixMs::new(100));
+        let trade = |key: DetectorKey, id: u64| {
+            OrderFlowEvent::Trade(NormalizedTradeEvent {
+                ticker_info: key.ticker_info,
+                event_time: UnixMs::new(100),
+                trade_time: UnixMs::new(100),
+                receive_time: UnixMs::new(100),
+                trade_id: id,
+                price: exchange::unit::Price::from_f64(100.0),
+                quantity: exchange::unit::Qty::from_f64(1.0),
+                aggressor: AggressorSide::Buy,
+            })
+        };
+        registry.ingest(trade(btc, 1));
+        registry.ingest(trade(eth, 1));
+        assert_eq!(registry.detectors[&btc].engine.buffered_count(), 1);
+        let retained = registry.detectors[&btc].engine.retained_events().len();
+        registry.set_integrity_blocks(&[btc.ticker_info], UnixMs::new(110));
+        assert_eq!(registry.detectors[&btc].engine.buffered_count(), 0);
+        assert_eq!(registry.detectors[&eth].engine.buffered_count(), 1);
+        assert_eq!(
+            registry.detectors[&btc].engine.retained_events().len(),
+            retained
+        );
+        assert!(
+            registry
+                .ingest(OrderFlowEvent::Quality {
+                    ticker_info: btc.ticker_info,
+                    at: UnixMs::new(120),
+                    quality: OrderFlowDataQuality::Healthy
+                })
+                .is_empty()
+        );
+        assert!(registry.ingest(trade(btc, 2)).is_empty());
+        assert_eq!(registry.detectors[&btc].engine.buffered_count(), 0);
+        registry.sync_requirements(vec![(eth, config)], UnixMs::new(200));
+        registry.collect_garbage(UnixMs::new(6000));
+        registry.sync_requirements(vec![(btc, config), (eth, config)], UnixMs::new(6001));
+        assert!(registry.ingest(trade(btc, 3)).is_empty());
+        assert_eq!(registry.detectors[&btc].engine.buffered_count(), 0);
     }
 
     #[test]

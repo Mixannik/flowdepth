@@ -348,6 +348,14 @@ struct DepthAdapter {
 }
 
 impl WsAdapter for DepthAdapter {
+    fn book_sync_proof(&self) -> Option<(StreamKind, crate::UnixMs, u64)> {
+        (self.local_depth_cache.last_update_id > 0).then_some((
+            self.stream,
+            self.local_depth_cache.time,
+            self.local_depth_cache.last_update_id,
+        ))
+    }
+
     fn heartbeat_policy(&self) -> HeartbeatPolicy {
         HYPERLIQUID_HEARTBEAT
     }
