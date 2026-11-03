@@ -29,6 +29,18 @@ Architecture work is incremental. Passing tests do not establish correctness aga
 
 ## Reproduce the checks
 
+The shared runner is `python -B scripts/quality_gate.py --mode fast` (Python 3.10+, standard library). Use `--mode full` for market-data/recovery/cache changes and broad validation; full adds the existing release workspace tests and both indicator catalogs. No application GUI, packaging or release is launched. Cargo uses the pinned toolchain, `--locked` and offline dependencies by default; `--online` permits dependency downloads, as in PR CI.
+
+Fast includes formatting, release all-target compilation, existing FD-001 WS-01/02/03 bounded/unbounded regressions (required counts/named scenarios), and four real profile-isolation/subprocess smoke tests. These create temporary synthetic files; the runner sets a fresh `.local/quality-gate/<run>/profile` as an additional safety fence. It does not invoke test-profile.mjs, copy working layouts, replace executables or access the application's shared credential store.
+
+`--allow-docs-only` skips Rust only when all changed paths are allowlisted Markdown; otherwise the requested Rust mode runs. Local selection includes staged/unstaged/untracked files against HEAD. CI supplies `--base SHA --head SHA`, uses merge-base diff and the same classifier. Check links/paths of changed documents as well; whitespace diff and runner tests remain automatic. The stable PR quality job completes even for documentation-only PRs. Release guards in develop-ci remain unchanged.
+
+Each run writes commands, return codes, durations, logs and `report.json` under the ignored `.local/quality-gate/` directory. HEAD and a working-tree fingerprint identify the checked inputs. Source changes during a run yield NOT VERIFIED. Exit codes are 0 for PASS, 1 for FAIL and 2 for NOT VERIFIED. The default `--require automated` covers machine checks. `--require all` includes outstanding UI/live checks and skipped workspace tests in the verdict. The report always includes both verdicts. The workspace row describes tests that ran. Its ignored tests get a separate NOT VERIFIED row, with names in `workspace.log`. An ignored FD-001 or profile smoke regression prevents an automated PASS.
+
+Manual FD-001 minimum: in a NEW explicit isolated profile, select BTCUSDT spot/perp, exercise reconnect/recorded overflow, change symbol/tab and reopen normally. Check that warnings persist through partial/error/unsupported recovery, stale generations do not clear them, and only supported proved scopes recover. Raw detectors, liquidation losses and historical depth must not appear repaired by aggregate backfill/current snapshot. Record exact build, UTC interval, units and observations. The gate cannot safely induce exchange overflow, verify rendering or confirm live recovery without an isolated interactive scenario; these remain NOT VERIFIED. Do not change shared keychain, touch the working instance, or forcibly close it. Targeted regressions establish synthetic correctness, not live exchange completeness.
+
+The gate is extensible through `plan()` in scripts/quality_gate.py: add task-specific existing regressions with a positive minimum and named critical tests. Keep FD task statuses in DEV_TASKS; a passing automated gate alone must not mark FD-001 Done. To stop a stuck check the runner terminates only its owned Cargo/test process tree after `--timeout` seconds (default 1800); it never starts an interactive application. Concurrent gate runs are rejected; inspect the PID before removing a stale run.lock after an abnormal runner exit.
+
 Run from the workspace root using the pinned Rust toolchain:
 
 ```sh
