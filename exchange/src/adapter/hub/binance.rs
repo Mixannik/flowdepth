@@ -9,6 +9,7 @@ use super::{AdapterError, HttpHub, RequestPort};
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
 pub mod fetch;
+use fetch::BinanceRawTradeV1;
 mod kline;
 pub mod stream;
 
@@ -212,6 +213,22 @@ impl BinanceHandle {
             .await
     }
 
+    pub async fn fetch_raw_trades(
+        &self,
+        ticker: TickerInfo,
+        from_time: UnixMs,
+        data_path: Option<PathBuf>,
+    ) -> Result<Vec<BinanceRawTradeV1>, AdapterError> {
+        self.request_port
+            .request(move |reply| BinanceCommand::BinanceRawTrades {
+                ticker,
+                from_time,
+                data_path,
+                reply,
+            })
+            .await
+    }
+
     pub async fn fetch_trades(
         &self,
         ticker: TickerInfo,
@@ -400,6 +417,16 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
         })
     }
 
+    fn fetch_binance_raw_trades(
+        &mut self,
+        ticker: TickerInfo,
+        from_time: UnixMs,
+        data_path: Option<PathBuf>,
+    ) -> futures::future::BoxFuture<'_, Result<Vec<BinanceRawTradeV1>, AdapterError>> {
+        let hub = self.hub_for_market(ticker.market_type());
+        Box::pin(fetch::fetch_raw_trades(hub, ticker, from_time, data_path))
+    }
+
     fn fetch_trades(
         &mut self,
         ticker_info: TickerInfo,
@@ -408,13 +435,18 @@ impl super::FetchCommandHandler<BinanceMarketScope> for Worker {
     ) -> futures::future::BoxFuture<'_, Result<Vec<Trade>, AdapterError>> {
         let market = ticker_info.market_type();
         Box::pin(async move {
-            fetch::fetch_trades(
+            let records = fetch::fetch_raw_trades(
                 self.hub_for_market(market),
                 ticker_info,
                 from_time,
                 data_path,
             )
-            .await
+            .await?;
+            let preference = crate::unit::qty::volume_size_unit();
+            records
+                .iter()
+                .map(|trade| trade.project(ticker_info, preference))
+                .collect()
         })
     }
 }

@@ -983,6 +983,7 @@ mod market_layout_tests {
                 },
                 style: Default::default(),
                 visible: true,
+                visibility: Default::default(),
             }],
             stream_type: streams(btc.ticker),
             settings: settings.clone(),
@@ -1258,6 +1259,7 @@ mod market_layout_tests {
             },
             style: Default::default(),
             visible: true,
+            visibility: Default::default(),
         };
         let price_line = Drawing {
             id: 2,
@@ -1266,6 +1268,7 @@ mod market_layout_tests {
             },
             style: Default::default(),
             visible: true,
+            visibility: Default::default(),
         };
         let mut copied = data::Dashboard {
             pane: data::Pane::KlineChart {

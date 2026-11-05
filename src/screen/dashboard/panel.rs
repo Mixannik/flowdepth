@@ -11,12 +11,16 @@ use std::time::Instant;
 pub enum Message {
     Scrolled(f32),
     ResetScroll,
+    LadderControl(ladder::Control),
+    DepthRulerMoved(bool, exchange::unit::Price),
     Invalidate(Option<Instant>),
 }
 
 pub enum Action {}
 
 pub trait Panel {
+    fn ladder_control(&mut self, _control: ladder::Control) {}
+    fn move_depth_ruler(&mut self, _upper: bool, _price: exchange::unit::Price) {}
     fn scroll(&mut self, scroll: f32);
 
     fn reset_scroll(&mut self);
@@ -40,6 +44,8 @@ pub fn view<T: Panel>(panel: &'_ T, timezone: data::UserTimezone) -> Element<'_,
 
 pub fn update<T: Panel>(panel: &mut T, message: Message) {
     match message {
+        Message::LadderControl(control) => panel.ladder_control(control),
+        Message::DepthRulerMoved(upper, price) => panel.move_depth_ruler(upper, price),
         Message::Scrolled(delta) => {
             panel.scroll(delta);
         }

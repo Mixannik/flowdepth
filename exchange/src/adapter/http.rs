@@ -1,5 +1,5 @@
 use crate::adapter::limiter::RateLimiter;
-use crate::adapter::{AdapterError, KlinePage};
+use crate::adapter::{AdapterError, BinanceRawTradeV1, KlinePage};
 use crate::depth::DepthPayload;
 use crate::{Kline, OpenInterest, Ticker, TickerInfo, TickerStats, Timeframe, Trade, UnixMs};
 
@@ -53,6 +53,12 @@ pub(super) enum FetchCommand<M> {
         ticker: TickerInfo,
         cursor: crate::adapter::TradePageCursor,
         reply: ResponseTx<Vec<Trade>>,
+    },
+    BinanceRawTrades {
+        ticker: TickerInfo,
+        from_time: UnixMs,
+        data_path: Option<PathBuf>,
+        reply: ResponseTx<Vec<BinanceRawTradeV1>>,
     },
     Trades {
         ticker: TickerInfo,
@@ -363,6 +369,16 @@ pub(super) trait FetchCommandHandler<M> {
         Box::pin(async { Err(unsupported_fetch("Verified aggregate trade pages")) })
     }
 
+    fn fetch_binance_raw_trades(
+        &mut self,
+        ticker: TickerInfo,
+        from_time: UnixMs,
+        data_path: Option<PathBuf>,
+    ) -> BoxFuture<'_, Result<Vec<BinanceRawTradeV1>, AdapterError>> {
+        let _ = (ticker, from_time, data_path);
+        Box::pin(async { Err(unsupported_fetch("Binance raw trades fetch")) })
+    }
+
     fn fetch_trades(
         &mut self,
         ticker_info: TickerInfo,
@@ -450,6 +466,17 @@ where
             reply,
         } => {
             let result = handler.fetch_recovery_trade_page(ticker, cursor).await;
+            let _ = reply.send(result);
+        }
+        FetchCommand::BinanceRawTrades {
+            ticker,
+            from_time,
+            data_path,
+            reply,
+        } => {
+            let result = handler
+                .fetch_binance_raw_trades(ticker, from_time, data_path)
+                .await;
             let _ = reply.send(result);
         }
         FetchCommand::Trades {

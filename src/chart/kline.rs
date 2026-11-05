@@ -36,6 +36,7 @@ use enum_map::EnumMap;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::{cell::RefCell, sync::Arc, time::Instant};
 
+mod cluster_search;
 mod drawing;
 mod failed_auction;
 mod naked_levels;
@@ -199,19 +200,15 @@ impl Chart for KlineChart {
 
         let data_labels_always_visible = self.visual_config.data_labels_always_visible;
 
-        let market = chart_state.ticker_info.market_type();
         let mut elements = vec![];
+        let mut seen = EnumMap::default();
 
-        for selected_indicator in enabled {
-            if !self.kind.allows_indicator(*selected_indicator)
-                || !KlineIndicator::for_market(market).contains(selected_indicator)
-            {
+        for &kind in enabled {
+            if seen[kind] || kind.is_overlay() || !self.indicator_visible(kind) {
                 continue;
             }
-            if selected_indicator.is_overlay() {
-                continue;
-            }
-            if let Some(indi) = self.indicators[*selected_indicator].as_ref() {
+            seen[kind] = true;
+            if let Some(indi) = self.indicators[kind].as_ref() {
                 elements.push(indi.element(
                     chart_state,
                     data_labels_always_visible,
@@ -272,7 +269,7 @@ impl Chart for KlineChart {
     }
 
     fn plot_overlay(&'_ self) -> Option<Element<'_, Message>> {
-        matches!(self.kind, KlineChartKind::Candles).then(|| self.drawing_overlay())
+        Some(self.drawing_overlay())
     }
 
     fn drawing_axis_labels(
@@ -281,9 +278,7 @@ impl Chart for KlineChart {
         Vec<crate::chart::ticks::AxisOverlayLabel>,
         Vec<crate::chart::ticks::AxisOverlayLabel>,
     ) {
-        matches!(self.kind, KlineChartKind::Candles)
-            .then(|| self.axis_drawing_labels())
-            .unwrap_or_default()
+        self.axis_drawing_labels()
     }
 }
 
@@ -355,15 +350,16 @@ pub struct KlineChart {
     derive_freshness: data::chart::gex::GexFreshness,
     gex_render_cache: RefCell<GexRenderCache>,
     rendered_volume_bubbles: RefCell<Vec<RenderedVolumeBubble>>,
+    cluster_search_markers: RefCell<Vec<cluster_search::Marker>>,
     stabilized_bubble_threshold: RefCell<StabilizedBubbleThreshold>,
     drawings: drawing::DrawingState,
     pending_tick_multiplier: Option<TickMultiplier>,
     /// Hourly candles (open time → candle) for long fixed-range profiles.
+    tpo_candles: std::collections::BTreeMap<UnixMs, Kline>,
     range_hourly: std::collections::BTreeMap<u64, Kline>,
     range_hourly_confirmed: std::collections::BTreeSet<u64>,
     profile_calculations: profile_state::ProfileCalculations,
-    /// Fixed-range profile levels drawn on other charts of this ticker.
-    shared_range_levels: Vec<range_levels::RangeLevels>,
+    shared_range_profiles: Vec<range_levels::SharedRangeProfile>,
 }
 
 #[derive(Debug, Default)]
@@ -404,7 +400,7 @@ impl KlineChart {
         let raw_trades =
             deduplicate_incoming_trades(&[], &raw_trades, "initial", Some(ticker_info));
 
-        match basis {
+        let mut result = match basis {
             Basis::Time(interval) => {
                 let timeseries = TimeSeries::<KlineDataPoint>::new(interval, step, klines_raw)
                     .with_trades(&raw_trades);
@@ -513,13 +509,15 @@ impl KlineChart {
                     derive_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
+                    cluster_search_markers: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
                     pending_tick_multiplier: None,
+                    tpo_candles: std::collections::BTreeMap::new(),
                     range_hourly: std::collections::BTreeMap::new(),
                     range_hourly_confirmed: std::collections::BTreeSet::new(),
                     profile_calculations: profile_state::ProfileCalculations::default(),
-                    shared_range_levels: Vec::new(),
+                    shared_range_profiles: Vec::new(),
                 }
             }
             Basis::Tick(interval) => {
@@ -600,16 +598,20 @@ impl KlineChart {
                     derive_freshness: data::chart::gex::GexFreshness::Loading,
                     gex_render_cache: RefCell::new(GexRenderCache::default()),
                     rendered_volume_bubbles: RefCell::new(Vec::new()),
+                    cluster_search_markers: RefCell::new(Vec::new()),
                     stabilized_bubble_threshold: RefCell::new(StabilizedBubbleThreshold::default()),
                     drawings: drawing::DrawingState::default(),
                     pending_tick_multiplier: None,
+                    tpo_candles: std::collections::BTreeMap::new(),
                     range_hourly: std::collections::BTreeMap::new(),
                     range_hourly_confirmed: std::collections::BTreeSet::new(),
                     profile_calculations: profile_state::ProfileCalculations::default(),
-                    shared_range_levels: Vec::new(),
+                    shared_range_profiles: Vec::new(),
                 }
             }
-        }
+        };
+        result.sync_visible_panel_splits();
+        result
     }
 
     pub fn update_latest_kline(&mut self, kline: &Kline, received_at: UnixMs) {
@@ -746,6 +748,28 @@ impl KlineChart {
                     visible_span,
                     fetcher::format_time_short(UnixMs::new(prefetch_earliest))
                 );
+
+                if self.indicator_enabled(KlineIndicator::Tpo)
+                    && let Some((from, to)) = tpo::missing_range(
+                        &self.tpo_candles,
+                        visible_earliest,
+                        visible_latest,
+                        UnixMs::now(),
+                        &self.visual_config.tpo,
+                    )
+                    && let Some(action) = request_fetch(
+                        &mut self.request_handler,
+                        FetchRange::RefKlines {
+                            from,
+                            to,
+                            timeframe: exchange::Timeframe::M30,
+                            spot: false,
+                        },
+                        Some(&self.chart.ticker_info),
+                    )
+                {
+                    return Some(action);
+                }
 
                 // priority 1, initial klines for visible range
                 if visible_earliest_ms < kline_earliest {
@@ -1413,6 +1437,7 @@ impl KlineChart {
         self.request_handler = RequestHandler::default();
         log::warn!("CHART Reset | reason=cache_invalidated request_history=discarded");
         self.raw_trades.clear();
+        self.tpo_candles.clear();
         self.range_hourly.clear();
         self.range_hourly_confirmed.clear();
         self.raw_trades_pruned = false;
@@ -1464,6 +1489,10 @@ impl KlineChart {
                 false
             }
         }
+    }
+
+    pub fn mark_trade_request_progress(&mut self, req_id: uuid::Uuid) {
+        self.request_handler.mark_trade_progress(req_id);
     }
 
     pub fn mark_trade_request_completed(&mut self, req_id: uuid::Uuid) {
@@ -1897,6 +1926,47 @@ impl KlineChart {
         (price.is_finite() && price > 0.0).then_some(price)
     }
 
+    pub fn indicator_visibility(
+        &self,
+        indicator: KlineIndicator,
+    ) -> data::chart::indicator::ObjectVisibility {
+        self.visual_config.indicator_visibility[indicator]
+    }
+
+    pub fn indicator_visible(&self, indicator: KlineIndicator) -> bool {
+        self.indicator_enabled(indicator)
+            && KlineIndicator::for_market(self.chart.ticker_info.market_type()).contains(&indicator)
+            && self
+                .indicator_visibility(indicator)
+                .is_visible(self.chart.basis)
+    }
+
+    pub fn set_indicator_visibility(
+        &mut self,
+        indicator: KlineIndicator,
+        visibility: data::chart::indicator::ObjectVisibility,
+    ) {
+        self.visual_config.indicator_visibility[indicator] = visibility;
+        self.sync_visible_panel_splits();
+        if indicator == KlineIndicator::VolumeBubbles && !self.indicator_visible(indicator) {
+            self.rendered_volume_bubbles.borrow_mut().clear();
+        }
+        self.chart.cache.clear_all();
+    }
+
+    fn sync_visible_panel_splits(&mut self) {
+        let count = self
+            .indicators
+            .iter()
+            .filter(|(kind, _)| !kind.is_overlay() && self.indicator_visible(*kind))
+            .count();
+        let previous = self.chart.layout.splits.len();
+        if count.max(1) != previous || count == 1 {
+            let main = self.chart.layout.splits.first().copied().unwrap_or(0.8);
+            self.chart.layout.splits = data::util::calc_panel_splits(main, count, Some(previous));
+        }
+    }
+
     pub fn indicator_enabled(&self, indicator: KlineIndicator) -> bool {
         self.indicators[indicator].is_some()
     }
@@ -2035,6 +2105,7 @@ impl KlineChart {
         let scripted_changed = self.visual_config.scripted != visual_config.scripted
             || self.visual_config.cvd != visual_config.cvd;
         self.visual_config = visual_config;
+        self.sync_visible_panel_splits();
         let config = self.visual_config;
         self.chart.cache.clear_all();
         self.indicators
@@ -2123,6 +2194,7 @@ impl KlineChart {
         self.chart.last_price = None;
         self.chart.max_price = Price::from_f32(0.0);
         self.chart.basis = new_basis;
+        self.sync_visible_panel_splits();
 
         match new_basis {
             Basis::Time(interval) => {
@@ -2582,15 +2654,19 @@ impl KlineChart {
             text_color: palette.background.base.text,
         };
         for kind in [KlineIndicator::PeriodLevels, KlineIndicator::Vwap] {
-            if self.indicator_enabled(kind)
+            if self.indicator_visible(kind)
                 && let Some(indi) = self.indicators[kind].as_ref()
             {
                 indi.draw_overlay(frame, &ctx);
             }
         }
-        let mut levels = self.range_levels();
-        levels.extend_from_slice(&self.shared_range_levels);
+        let levels = self.range_levels();
         range_levels::draw(&levels, frame, &ctx);
+        let shared = self
+            .visible_shared_range_profiles()
+            .map(|profile| profile.levels)
+            .collect::<Vec<_>>();
+        range_levels::draw_shared(&shared, frame, &ctx);
     }
 
     pub fn insert_ref_trades(
@@ -2625,6 +2701,22 @@ impl KlineChart {
             }
         }
 
+        if !spot
+            && timeframe == exchange::Timeframe::M30
+            && self.indicator_enabled(KlineIndicator::Tpo)
+        {
+            let closed_before = UnixMs::now().floor_to(timeframe);
+            self.tpo_candles.extend(
+                klines
+                    .iter()
+                    .filter(|bar| {
+                        bar.time < closed_before && bar.time == bar.time.floor_to(timeframe)
+                    })
+                    .map(|bar| (bar.time, *bar)),
+            );
+            self.chart.cache.clear_all();
+        }
+
         for indi in self.indicators.values_mut().filter_map(Option::as_mut) {
             indi.on_ref_klines(spot, timeframe, klines);
         }
@@ -2653,13 +2745,48 @@ impl KlineChart {
         }
     }
 
-    /// Levels of this chart's fixed-range profiles that continue to the right edge, for
-    /// this chart and for the other charts of its ticker.
+    /// Levels of this chart's fixed-range profiles that continue to its right edge.
     pub fn range_levels(&self) -> Vec<range_levels::RangeLevels> {
-        if self.ws_integrity_revision.is_some() {
-            return Vec::new();
+        self.owned_range_levels().map(|(_, level)| level).collect()
+    }
+
+    pub fn shared_range_profile_exports(
+        &self,
+        source_pane: uuid::Uuid,
+    ) -> Vec<range_levels::SharedRangeProfile> {
+        self.owned_range_levels()
+            .filter_map(|(drawing_id, levels)| {
+                let drawing = self.drawings.drawings.iter().find(|d| d.id == drawing_id)?;
+                drawing
+                    .style
+                    .fixed_range_volume_profile
+                    .share_levels
+                    .then_some(range_levels::SharedRangeProfile {
+                        source_pane,
+                        source_ticker: self.chart.ticker_info.ticker,
+                        source_basis: self.chart.basis,
+                        drawing_id,
+                        visibility: drawing.visibility,
+                        levels,
+                    })
+            })
+            .collect()
+    }
+
+    pub fn set_shared_range_profiles(&mut self, profiles: Vec<range_levels::SharedRangeProfile>) {
+        if self.shared_range_profiles != profiles {
+            self.shared_range_profiles = profiles;
+            self.chart.cache.clear_all();
         }
-        self.prepared_range_levels()
+    }
+
+    fn visible_shared_range_profiles(
+        &self,
+    ) -> impl Iterator<Item = &range_levels::SharedRangeProfile> {
+        self.shared_range_profiles.iter().filter(|profile| {
+            matches!(self.chart.basis, Basis::Time(_))
+                && profile.visibility.is_visible(self.chart.basis)
+        })
     }
 
     /// Prices of every reference level this chart shows (fixed-range profiles, period
@@ -2669,11 +2796,15 @@ impl KlineChart {
         let mut prices: Vec<f64> = self
             .range_levels()
             .iter()
-            .chain(&self.shared_range_levels)
             .flat_map(|levels| levels.prices())
             .collect();
         if self.drawings.visible {
-            for drawing in self.drawings.drawings.iter().filter(|d| d.visible) {
+            for drawing in self
+                .drawings
+                .drawings
+                .iter()
+                .filter(|d| d.is_visible(self.chart.basis))
+            {
                 match &drawing.geometry {
                     data::chart::kline::drawing::DrawingGeometry::HorizontalLine { price } => {
                         prices.push(price.to_f64());
@@ -2686,13 +2817,13 @@ impl KlineChart {
             }
         }
         for kind in [KlineIndicator::PeriodLevels, KlineIndicator::Vwap] {
-            if self.indicator_enabled(kind)
+            if self.indicator_visible(kind)
                 && let Some(indi) = self.indicators[kind].as_ref()
             {
                 prices.extend(indi.reference_prices());
             }
         }
-        if self.indicator_enabled(KlineIndicator::NakedLevels) {
+        if self.indicator_visible(KlineIndicator::NakedLevels) {
             prices.extend(
                 self.profile_calculations
                     .naked
@@ -2715,12 +2846,12 @@ impl KlineChart {
         const DAY_MS: u64 = 24 * 60 * 60_000;
 
         let mut levels = Vec::new();
-        if self.indicator_enabled(KlineIndicator::PeriodLevels)
+        if self.indicator_visible(KlineIndicator::PeriodLevels)
             && let Some(indi) = self.indicators[KlineIndicator::PeriodLevels].as_ref()
         {
             levels.extend(indi.auction_levels(from, to));
         }
-        for range in self.range_levels().iter().chain(&self.shared_range_levels) {
+        for range in &self.range_levels() {
             for (price, name) in [(range.vah, "VAH"), (range.val, "VAL")] {
                 levels.push(AuctionLevel {
                     price,
@@ -2732,7 +2863,12 @@ impl KlineChart {
             }
         }
         if self.drawings.visible {
-            for drawing in self.drawings.drawings.iter().filter(|d| d.visible) {
+            for drawing in self
+                .drawings
+                .drawings
+                .iter()
+                .filter(|d| d.is_visible(self.chart.basis))
+            {
                 if let data::chart::kline::drawing::DrawingGeometry::HorizontalLine { price } =
                     &drawing.geometry
                 {
@@ -2759,15 +2895,6 @@ impl KlineChart {
         }
     }
 
-    pub fn set_shared_range_levels(&mut self, levels: Vec<range_levels::RangeLevels>) {
-        if self.shared_range_levels != levels {
-            self.shared_range_levels = levels;
-            self.chart.cache.clear_all();
-        }
-    }
-
-    /// The fixed-range profile as far as its data is loaded: hourly candles for long
-    /// ranges, trades otherwise.
     fn compute_fixed_volume_profile(
         &self,
         from: UnixMs,
@@ -3005,11 +3132,6 @@ impl KlineChart {
             return;
         }
 
-        let prev_indi_count = KlineIndicator::for_market(self.chart.ticker_info.market_type())
-            .iter()
-            .filter(|indicator| !indicator.is_overlay() && self.indicators[**indicator].is_some())
-            .count();
-
         let enabling = self.indicators[indicator].is_none();
         if !enabling {
             self.indicators[indicator] = None;
@@ -3024,20 +3146,7 @@ impl KlineChart {
             self.visual_config.volume_bubbles.enabled = enabling;
         }
 
-        if let Some(main_split) = self.chart.layout.splits.first() {
-            let current_indi_count =
-                KlineIndicator::for_market(self.chart.ticker_info.market_type())
-                    .iter()
-                    .filter(|indicator| {
-                        !indicator.is_overlay() && self.indicators[**indicator].is_some()
-                    })
-                    .count();
-            self.chart.layout.splits = data::util::calc_panel_splits(
-                *main_split,
-                current_indi_count,
-                Some(prev_indi_count),
-            );
-        }
+        self.sync_visible_panel_splits();
         self.invalidate(None);
         self.last_tick = Instant::now() - std::time::Duration::from_secs(1);
     }
@@ -3300,7 +3409,7 @@ impl canvas::Program<Message> for KlineChart {
                         imbalance.is_some(),
                     );
 
-                    if self.indicator_enabled(KlineIndicator::NakedLevels) {
+                    if self.indicator_visible(KlineIndicator::NakedLevels) {
                         naked_levels::draw_levels(
                             &self.profile_calculations.naked,
                             frame,
@@ -3312,7 +3421,7 @@ impl canvas::Program<Message> for KlineChart {
                             &self.visual_config.indicator_configs.naked_levels,
                         );
                     }
-                    if self.session_vwap_enabled() {
+                    if self.session_vwap_enabled() && self.indicator_visible(KlineIndicator::Vwap) {
                         draw_vwap_overlay(
                             &self.data_source,
                             frame,
@@ -3389,7 +3498,7 @@ impl canvas::Program<Message> for KlineChart {
                             _ => None,
                         })
                         .filter(|_| self.ws_integrity_revision.is_none());
-                    if self.indicator_enabled(KlineIndicator::OiBars)
+                    if self.indicator_visible(KlineIndicator::OiBars)
                         && let Some(oi) = self.indicators[KlineIndicator::OpenInterest]
                             .as_ref()
                             .and_then(|indi| indi.open_interest())
@@ -3493,7 +3602,7 @@ impl canvas::Program<Message> for KlineChart {
                     let proxy_asset =
                         exchange::options::resolve_options_underlying(chart.ticker_info.ticker);
                     let (visible_high, visible_low) = chart.price_range(&region);
-                    if self.indicator_enabled(KlineIndicator::GexLevels)
+                    if self.indicator_visible(KlineIndicator::GexLevels)
                         && (self.gex_snapshot.is_some() || !self.gex_proxy_history.is_empty())
                     {
                         draw_gex_overlay_background(
@@ -3517,7 +3626,7 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    if self.indicator_enabled(KlineIndicator::NakedLevels) {
+                    if self.indicator_visible(KlineIndicator::NakedLevels) {
                         naked_levels::draw_levels(
                             &self.profile_calculations.naked,
                             frame,
@@ -3537,21 +3646,7 @@ impl canvas::Program<Message> for KlineChart {
                         |t| interval_to_x(t),
                         |p| price_to_y(p),
                     );
-                    if self.indicator_enabled(KlineIndicator::Tpo) {
-                        self::tpo::draw(
-                            &self.data_source,
-                            frame,
-                            earliest,
-                            latest,
-                            interval_to_x,
-                            price_to_y,
-                            chart.tick_size,
-                            chart.scaling,
-                            &self.visual_config.tpo,
-                            palette,
-                        );
-                    }
-                    if self.indicator_enabled(KlineIndicator::SessionVolumeProfile) {
+                    if self.indicator_visible(KlineIndicator::SessionVolumeProfile) {
                         draw_session_volume_profiles(
                             &self.profile_calculations.session,
                             frame,
@@ -3562,7 +3657,19 @@ impl canvas::Program<Message> for KlineChart {
                             palette,
                         );
                     }
-                    for (from, to, config) in self.fixed_volume_profiles() {
+                    if self.session_vwap_enabled() && self.indicator_visible(KlineIndicator::Vwap) {
+                        draw_vwap_overlay(
+                            &self.data_source,
+                            frame,
+                            earliest,
+                            latest,
+                            interval_to_x,
+                            price_to_y,
+                            &self.visual_config.vwap,
+                            palette,
+                        );
+                    }
+                    for (from, to, config) in self.visible_fixed_volume_profiles() {
                         if let Some(profile) = self.fixed_volume_profile(from, to, &config) {
                             draw_volume_profile(
                                 frame,
@@ -3575,21 +3682,9 @@ impl canvas::Program<Message> for KlineChart {
                             );
                         }
                     }
-                    if self.session_vwap_enabled() {
-                        draw_vwap_overlay(
-                            &self.data_source,
-                            frame,
-                            earliest,
-                            latest,
-                            interval_to_x,
-                            price_to_y,
-                            &self.visual_config.vwap,
-                            palette,
-                        );
-                    }
                     let volume_bubbles = self.visual_config.volume_bubbles;
                     let bubbles_enabled = volume_bubbles.enabled
-                        && self.indicator_enabled(KlineIndicator::VolumeBubbles);
+                        && self.indicator_visible(KlineIndicator::VolumeBubbles);
                     if !bubbles_enabled {
                         self.rendered_volume_bubbles.borrow_mut().clear();
                     }
@@ -3625,7 +3720,7 @@ impl canvas::Program<Message> for KlineChart {
                             );
                         },
                     );
-                    if self.indicator_enabled(KlineIndicator::GexLevels)
+                    if self.indicator_visible(KlineIndicator::GexLevels)
                         && !self.gex_proxy_history.is_empty()
                     {
                         draw_gex_proxy_zone_cores(
@@ -3667,7 +3762,7 @@ impl canvas::Program<Message> for KlineChart {
                         );
                         *self.rendered_volume_bubbles.borrow_mut() = bubbles;
                     }
-                    if self.indicator_enabled(KlineIndicator::GexLevels)
+                    if self.indicator_visible(KlineIndicator::GexLevels)
                         && let Some(snapshot) = &self.gex_snapshot
                     {
                         draw_gex_overlay_foreground(
@@ -3688,7 +3783,42 @@ impl canvas::Program<Message> for KlineChart {
                 }
             }
 
+            if self.indicator_visible(KlineIndicator::Tpo) {
+                self::tpo::draw(
+                    &self.tpo_candles,
+                    matches!(chart.basis, Basis::Time(_)),
+                    frame,
+                    earliest,
+                    latest,
+                    interval_to_x,
+                    price_to_y,
+                    PriceStep::from(chart.ticker_info.min_ticksize),
+                    region,
+                    chart.scaling,
+                    &self.visual_config.tpo,
+                    palette,
+                );
+            }
+
             chart.draw_last_price_line(frame, palette, region);
+            let mut cluster_studies = match &self.kind {
+                KlineChartKind::Footprint { studies, .. } => studies.clone(),
+                _ => Vec::new(),
+            };
+            for (index, indicator) in [
+                KlineIndicator::ClusterSearch1,
+                KlineIndicator::ClusterSearch2,
+                KlineIndicator::ClusterSearch3,
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                if self.indicator_visible(indicator) {
+                    cluster_studies.push(self.visual_config.cluster_search[index]);
+                }
+            }
+            *self.cluster_search_markers.borrow_mut() =
+                cluster_search::draw(self, frame, &cluster_studies, region, palette);
         });
 
         let crosshair = chart.cache.crosshair.draw(renderer, bounds_size, |frame| {
@@ -3705,7 +3835,17 @@ impl canvas::Program<Message> for KlineChart {
                 );
                 let center = Vector::new(bounds.width / 2.0, bounds.height / 2.0);
                 let bubbles = self.rendered_volume_bubbles.borrow();
-                if let Some(bubble) = hit_test_volume_bubbles(
+                if cluster_search::hover(
+                    frame,
+                    &self.cluster_search_markers.borrow(),
+                    palette,
+                    cursor_position,
+                    bounds_size,
+                    chart.translation,
+                    chart.scaling,
+                    cluster_search::quantity_unit(&chart.ticker_info),
+                ) {
+                } else if let Some(bubble) = hit_test_volume_bubbles(
                     &bubbles,
                     cursor_position,
                     center,
@@ -3730,7 +3870,7 @@ impl canvas::Program<Message> for KlineChart {
                         bounds_size,
                     );
                 } else if self.visual_config.gex_levels().show_hover_tooltip
-                    && self.indicator_enabled(KlineIndicator::GexLevels)
+                    && self.indicator_visible(KlineIndicator::GexLevels)
                     && draw_gex_hover_tooltip(
                         frame,
                         chart,
@@ -3782,7 +3922,13 @@ impl canvas::Program<Message> for KlineChart {
             Interaction::Panning { .. } => mouse::Interaction::Grabbing,
             Interaction::Zoomin { .. } => mouse::Interaction::ZoomIn,
             Interaction::None | Interaction::Ruler { .. } => {
-                if cursor.is_over(bounds) {
+                if matches!(interaction.navigation, Interaction::None)
+                    && cursor
+                        .position_in(bounds)
+                        .is_some_and(|point| self.fixed_profile_level_hit(point, bounds).is_some())
+                {
+                    mouse::Interaction::Pointer
+                } else if cursor.is_over(bounds) {
                     mouse::Interaction::Crosshair
                 } else {
                     mouse::Interaction::default()
@@ -6326,6 +6472,17 @@ fn draw_volume_bubble_tooltip(
         .filter(|base| !base.is_empty())
         .unwrap_or("units");
     let lines = bubble_tooltip_lines(bubble, unit, config.threshold_mode);
+    draw_hover_lines(frame, lines, palette, bubble.border_color, cursor, bounds);
+}
+
+fn draw_hover_lines(
+    frame: &mut canvas::Frame,
+    lines: Vec<String>,
+    palette: &Palette,
+    title_color: Color,
+    cursor: Point,
+    bounds: Size,
+) {
     let width = 330.0;
     let line_height = 17.0;
     let height = line_height * lines.len() as f32 + 12.0;
@@ -6347,7 +6504,7 @@ fn draw_volume_bubble_tooltip(
             position: Point::new(x + 8.0, y + 6.0 + index as f32 * line_height),
             size: iced::Pixels(if index == 0 { 13.0 } else { 12.0 }),
             color: if index == 0 {
-                bubble.border_color
+                title_color
             } else {
                 palette.background.base.text
             },
@@ -8194,6 +8351,23 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn cluster_search_instances_visibility_and_removal_are_independent() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        chart.toggle_indicator(KlineIndicator::ClusterSearch1);
+        chart.toggle_indicator(KlineIndicator::ClusterSearch2);
+        assert!(chart.indicator_visible(KlineIndicator::ClusterSearch1));
+        assert!(chart.indicator_visible(KlineIndicator::ClusterSearch2));
+        let mut config = chart.visual_config();
+        config.indicator_visibility[KlineIndicator::ClusterSearch1].ranges[1].enabled = false;
+        chart.set_visual_config(config);
+        assert!(!chart.indicator_visible(KlineIndicator::ClusterSearch1));
+        assert!(chart.indicator_visible(KlineIndicator::ClusterSearch2));
+        chart.toggle_indicator(KlineIndicator::ClusterSearch2);
+        assert!(!chart.indicator_enabled(KlineIndicator::ClusterSearch2));
+        assert!(chart.indicator_enabled(KlineIndicator::ClusterSearch1));
+    }
+
+    #[test]
     fn ws_integrity_cancels_requests_and_preserves_trades_coverage_and_quarantine_on_completion() {
         let mut chart = empty_candlestick_chart(&[], None);
         let from = UnixMs::new(1000);
@@ -8434,7 +8608,72 @@ pub(crate) mod tests {
             },
             style: DrawingStyle::default(),
             visible: true,
+            visibility: Default::default(),
         }
+    }
+
+    #[test]
+    fn fixed_profile_sharing_is_opt_in_and_follows_owner_and_target_visibility() {
+        let mut owner = empty_candlestick_chart(&[], None);
+        let hour = range_levels::HOUR_MS;
+        let end = 96 * hour;
+        let mut drawing = fixed_profile_drawing(0, end);
+        let bars = (0..96)
+            .map(|h| hourly_bar(h, 100.0, 104.0, 10.0).1)
+            .collect::<Vec<_>>();
+        let owner_id = uuid::Uuid::new_v4();
+        owner.set_drawings(vec![drawing.clone()]);
+        owner.insert_ref_klines(None, false, exchange::Timeframe::H1, &bars);
+        assert_eq!(owner.range_levels().len(), 1);
+        assert!(owner.shared_range_profile_exports(owner_id).is_empty());
+
+        drawing.style.fixed_range_volume_profile.share_levels = true;
+        drawing.visibility.ranges[2].enabled = false;
+        owner.set_drawings(vec![drawing]);
+        let exports = owner.shared_range_profile_exports(owner_id);
+        assert_eq!(exports.len(), 1);
+        assert_eq!(exports[0].drawing_id, 1);
+        assert_eq!(exports[0].levels, owner.range_levels()[0]);
+
+        let mut target = empty_candlestick_chart(&[], None);
+        target.set_shared_range_profiles(exports);
+        assert_eq!(target.visible_shared_range_profiles().count(), 1);
+        target.set_basis(Basis::Time(exchange::Timeframe::H4));
+        assert_eq!(target.visible_shared_range_profiles().count(), 0);
+        owner.handle_drawing(&super::super::DrawingMessage::DeleteDrawing(1));
+        assert!(owner.shared_range_profile_exports(owner_id).is_empty());
+    }
+
+    #[test]
+    fn profile_visibility_and_removal_gate_all_derived_levels() {
+        let mut chart = empty_candlestick_chart(&[], None);
+        let hour = range_levels::HOUR_MS;
+        let end = 96 * hour;
+        chart.set_drawings(vec![fixed_profile_drawing(0, end)]);
+        let bars = (0..96)
+            .map(|h| hourly_bar(h, 100.0, 104.0, 10.0).1)
+            .collect::<Vec<_>>();
+        chart.insert_ref_klines(None, false, exchange::Timeframe::H1, &bars);
+        assert_eq!(chart.range_levels().len(), 1);
+
+        let mut visibility = chart.drawings()[0].visibility;
+        visibility.ranges[1].enabled = false;
+        chart.handle_drawing(&super::super::DrawingMessage::SetDrawingVisibility(
+            1, visibility,
+        ));
+        assert_eq!(chart.drawings().len(), 1);
+        assert!(chart.range_levels().is_empty());
+        assert!(chart.reference_level_prices().is_empty());
+        assert!(chart.auction_levels(0, end).is_empty());
+
+        chart.handle_drawing(&super::super::DrawingMessage::SetDrawingVisibility(
+            1,
+            Default::default(),
+        ));
+        assert_eq!(chart.range_levels().len(), 1);
+        chart.handle_drawing(&super::super::DrawingMessage::DeleteDrawing(1));
+        assert!(chart.drawings().is_empty());
+        assert!(chart.range_levels().is_empty());
     }
 
     #[test]

@@ -1,7 +1,5 @@
-//! Levels of fixed-range volume profiles (POC, VAH, VAL) continued from the range's end to
-//! the right edge, as JDK marks a multi-week range on 4h. A profile drawn on one chart also
-//! shows its levels on every other chart of the same ticker (the dashboard collects them
-//! with `KlineChart::range_levels` and hands them out with `set_shared_range_levels`).
+//! Levels of a fixed-range volume profile (POC, VAH, VAL) from the end of its range
+//! to the right edge of the chart that owns it.
 //!
 //! Ranges longer than a few days are profiled from hourly candles: a month of trades is far
 //! too much to download, and an hour is fine-grained enough for POC and value area.
@@ -35,6 +33,16 @@ pub struct RangeLevels {
     pub val: f64,
     /// Complete source coverage, but candle volume is distributed over price rows.
     pub approximate: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SharedRangeProfile {
+    pub source_pane: uuid::Uuid,
+    pub source_ticker: exchange::Ticker,
+    pub source_basis: data::chart::Basis,
+    pub drawing_id: u64,
+    pub visibility: data::chart::indicator::ObjectVisibility,
+    pub levels: RangeLevels,
 }
 
 impl RangeLevels {
@@ -83,6 +91,14 @@ pub fn missing_hourly(
 
 /// Thin dashed lines from each range's end to `right_x`, labelled at their left end.
 pub fn draw(levels: &[RangeLevels], frame: &mut Frame, ctx: &OverlayCtx) {
+    draw_levels(levels, frame, ctx, "");
+}
+
+pub fn draw_shared(levels: &[RangeLevels], frame: &mut Frame, ctx: &OverlayCtx) {
+    draw_levels(levels, frame, ctx, " ↗");
+}
+
+fn draw_levels(levels: &[RangeLevels], frame: &mut Frame, ctx: &OverlayCtx, suffix: &str) {
     let OverlayCtx {
         x,
         y,
@@ -118,7 +134,7 @@ pub fn draw(levels: &[RangeLevels], frame: &mut Frame, ctx: &OverlayCtx) {
             );
             frame.fill_text(canvas::Text {
                 content: format!(
-                    "{name}{} {price:.0}",
+                    "{name}{} {price:.0}{suffix}",
                     if level.approximate { "~" } else { "" }
                 ),
                 position: Point::new(start + label_size * 0.4, line_y - label_size * 0.15),

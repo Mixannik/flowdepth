@@ -2062,6 +2062,36 @@ impl State {
                     }
                 }
             }
+            Event::ChartInteraction(super::chart::Message::Drawing(
+                super::chart::DrawingMessage::OpenIndicatorSettings(indicator),
+            )) => {
+                if !matches!(self.modal, Some(Modal::Indicators)) {
+                    self.show_modal_with_focus(Modal::Indicators);
+                }
+                self.indicator_menu
+                    .update(&crate::indicators::Action::Select(indicator.into()));
+            }
+            Event::ChartInteraction(super::chart::Message::Drawing(
+                super::chart::DrawingMessage::ToggleIndicatorVisibility(indicator),
+            )) => {
+                if let Content::Kline {
+                    chart: Some(chart), ..
+                } = &self.content
+                {
+                    let mut visibility = chart.indicator_visibility(indicator);
+                    visibility.shown = !visibility.shown;
+                    return self.update(Event::IndicatorMenu(
+                        crate::indicators::Action::Visibility(indicator.into(), visibility),
+                    ));
+                }
+            }
+            Event::ChartInteraction(super::chart::Message::Drawing(
+                super::chart::DrawingMessage::RemoveIndicator(indicator),
+            )) => {
+                if self.content.indicator_enabled(indicator.into()) {
+                    return self.update(Event::ToggleIndicator(indicator.into()));
+                }
+            }
             Event::ChartInteraction(msg) => match &mut self.content {
                 Content::Heatmap { chart: Some(c), .. } => {
                     super::chart::update(c, &msg);
@@ -2168,6 +2198,22 @@ impl State {
                             return self.update(Event::ToggleIndicator(indicator));
                         }
                     }
+                    Action::Visibility(UiIndicator::Kline(indicator), visibility) => {
+                        if let Content::Kline {
+                            chart: Some(chart), ..
+                        } = &mut self.content
+                            && chart.indicator_enabled(indicator)
+                        {
+                            chart.set_indicator_visibility(indicator, visibility);
+                            self.settings.visual_config =
+                                Some(VisualConfig::Kline(chart.visual_config()));
+                        }
+                    }
+                    Action::Visibility(UiIndicator::Heatmap(indicator), visibility) => {
+                        if self.content.indicator_enabled(indicator.into()) {
+                            self.set_heatmap_volume_visibility(visibility);
+                        }
+                    }
                     Action::ReorderPanels(event) => {
                         if self.indicator_menu.can_reorder() {
                             self.content.reorder_indicators(&event);
@@ -2189,6 +2235,22 @@ impl State {
                         if indicator.requires_trades(exchange)
                 );
                 self.content.toggle_indicator(ind);
+                if let (
+                    UiIndicator::Kline(indicator),
+                    Content::Kline {
+                        chart: Some(chart), ..
+                    },
+                ) = (ind, &mut self.content)
+                    && !chart.indicator_enabled(indicator)
+                {
+                    chart.set_indicator_visibility(indicator, Default::default());
+                    self.settings.visual_config = Some(VisualConfig::Kline(chart.visual_config()));
+                }
+                if let UiIndicator::Heatmap(_) = ind
+                    && !self.content.indicator_enabled(ind)
+                {
+                    self.set_heatmap_volume_visibility(Default::default());
+                }
                 if refresh_streams {
                     self.reconcile_candlestick_trade_stream();
                     return Some(Effect::RefreshStreams);
@@ -2839,6 +2901,25 @@ impl State {
         }
     }
 
+    fn set_heatmap_volume_visibility(
+        &mut self,
+        visibility: data::chart::indicator::ObjectVisibility,
+    ) {
+        let mut config = match &self.content {
+            Content::Heatmap {
+                chart: Some(chart), ..
+            } => chart.visual_config(),
+            Content::ShaderHeatmap {
+                chart: Some(chart), ..
+            } => chart.visual_config(),
+            _ => return,
+        };
+        config.volume_visibility = visibility;
+        let config = VisualConfig::Heatmap(config);
+        self.content.change_visual_config(config.clone());
+        self.settings.visual_config = Some(config);
+    }
+
     fn show_modal_with_focus(&mut self, requested_modal: Modal) -> Option<Effect> {
         let should_toggle_close = match (&self.modal, &requested_modal) {
             (Some(Modal::StreamModifier(open)), Modal::StreamModifier(req)) => {
@@ -3218,9 +3299,7 @@ impl Content {
             &determined_chart_kind,
             visual_config,
         );
-        if matches!(determined_chart_kind, data::chart::KlineChartKind::Candles) {
-            chart.set_drawings(prev_drawings.clone());
-        }
+        chart.set_drawings(prev_drawings.clone());
 
         Content::Kline {
             chart: Some(chart),
@@ -3425,7 +3504,7 @@ impl Content {
                 false
             }
             (Content::Ladder(Some(panel)), VisualConfig::Ladder(cfg)) => {
-                panel.config = cfg;
+                panel.set_config(cfg);
                 false
             }
             _ => false,

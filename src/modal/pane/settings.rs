@@ -1220,6 +1220,66 @@ pub fn kline_cfg_view<'a>(
 }
 
 pub fn ladder_cfg_view<'a>(cfg: ladder::Config, pane: pane_grid::Pane) -> Element<'a, Message> {
+    let dom_options = column![
+        text(format!("Ширина DOM · {} px", cfg.width_px.clamp(240, 640))),
+        slider(240..=640, cfg.width_px.clamp(240, 640), move |value| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Ladder(ladder::Config {
+                    width_px: value,
+                    ..cfg
+                }),
+                false,
+            )
+        })
+        .step(10),
+        checkbox(cfg.compact)
+            .label("Компактный DOM")
+            .on_toggle(move |value| Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Ladder(ladder::Config {
+                    compact: value,
+                    ..cfg
+                }),
+                false
+            )),
+        checkbox(cfg.show_depth_ruler)
+            .label("Depth Ruler — диапазон ликвидности")
+            .on_toggle(move |value| Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Ladder(ladder::Config {
+                    show_depth_ruler: value,
+                    ..cfg
+                }),
+                false
+            )),
+        checkbox(cfg.show_cumulative_depth)
+            .label("Cumulative Depth — накопленная глубина")
+            .on_toggle(move |value| Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Ladder(ladder::Config {
+                    show_cumulative_depth: value,
+                    ..cfg
+                }),
+                false
+            )),
+        text("Интенсивность подсветки"),
+        slider(0.0..=1.0, cfg.liquidity_intensity, move |value| {
+            Message::VisualConfigChanged(
+                pane,
+                VisualConfig::Ladder(ladder::Config {
+                    liquidity_intensity: value,
+                    ..cfg
+                }),
+                false,
+            )
+        })
+        .step(0.05),
+        text("Шаг цен: в заголовке панели. Границы Ruler: перетаскивайте метки слева от цены.")
+            .size(crate::style::text_size::SMALL),
+    ]
+    .spacing(8);
+
     let display_options = {
         let spread = checkbox(cfg.show_spread)
             .label("Show Spread")
@@ -1300,6 +1360,7 @@ pub fn ladder_cfg_view<'a>(cfg: ladder::Config, pane: pane_grid::Pane) -> Elemen
     .spacing(8);
 
     let content = split_column![
+        dom_options,
         display_options,
         history_column,
         row![
@@ -1350,7 +1411,7 @@ pub mod study {
 
     impl Study for FootprintStudy {
         fn is_same_type(&self, other: &Self) -> bool {
-            std::mem::discriminant(self) == std::mem::discriminant(other)
+            FootprintStudy::is_same_type(self, other)
         }
 
         fn all() -> Vec<Self> {
@@ -1363,6 +1424,377 @@ pub mod study {
             on_change: impl Fn(Self) -> Message<Self> + Copy + 'a,
         ) -> Element<'a, Message<Self>> {
             match *self {
+                FootprintStudy::ClusterSearch {
+                    slot,
+                    metric,
+                    rule,
+                    bars,
+                    minimum,
+                    top,
+                    sigma_tenths,
+                    style,
+                } => {
+                    use data::chart::kline::{ClusterMetric as Metric, ClusterRule as Rule};
+                    let change = move |metric, rule, bars, minimum, top, sigma_tenths, style| {
+                        on_change(FootprintStudy::ClusterSearch {
+                            slot,
+                            metric,
+                            rule,
+                            bars,
+                            minimum,
+                            top,
+                            sigma_tenths,
+                            style,
+                        })
+                    };
+                    let restyle =
+                        move |style| change(metric, rule, bars, minimum, top, sigma_tenths, style);
+                    macro_rules! choice {
+                        ($field:ident, $items:expr) => {
+                            row($items.map(|(v, label)| {
+                                button(text(label))
+                                    .style(if style.options.$field == v {
+                                        button::primary
+                                    } else {
+                                        button::secondary
+                                    })
+                                    .on_press({
+                                        let mut next = style;
+                                        next.options.$field = v;
+                                        restyle(next)
+                                    })
+                                    .into()
+                            }))
+                            .spacing(3)
+                        };
+                    }
+                    macro_rules! quantity {
+                        ($field:ident, $label:expr) => {
+                            column![
+                                text($label),
+                                iced::widget::text_input(
+                                    "0 = off",
+                                    format!("{:.3}", style.options.$field as f64 / 1000.0)
+                                )
+                                .on_input(move |v| {
+                                    let mut next = style;
+                                    if let Ok(v) = v.parse::<f64>()
+                                        && v.is_finite()
+                                        && v >= 0.0
+                                    {
+                                        next.options.$field = (v * 1000.0).round() as u64;
+                                    }
+                                    restyle(next)
+                                })
+                            ]
+                            .spacing(3)
+                        };
+                    }
+                    macro_rules! integer {
+                        ($field:ident, $label:expr, $max:expr) => {
+                            column![
+                                text($label),
+                                iced::widget::text_input("0", style.options.$field.to_string())
+                                    .on_input(move |v| {
+                                        let mut next = style;
+                                        if let Ok(v) = v.parse::<u32>() {
+                                            next.options.$field = v.min($max) as _;
+                                        }
+                                        restyle(next)
+                                    })
+                            ]
+                            .spacing(3)
+                        };
+                    }
+                    macro_rules! toggle {
+                        ($field:ident, $label:expr) => {
+                            checkbox(style.options.$field)
+                                .label($label)
+                                .on_toggle(move |v| {
+                                    let mut next = style;
+                                    next.options.$field = v;
+                                    restyle(next)
+                                })
+                        };
+                    }
+                    let metrics = column![
+                        row(
+                            [Metric::Volume, Metric::Bid, Metric::Ask, Metric::Delta].map(|m| {
+                                button(text(format!("{m:?}")))
+                                    .style(if m == metric {
+                                        button::primary
+                                    } else {
+                                        button::secondary
+                                    })
+                                    .on_press(change(
+                                        m,
+                                        rule,
+                                        bars,
+                                        minimum,
+                                        top,
+                                        sigma_tenths,
+                                        style,
+                                    ))
+                                    .into()
+                            })
+                        )
+                        .spacing(3),
+                        row([
+                            Metric::PositiveDelta,
+                            Metric::NegativeDelta,
+                            Metric::Trades,
+                            Metric::Imbalance
+                        ]
+                        .map(|m| button(text(format!("{m:?}")))
+                            .style(if m == metric {
+                                button::primary
+                            } else {
+                                button::secondary
+                            })
+                            .on_press(change(m, rule, bars, minimum, top, sigma_tenths, style))
+                            .into()))
+                        .spacing(3)
+                    ]
+                    .spacing(3);
+                    let rule_button = |r, label| {
+                        button(label)
+                            .style(if r == rule {
+                                button::primary
+                            } else {
+                                button::secondary
+                            })
+                            .on_press(change(metric, r, bars, minimum, top, sigma_tenths, style))
+                    };
+                    let rules = column![
+                        row![
+                            rule_button(Rule::Minimum, "Manual"),
+                            rule_button(Rule::Top, "Top N"),
+                            rule_button(Rule::Percentile, "Percentile")
+                        ]
+                        .spacing(3),
+                        row![
+                            rule_button(Rule::Average, "Average × K"),
+                            rule_button(Rule::Median, "Median × K"),
+                            rule_button(Rule::Sigma, "Std × K")
+                        ]
+                        .spacing(3)
+                    ]
+                    .spacing(3);
+                    let mut controls = column![
+                        text(
+                            "Порог после фильтров и объединения; авто — по максимуму каждого бара"
+                        ),
+                        metrics,
+                        rules
+                    ]
+                    .spacing(7);
+                    controls = match rule {
+                        Rule::Minimum => controls
+                            .push(text("Minimum (текущие единицы объёма / выбранной метрики)"))
+                            .push(
+                                iced::widget::text_input(
+                                    "Minimum",
+                                    format!("{:.3}", minimum as f64 / 1000.0),
+                                )
+                                .on_input(move |v| {
+                                    let minimum = v
+                                        .parse::<f64>()
+                                        .ok()
+                                        .filter(|v| v.is_finite() && *v >= 0.0)
+                                        .map(|v| (v * 1000.0).round() as u64)
+                                        .unwrap_or(minimum);
+                                    change(metric, rule, bars, minimum, top, sigma_tenths, style)
+                                }),
+                            )
+                            .push(quantity!(maximum, "Maximum (0 = без верхней границы)")),
+                        Rule::Top => controls.push(text("Top N")).push(
+                            iced::widget::text_input("Top N", top.to_string()).on_input(move |v| {
+                                change(
+                                    metric,
+                                    rule,
+                                    bars,
+                                    minimum,
+                                    v.parse::<usize>().unwrap_or(top).clamp(1, 5000),
+                                    sigma_tenths,
+                                    style,
+                                )
+                            }),
+                        ),
+                        Rule::Percentile => controls
+                            .push(text(format!(
+                                "Percentile {:.1}%",
+                                style.options.percentile_tenths as f32 / 10.0
+                            )))
+                            .push(
+                                slider(
+                                    0.0..=100.0,
+                                    style.options.percentile_tenths as f32 / 10.0,
+                                    move |v| {
+                                        let mut next = style;
+                                        next.options.percentile_tenths = (v * 10.0).round() as u16;
+                                        restyle(next)
+                                    },
+                                )
+                                .step(0.1),
+                            ),
+                        Rule::Average | Rule::Median => controls
+                            .push(text(format!(
+                                "K = {:.1}",
+                                style.options.multiplier_tenths as f32 / 10.0
+                            )))
+                            .push(
+                                slider(
+                                    0.0..=20.0,
+                                    style.options.multiplier_tenths as f32 / 10.0,
+                                    move |v| {
+                                        let mut next = style;
+                                        next.options.multiplier_tenths = (v * 10.0).round() as u16;
+                                        restyle(next)
+                                    },
+                                )
+                                .step(0.1),
+                            ),
+                        Rule::Sigma => controls
+                            .push(text(format!(
+                                "Mean + {:.1} × Std",
+                                sigma_tenths as f32 / 10.0
+                            )))
+                            .push(
+                                slider(0.0..=20.0, sigma_tenths as f32 / 10.0, move |v| {
+                                    change(
+                                        metric,
+                                        rule,
+                                        bars,
+                                        minimum,
+                                        top,
+                                        (v * 10.0).round() as u32,
+                                        style,
+                                    )
+                                })
+                                .step(0.1),
+                            ),
+                    };
+                    if rule != Rule::Minimum {
+                        controls = controls.push(
+                            checkbox(style.visible_range)
+                                .label("AutoVisible: видимые бары и цены")
+                                .on_toggle(move |v| {
+                                    let mut next = style;
+                                    next.visible_range = v;
+                                    restyle(next)
+                                }),
+                        );
+                        if !style.visible_range {
+                            controls = controls
+                                .push(text("AutoPeriod: последние N загруженных баров"))
+                                .push(
+                                    iced::widget::text_input("Lookback", bars.to_string())
+                                        .on_input(move |v| {
+                                            change(
+                                                metric,
+                                                rule,
+                                                v.parse::<usize>().unwrap_or(bars).clamp(1, 5000),
+                                                minimum,
+                                                top,
+                                                sigma_tenths,
+                                                style,
+                                            )
+                                        }),
+                                )
+                                .push(toggle!(
+                                    display_only_lookback,
+                                    "Показывать только последние N баров"
+                                ));
+                        }
+                        controls = controls.push(quantity!(
+                            auto_floor,
+                            "Минимальный авто-порог (MinAutoThreshold)"
+                        ));
+                    }
+                    controls=controls.push(text("Объединение")).push(integer!(merge_bars,"MergeBars (1–200)",200)).push(integer!(merge_prices,"MergePrices (1–200 строк Footprint)",200)).push(choice!(merge_direction,[(0,"Both"),(1,"Up"),(2,"Down")])).push(toggle!(single_per_bar,"Один сильнейший сигнал на бар"))
+                        .push(text("Фильтры до расчёта порога (0 = выключен)"))
+                        .push(quantity!(min_value,"MinValue выбранной метрики"))
+                        .push(quantity!(min_delta,"Минимум |Delta|"))
+                        .push(integer!(imbalance_percent,"Доля большей стороны Bid/Ask (%)",100))
+                        .push(quantity!(min_average,"Минимальный средний размер сделки"))
+                        .push(quantity!(max_average,"Максимальный средний размер сделки"))
+                        .push(text("Trades / средний размер недоступны для compact-строк: они исключаются при этих фильтрах."))
+                        .push(integer!(range_high,"Не дальше от High (строк)",10000))
+                        .push(integer!(range_low,"Не дальше от Low (строк)",10000))
+                        .push(choice!(bar_direction,[(0,"Любой бар"),(1,"Бычий"),(2,"Медвежий")]))
+                        .push(choice!(price_location,[(0,"Любая цена"),(1,"Верх"),(2,"Середина"),(3,"Низ")]))
+                        .push(choice!(price_location,[(4,"≥ Open"),(5,"≤ Open"),(6,"≥ Close"),(7,"≤ Close")]))
+                        .push(toggle!(time_filter,"Фильтр времени открытия бара (UTC)"));
+                    if style.options.time_filter {
+                        controls = controls
+                            .push(integer!(
+                                start_second,
+                                "Начало: секунды от 00:00 UTC",
+                                86399
+                            ))
+                            .push(integer!(
+                                end_second,
+                                "Конец: секунды от 00:00 UTC; допускается через полночь",
+                                86399
+                            ));
+                    }
+                    let colors = [
+                        [65, 185, 255],
+                        [75, 220, 140],
+                        [255, 190, 60],
+                        [190, 130, 255],
+                        [245, 85, 100],
+                    ];
+                    let swatches = |sell: bool| {
+                        row(colors.map(|rgb| {
+                            button(text("●").color(iced::Color::from_rgb8(rgb[0], rgb[1], rgb[2])))
+                                .on_press({
+                                    let mut next = style;
+                                    if sell {
+                                        next.sell_color = rgb;
+                                    } else {
+                                        next.color = rgb;
+                                    }
+                                    restyle(next)
+                                })
+                                .into()
+                        }))
+                        .spacing(4)
+                    };
+                    controls
+                        .push(text("Отображение"))
+                        .push(choice!(
+                            shape,
+                            [
+                                (0, "Круг"),
+                                (1, "Квадрат"),
+                                (2, "Ромб"),
+                                (3, "Треугольник"),
+                                (4, "Линия")
+                            ]
+                        ))
+                        .push(text("Цвет / положительное направление"))
+                        .push(swatches(false))
+                        .push(text("Отрицательное направление"))
+                        .push(swatches(true))
+                        .push(text(format!("Радиус от {} px", style.radius)))
+                        .push(
+                            slider(1.0..=30.0, style.radius as f32, move |v| {
+                                let mut next = style;
+                                next.radius = v as u8;
+                                restyle(next)
+                            })
+                            .step(1.0),
+                        )
+                        .push(integer!(max_radius, "Радиус до (px)", 60))
+                        .push(integer!(fill_percent, "Непрозрачность заливки (%)", 100))
+                        .push(toggle!(border, "Контур"))
+                        .push(toggle!(text, "Значение у маркера"))
+                        .push(toggle!(zones, "Границы объединённых областей"))
+                        .padding(8)
+                        .spacing(7)
+                        .into()
+                }
                 FootprintStudy::NPoC { lookback } => {
                     let slider_ui = slider(10.0..=400.0, lookback as f32, move |new_value| {
                         on_change(FootprintStudy::NPoC {

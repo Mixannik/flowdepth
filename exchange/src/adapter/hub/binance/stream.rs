@@ -133,10 +133,10 @@ struct SonicTrade {
     event_time: u64,
     #[serde(rename = "T")]
     time: u64,
-    #[serde(rename = "p", deserialize_with = "de_string_to_number")]
-    price: f64,
-    #[serde(rename = "q", deserialize_with = "de_string_to_number")]
-    qty: f64,
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "q")]
+    qty: String,
     #[serde(rename = "m")]
     is_sell: bool,
     /// Undocumented fields observed on Binance USDⓈ-M `@trade` non-execution markers.
@@ -582,66 +582,33 @@ impl WsAdapter for TradeAdapter {
                 let Some(trade_id) = de_trade.stream_id(stream_kind) else {
                     return Err(format!("Missing {stream_kind:?} trade ID"));
                 };
-                let price =
-                    Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize);
-                let quantity = qty_norm.normalize_qty(de_trade.qty, de_trade.price);
-
-                if !de_trade.price.is_finite()
-                    || de_trade.price <= 0.0
-                    || !de_trade.qty.is_finite()
-                    || de_trade.qty <= 0.0
-                    || price.units <= 0
-                    || quantity.is_zero()
-                {
-                    let is_non_execution_marker = de_trade.price == 0.0
-                        && de_trade.qty == 0.0
-                        && de_trade.execution_type.as_deref() == Some("NA")
-                        && de_trade.stream_status == Some(1);
-                    let reason = if !de_trade.price.is_finite() || !de_trade.qty.is_finite() {
-                        "non_finite_raw_value"
-                    } else if de_trade.price <= 0.0 || de_trade.qty <= 0.0 {
-                        "non_positive_raw_value"
-                    } else if price.units <= 0 {
-                        "non_positive_normalized_price"
-                    } else {
-                        "zero_normalized_quantity"
-                    };
-                    let public_payload = String::from_utf8_lossy(payload);
-                    if is_non_execution_marker {
-                        log::debug!(
-                            "BINANCE NonExecutionMarkerIgnored | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} execution_type=NA stream_status=1 action=discarded_before_trade_buffer",
-                            self.market,
-                            ticker,
-                            de_trade.event_time,
-                            de_trade.time,
-                        );
-                    } else {
-                        log::warn!(
-                            "BINANCE InvalidTradeDiscarded | stream={stream_kind:?} market={:?} ticker={} trade_id={trade_id} event_time_ms={} trade_time_ms={} side={} raw_price={} raw_qty={} normalized_price={} normalized_price_units={} normalized_qty={} min_tick={:?} execution_type={:?} stream_status={:?} reason={reason} action=discarded_before_trade_buffer payload={public_payload:?}",
-                            self.market,
-                            ticker,
-                            de_trade.event_time,
-                            de_trade.time,
-                            if de_trade.is_sell { "sell" } else { "buy" },
-                            de_trade.price,
-                            de_trade.qty,
-                            price.to_f64(),
-                            price.units,
-                            quantity.to_f64(),
-                            ticker_info.min_ticksize,
-                            de_trade.execution_type,
-                            de_trade.stream_status,
-                        );
-                    }
-                    return Ok(Vec::new());
-                }
-
-                let trade = Trade {
-                    id: Some(trade_id),
-                    time: de_trade.time.into(),
+                let raw = super::fetch::RawTrade {
+                    id: trade_id,
+                    time: de_trade.time,
+                    price: &de_trade.price,
+                    quantity: &de_trade.qty,
                     is_sell: de_trade.is_sell,
-                    price,
-                    qty: quantity,
+                };
+                let trade = match raw.project(ticker_info, *qty_norm) {
+                    Ok(trade) => trade,
+                    Err(error) => {
+                        let is_non_execution_marker = de_trade.price.parse::<f64>() == Ok(0.0)
+                            && de_trade.qty.parse::<f64>() == Ok(0.0)
+                            && de_trade.execution_type.as_deref() == Some("NA")
+                            && de_trade.stream_status == Some(1);
+                        if is_non_execution_marker {
+                            log::debug!(
+                                "BINANCE NonExecutionMarkerIgnored | stream={stream_kind:?} ticker={ticker} trade_id={trade_id}"
+                            );
+                        } else {
+                            log::warn!(
+                                "BINANCE InvalidTradeDiscarded | stream={stream_kind:?} ticker={ticker} trade_id={trade_id} event_time_ms={} trade_time_ms={} reason={error}",
+                                de_trade.event_time,
+                                de_trade.time,
+                            );
+                        }
+                        return Ok(Vec::new());
+                    }
                 };
 
                 if stream_kind == TradeStreamKind::Raw
@@ -654,7 +621,7 @@ impl WsAdapter for TradeAdapter {
                         trade_time: de_trade.time.into(),
                         receive_time,
                         trade_id,
-                        price,
+                        price: trade.price,
                         quantity: trade.qty,
                         aggressor: if de_trade.is_sell {
                             AggressorSide::Sell
@@ -1412,8 +1379,8 @@ mod tests {
         assert_eq!(trade.event_time, 1_720_000_000_001);
         assert_eq!(trade.time, 1_720_000_000_000);
         assert!(trade.is_sell, "m=true means seller aggressor");
-        assert_eq!(trade.price, 65_000.10);
-        assert_eq!(trade.qty, 0.125);
+        assert_eq!(trade.price, "65000.10");
+        assert_eq!(trade.qty, "0.125");
 
         let buyer = br#"{"stream":"btcusdt@trade","data":{"E":1720000000002,"t":987654322,"T":1720000000001,"p":"65000.20","q":"0.010","m":false}}"#;
         let StreamData::Trade(_, buyer, kind) = feed_de(buyer, MarketKind::LinearPerps).unwrap()
@@ -1448,6 +1415,10 @@ mod tests {
         };
         assert_eq!(trades.len(), 1);
         assert_eq!(trades[0].id, Some(987_654_321));
+        assert_eq!(trades[0].time, crate::UnixMs::new(1_720_000_000_000));
+        assert_eq!(trades[0].price, Price::from_f64(65_000.10));
+        assert_eq!(trades[0].qty, crate::unit::Qty::from_f64(0.125));
+        assert!(trades[0].is_sell);
         assert_eq!(raw_trades.len(), 1);
         assert_eq!(raw_trades[0].trade_id, 987_654_321);
     }

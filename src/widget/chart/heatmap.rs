@@ -594,7 +594,9 @@ impl HeatmapShader {
         let trade_visual_changed = prev.trade_size_filter.to_bits()
             != self.config.trade_size_filter.to_bits()
             || prev.trade_size_scale != self.config.trade_size_scale
-            || prev.trade_bubbles_3d != self.config.trade_bubbles_3d;
+            || prev.trade_bubbles_3d != self.config.trade_bubbles_3d
+            || prev.volume_visibility.is_visible(self.basis)
+                != self.config.volume_visibility.is_visible(self.basis);
 
         self.canvas_invalidation.mark_overlay_tooltip();
         self.canvas_invalidation.mark_overlay_scale_labels();
@@ -731,7 +733,8 @@ impl HeatmapShader {
             )
             .map(|(price, run)| (*price, run.qty, run.is_bid));
 
-        let show_volume_indicator = self.indicators.contains(&HeatmapIndicator::Volume);
+        let show_volume_indicator = self.indicators.contains(&HeatmapIndicator::Volume)
+            && self.config.volume_visibility.is_visible(self.basis);
 
         let built = self.instances.build_instances(
             &effective_window,

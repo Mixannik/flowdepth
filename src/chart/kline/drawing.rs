@@ -197,38 +197,66 @@ impl KlineChart {
         }
     }
 
+    pub(super) fn drawing_supported(&self, drawing: &Drawing) -> bool {
+        drawing.supports_basis(self.chart.basis)
+            && (!matches!(
+                drawing.geometry,
+                DrawingGeometry::FixedRangeVolumeProfile { .. }
+            ) || matches!(self.kind, data::chart::KlineChartKind::Candles))
+    }
+
+    pub(super) fn drawing_visible(&self, drawing: &Drawing) -> bool {
+        self.drawing_supported(drawing) && drawing.is_visible(self.chart.basis)
+    }
+
     pub(super) fn fixed_volume_profiles(
         &self,
+    ) -> Vec<(UnixMs, UnixMs, FixedRangeVolumeProfileConfig)> {
+        self.fixed_volume_profile_inputs(false)
+    }
+
+    pub(super) fn visible_fixed_volume_profiles(
+        &self,
+    ) -> Vec<(UnixMs, UnixMs, FixedRangeVolumeProfileConfig)> {
+        self.fixed_volume_profile_inputs(true)
+    }
+
+    fn fixed_volume_profile_inputs(
+        &self,
+        apply_timeframe_visibility: bool,
     ) -> Vec<(UnixMs, UnixMs, FixedRangeVolumeProfileConfig)> {
         let Basis::Time(timeframe) = self.chart.basis else {
             return Vec::new();
         };
-        if self.drawings.visible {
+        if self.drawings.visible && matches!(self.kind, data::chart::KlineChartKind::Candles) {
             self.drawings
                 .drawings
                 .iter()
-                .filter(|drawing| drawing.visible)
-                .filter_map(|drawing| {
-                    let DrawingGeometry::FixedRangeVolumeProfile { first, second } =
-                        drawing.geometry
-                    else {
-                        return None;
-                    };
-                    let (from, last) = if first <= second {
-                        (first, second)
-                    } else {
-                        (second, first)
-                    };
-                    Some((
-                        from,
-                        last.saturating_add(timeframe.to_milliseconds()),
-                        sanitize_volume_profile_config(drawing.style.fixed_range_volume_profile),
-                    ))
+                .filter(|drawing| {
+                    drawing.visible
+                        && (!apply_timeframe_visibility || drawing.is_visible(self.chart.basis))
                 })
+                .filter_map(|drawing| fixed_profile_input(drawing, timeframe))
                 .collect()
         } else {
             Vec::new()
         }
+    }
+
+    pub(super) fn visible_fixed_profile_owners(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (u64, UnixMs, UnixMs, FixedRangeVolumeProfileConfig)> + '_
+    {
+        self.drawings.drawings.iter().filter_map(|drawing| {
+            let Basis::Time(timeframe) = self.chart.basis else {
+                return None;
+            };
+            if !self.drawings.visible || !self.drawing_visible(drawing) {
+                return None;
+            }
+            let (from, to, config) = fixed_profile_input(drawing, timeframe)?;
+            Some((drawing.id, from, to, config))
+        })
     }
 
     pub fn has_fixed_volume_profiles(&self) -> bool {
@@ -315,6 +343,7 @@ impl KlineChart {
             geometry,
             style: self.style_for_tool(tool),
             visible: true,
+            visibility: Default::default(),
         });
         self.drawings.selected = Some(id);
         self.drawings.active_tool = DrawingTool::Select;
@@ -323,10 +352,13 @@ impl KlineChart {
     }
 
     pub fn handle_drawing(&mut self, message: &DrawingMessage) -> bool {
-        if !matches!(self.kind, data::chart::KlineChartKind::Candles) {
-            return false;
-        }
         match message {
+            DrawingMessage::ToolSelected(DrawingTool::FixedRangeVolumeProfile)
+                if !matches!(self.kind, data::chart::KlineChartKind::Candles)
+                    || !matches!(self.chart.basis, Basis::Time(_)) =>
+            {
+                return false;
+            }
             DrawingMessage::ToolSelected(tool) => {
                 self.drawings.active_tool = *tool;
                 self.drawings.draft = None;
@@ -652,6 +684,19 @@ impl KlineChart {
             DrawingMessage::ToggleToolbar => {
                 self.drawings.toolbar_open = !self.drawings.toolbar_open
             }
+            DrawingMessage::OpenIndicatorSettings(_)
+            | DrawingMessage::ToggleIndicatorVisibility(_)
+            | DrawingMessage::RemoveIndicator(_) => return false,
+            DrawingMessage::SetDrawingVisibility(id, visibility) => {
+                if let Some(drawing) = self
+                    .drawings
+                    .drawings
+                    .iter_mut()
+                    .find(|drawing| drawing.id == *id)
+                {
+                    drawing.visibility = *visibility;
+                }
+            }
             DrawingMessage::ToggleDrawingVisibility(id) => {
                 if let Some(drawing) = self
                     .drawings
@@ -664,8 +709,7 @@ impl KlineChart {
             }
             DrawingMessage::FocusDrawing(id) => self.focus_drawing(*id),
             DrawingMessage::ToggleDrawingList => {
-                self.drawings.drawing_list_open =
-                    !self.drawings.drawings.is_empty() && !self.drawings.drawing_list_open;
+                self.drawings.drawing_list_open = !self.drawings.drawing_list_open;
             }
             DrawingMessage::ToolbarDragStarted(_) => {
                 self.drawings.dragging_panel = Some(FloatingPanel::Toolbar);
@@ -735,11 +779,8 @@ impl KlineChart {
         match panel {
             FloatingPanel::Toolbar => (
                 44.0,
-                toolbar_panel_height(
-                    self.drawings.toolbar_open,
-                    !self.drawings.drawings.is_empty(),
-                )
-                .min(self.chart.bounds.height),
+                toolbar_panel_height(self.drawings.toolbar_open, true)
+                    .min(self.chart.bounds.height),
             ),
             FloatingPanel::DrawingList => (
                 288.0,
@@ -808,7 +849,8 @@ impl KlineChart {
             let drawing = &mut self.drawings.drawings[index];
             apply(&mut drawing.style);
             let tool = geometry_tool(&drawing.geometry);
-            let style = drawing.style.clone();
+            let mut style = drawing.style.clone();
+            style.fixed_range_volume_profile.share_levels = false;
             if let Some((_, default_style)) = self
                 .drawings
                 .tool_styles
@@ -825,9 +867,32 @@ impl KlineChart {
             .drawings
             .iter()
             .rev()
-            .filter(|drawing| drawing.visible)
+            .filter(|drawing| self.drawing_visible(drawing))
             .find(|drawing| hit_test(self, drawing, point, bounds))
             .map(|drawing| drawing.id)
+    }
+
+    pub(super) fn fixed_profile_level_hit(&self, point: Point, bounds: Rectangle) -> Option<u64> {
+        let center = drawing_canvas_center(bounds);
+        let screen_y = |price| {
+            center.y
+                + (self.chart.price_to_y(Price::from_f64(price)) + self.chart.translation.y)
+                    * self.chart.scaling
+        };
+        self.owned_range_levels()
+            .rev()
+            .filter(|(_, level)| {
+                let start = self.volume_profile_screen_x(UnixMs::new(level.to), bounds);
+                start < bounds.width && point.x >= start.max(0.0)
+            })
+            .flat_map(|(id, level)| {
+                level
+                    .prices()
+                    .map(|price| (id, (screen_y(price) - point.y).abs()))
+            })
+            .filter(|(_, distance)| *distance <= 5.0)
+            .min_by(|(_, a), (_, b)| a.total_cmp(b))
+            .map(|(id, _)| id)
     }
 
     fn drawing_handle_hit(&self, id: u64, point: Point, bounds: Rectangle) -> Option<u8> {
@@ -835,7 +900,7 @@ impl KlineChart {
             .drawings
             .drawings
             .iter()
-            .find(|drawing| drawing.id == id)?;
+            .find(|drawing| drawing.id == id && self.drawing_visible(drawing))?;
         if let DrawingGeometry::FixedRangeVolumeProfile { first, second } = drawing.geometry {
             let first_x = self.volume_profile_screen_x(first, bounds);
             let second_x = self.volume_profile_screen_x(second, bounds);
@@ -876,7 +941,10 @@ impl KlineChart {
                         .and_capture(),
                     );
                 }
-                if let Some(id) = self.drawing_hit_test(point, bounds) {
+                let drawing_hit = self.drawing_hit_test(point, bounds);
+                if let Some(id) =
+                    drawing_hit.or_else(|| self.fixed_profile_level_hit(point, bounds))
+                {
                     let click = cursor.position().map(|global| {
                         Click::new(global, mouse::Button::Left, state.previous_click)
                     });
@@ -888,11 +956,12 @@ impl KlineChart {
                     state.previous_hit = Some(id);
                     let message = if is_double {
                         DrawingMessage::DoubleClicked(id)
-                    } else if self.drawings.selected == Some(id)
+                    } else if drawing_hit.is_some()
+                        && self.drawings.selected == Some(id)
                         && let Some(handle) = self.drawing_handle_hit(id, point, bounds)
                     {
                         DrawingMessage::ResizeStarted(anchor, point, handle)
-                    } else if self.drawings.selected == Some(id) {
+                    } else if drawing_hit.is_some() && self.drawings.selected == Some(id) {
                         DrawingMessage::MoveStarted(anchor)
                     } else {
                         // The first click belongs to chart navigation; a double-click selects.
@@ -1004,7 +1073,7 @@ impl KlineChart {
             return frame.into_geometry();
         }
         for drawing in &self.drawings.drawings {
-            if !drawing.visible {
+            if !self.drawing_visible(drawing) {
                 continue;
             }
             draw_one(
@@ -1027,7 +1096,8 @@ impl KlineChart {
             self.drawings.visible,
             self.drawings.toolbar_open,
             self.drawings.drawing_list_open,
-            !self.drawings.drawings.is_empty(),
+            matches!(self.kind, data::chart::KlineChartKind::Candles)
+                && matches!(self.chart.basis, Basis::Time(_)),
             self.chart.bounds.height,
         );
         let mut layers: Vec<Element<'_, Message>> = vec![
@@ -1042,10 +1112,7 @@ impl KlineChart {
                 .height(Length::Fill)
                 .into(),
         ];
-        if self.drawings.visible
-            && self.drawings.drawing_list_open
-            && !self.drawings.drawings.is_empty()
-        {
+        if self.drawings.drawing_list_open {
             layers.push(
                 container(drawing_list(self))
                     .padding(
@@ -1075,16 +1142,17 @@ impl KlineChart {
                 .into(),
             );
         }
-        if self.drawings.visible && self.drawings.settings_open && self.drawings.selected.is_some()
-        {
+        if self.drawings.settings_open && self.drawings.selected.is_some() {
             layers.push(
-                container(opaque(settings(self)))
-                    .padding(8)
-                    .align_x(Alignment::End)
-                    .align_y(Alignment::Start)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into(),
+                container(opaque(scrollable(settings(self)).height(Length::Fixed(
+                    (self.chart.bounds.height - 16.0).clamp(80.0, 650.0),
+                ))))
+                .padding(8)
+                .align_x(Alignment::End)
+                .align_y(Alignment::Start)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .into(),
             );
         }
         if self.drawings.visible
@@ -1125,7 +1193,7 @@ impl KlineChart {
         let mut x_labels = Vec::new();
         let mut y_labels = Vec::new();
         for drawing in &self.drawings.drawings {
-            if !drawing.visible {
+            if !self.drawing_visible(drawing) {
                 continue;
             }
             match &drawing.geometry {
@@ -1186,6 +1254,22 @@ impl KlineChart {
         matches!(self.drawings.draft, Some(Draft::Text { .. }))
             .then(|| self.drawings.text_input_id.clone())
     }
+}
+
+fn fixed_profile_input(
+    drawing: &Drawing,
+    timeframe: exchange::Timeframe,
+) -> Option<(UnixMs, UnixMs, FixedRangeVolumeProfileConfig)> {
+    let DrawingGeometry::FixedRangeVolumeProfile { first, second } = drawing.geometry else {
+        return None;
+    };
+    Some((
+        first.min(second),
+        first
+            .max(second)
+            .saturating_add(timeframe.to_milliseconds()),
+        sanitize_volume_profile_config(drawing.style.fixed_range_volume_profile),
+    ))
 }
 
 fn color(value: DrawingColor, opacity: f32) -> Color {
@@ -1626,6 +1710,7 @@ fn draw_draft(
                     geometry,
                     style,
                     visible: true,
+                    visibility: Default::default(),
                 },
                 bounds,
                 false,
@@ -1641,6 +1726,7 @@ fn draw_draft(
                 },
                 style,
                 visible: true,
+                visibility: Default::default(),
             },
             bounds,
             false,
@@ -1656,6 +1742,7 @@ fn draw_draft(
                 },
                 style,
                 visible: true,
+                visibility: Default::default(),
             },
             bounds,
             false,
@@ -1998,7 +2085,7 @@ fn toolbar(
     visible: bool,
     open: bool,
     drawing_list_open: bool,
-    has_drawings: bool,
+    allow_fixed_profile: bool,
     max_height: f32,
 ) -> Element<'static, Message> {
     let tools = [
@@ -2053,7 +2140,7 @@ fn toolbar(
         |position| Message::Drawing(DrawingMessage::ToolbarDragged(position)),
         Message::Drawing(DrawingMessage::ToolbarDragEnded),
     ));
-    if has_drawings {
+    {
         items = items.push(
             button(
                 svg(svg::Handle::from_memory(include_bytes!(
@@ -2092,7 +2179,7 @@ fn toolbar(
     if !open {
         return container(
             scrollable(container(items).padding(iced::padding::right(10))).height(Length::Fixed(
-                toolbar_panel_height(false, has_drawings).min(max_height),
+                toolbar_panel_height(false, true).min(max_height),
             )),
         )
         .padding(3)
@@ -2100,6 +2187,9 @@ fn toolbar(
         .into();
     }
     for (tool, asset, _label) in tools {
+        if tool == DrawingTool::FixedRangeVolumeProfile && !allow_fixed_profile {
+            continue;
+        }
         let bytes: &'static [u8] = match asset {
             "drawing-select.svg" => include_bytes!("../../../assets/ui/drawing-select.svg"),
             "drawing-pen.svg" => include_bytes!("../../../assets/ui/drawing-pen.svg"),
@@ -2173,7 +2263,7 @@ fn toolbar(
     );
     container(
         scrollable(container(items).padding(iced::padding::right(10))).height(Length::Fixed(
-            toolbar_panel_height(true, has_drawings).min(max_height),
+            toolbar_panel_height(true, true).min(max_height),
         )),
     )
     .padding(3)
@@ -2196,7 +2286,7 @@ fn drawing_list(chart: &KlineChart) -> Element<'_, Message> {
                 )))
                 .width(14)
                 .height(14),
-                text("Drawings list")
+                text("Объекты графика")
                     .size(13)
                     .color(Color::from_rgb(0.68, 0.70, 0.73)),
             ]
@@ -2210,17 +2300,72 @@ fn drawing_list(chart: &KlineChart) -> Element<'_, Message> {
     );
 
     let mut items = column![].spacing(3);
+    for (indicator, _) in chart.indicators.iter().filter(|(_, value)| value.is_some()) {
+        let visibility = chart.indicator_visibility(indicator);
+        let label = if !visibility.shown {
+            "Скрыт"
+        } else if !visibility.allows_timeframe(chart.chart.basis) {
+            "Скрыт по ТФ"
+        } else {
+            "Виден"
+        };
+        items = items.push(
+            row![
+                text(indicator.to_string()).size(11).width(Length::Fill),
+                button(text(label).size(11)).on_press(Message::Drawing(
+                    DrawingMessage::ToggleIndicatorVisibility(indicator)
+                )),
+                button(text("⚙").size(12)).on_press(Message::Drawing(
+                    DrawingMessage::OpenIndicatorSettings(indicator)
+                )),
+                button(text("×").size(12))
+                    .on_press(Message::Drawing(DrawingMessage::RemoveIndicator(indicator))),
+            ]
+            .spacing(3),
+        );
+    }
+    for profile in chart.visible_shared_range_profiles() {
+        items = items.push(
+            column![
+                text(format!("↗ Fixed Range VP #{}", profile.drawing_id)).size(11),
+                text(format!(
+                    "{} · {} · настройки на исходном графике",
+                    profile.source_ticker.symbol_and_exchange_string(),
+                    profile.source_basis
+                ))
+                .size(10),
+            ]
+            .spacing(2),
+        );
+    }
+    if chart.drawings.drawings.is_empty()
+        && chart.indicators.values().all(Option::is_none)
+        && chart.visible_shared_range_profiles().next().is_none()
+    {
+        items = items.push(text("Нет объектов. Добавьте индикатор или рисунок.").size(11));
+    }
     for drawing in &chart.drawings.drawings {
         let title = drawing_name(&drawing.geometry);
         let position = drawing_position(drawing, chart.tick_size().decimal_places());
+        let label = if !chart.drawing_supported(drawing) {
+            format!("{title} · другой режим")
+        } else if !drawing.visibility.allows_timeframe(chart.chart.basis) {
+            format!("{title} · скрыт по ТФ")
+        } else {
+            format!("{title} - {position}")
+        };
         let focus = button(
-            text(ellipsize(&format!("{title} - {position}"), 24))
+            text(ellipsize(&label, 29))
                 .size(11)
                 .color(Color::from_rgb(0.62, 0.64, 0.67)),
         )
         .padding(4)
         .width(Length::Fill)
-        .on_press(Message::Drawing(DrawingMessage::FocusDrawing(drawing.id)))
+        .on_press_maybe(
+            drawing
+                .supports_basis(chart.chart.basis)
+                .then_some(Message::Drawing(DrawingMessage::FocusDrawing(drawing.id))),
+        )
         .style(|theme, status| crate::style::button::transparent(theme, status, false));
         let action_icon = |bytes: &'static [u8], message| {
             button(
@@ -2246,7 +2391,7 @@ fn drawing_list(chart: &KlineChart) -> Element<'_, Message> {
                         DrawingMessage::OpenDrawingSettings(drawing.id),
                     ),
                     action_icon(
-                        if drawing.visible {
+                        if chart.drawing_visible(drawing) {
                             include_bytes!("../../../assets/ui/drawing-eye.svg")
                         } else {
                             include_bytes!("../../../assets/ui/drawing-eye-off.svg")
@@ -2269,7 +2414,15 @@ fn drawing_list(chart: &KlineChart) -> Element<'_, Message> {
         column![
             header,
             scrollable(items).height(Length::Fixed(
-                (chart.drawings.drawings.len() as f32 * 30.0).clamp(30.0, 240.0),
+                ((chart.drawings.drawings.len()
+                    + chart
+                        .indicators
+                        .values()
+                        .filter(|value| value.is_some())
+                        .count()) as f32
+                    * 30.0
+                    + chart.visible_shared_range_profiles().count() as f32 * 40.0)
+                    .clamp(40.0, 240.0),
             )),
         ]
         .spacing(3),
@@ -2454,6 +2607,7 @@ fn settings(chart: &KlineChart) -> Element<'_, Message> {
         _ => {}
     }
 
+    controls = controls.push(drawing_visibility_settings(drawing));
     controls = controls.push(
         button(text("Delete drawing")).on_press(Message::Drawing(DrawingMessage::DeleteSelected)),
     );
@@ -2463,6 +2617,13 @@ fn settings(chart: &KlineChart) -> Element<'_, Message> {
         .width(iced::Length::Fit.max(240))
         .style(crate::style::chart_modal)
         .into()
+}
+
+fn drawing_visibility_settings(drawing: &Drawing) -> Element<'static, Message> {
+    let id = drawing.id;
+    crate::indicators::visibility_settings(drawing.visibility, move |visibility| {
+        Message::Drawing(DrawingMessage::SetDrawingVisibility(id, visibility))
+    })
 }
 
 fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message> {
@@ -2541,8 +2702,16 @@ fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message
             value
         },
     );
+    let share = toggle(
+        "На других графиках символа (спот и фьючерсы)",
+        config.share_levels,
+        |mut value, enabled| {
+            value.share_levels = enabled;
+            value
+        },
+    );
     let extend = toggle(
-        "Extend POC / VA right (all charts of ticker)",
+        "Extend POC / VA right",
         config.extend_levels,
         |mut value, enabled| {
             value.extend_levels = enabled;
@@ -2571,6 +2740,9 @@ fn fixed_range_volume_profile_settings(drawing: &Drawing) -> Element<'_, Message
             vwap,
             high_low,
             extend,
+            share,
+            text("Переносятся продлённые POC, VAH и VAL.").size(11),
+            drawing_visibility_settings(drawing),
             button(text("Delete drawing"))
                 .on_press(Message::Drawing(DrawingMessage::DeleteSelected)),
         ]

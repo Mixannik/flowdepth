@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 use std::cell::Cell;
 use std::fmt;
 use std::path::PathBuf;
-use std::sync::RwLock;
+use std::sync::{Arc, LazyLock, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
@@ -1009,6 +1009,17 @@ impl RequestHandler {
             self.generation_id
         );
         Ok(Some(id))
+    }
+
+    pub fn mark_trade_progress(&mut self, id: Uuid) {
+        let generation = self.generation_id();
+        if let Some(request) = self.requests.get_mut(&id)
+            && request.generation == generation
+            && matches!(request.status, RequestStatus::Pending)
+            && matches!(request.fetch_type, FetchRange::Trades(..))
+        {
+            request.updated_at = UnixMs::now().as_u64();
+        }
     }
 
     pub fn mark_completed(&mut self, id: Uuid) {
@@ -2763,6 +2774,38 @@ fn kline_success_updates(
     (data, completed)
 }
 
+// Direct Binance workers share the canonical cache across panes and timeframes.
+fn binance_history_lane(dataset: String) -> Arc<tokio::sync::Mutex<()>> {
+    type Lane = tokio::sync::Mutex<()>;
+    static LANES: LazyLock<Mutex<FxHashMap<String, Weak<Lane>>>> =
+        LazyLock::new(|| Mutex::new(FxHashMap::default()));
+    let mut lanes = LANES.lock().unwrap_or_else(|error| error.into_inner());
+    lanes.retain(|_, lane| lane.strong_count() != 0);
+    if let Some(lane) = lanes.get(&dataset).and_then(Weak::upgrade) {
+        return lane;
+    }
+    let lane = Arc::new(Lane::new(()));
+    lanes.insert(dataset, Arc::downgrade(&lane));
+    lane
+}
+
+fn trade_in_cache_snapshot(snapshot: &[Trade], trade: &Trade) -> bool {
+    let start = snapshot.partition_point(|record| record.time < trade.time);
+    snapshot[start..]
+        .iter()
+        .take_while(|record| record.time == trade.time)
+        .any(|record| {
+            if let Some(id) = trade.id {
+                record.id == Some(id)
+            } else {
+                record.id.is_none()
+                    && record.is_sell == trade.is_sell
+                    && record.price == trade.price
+                    && record.qty == trade.qty
+            }
+        })
+}
+
 pub fn fetch_trades_batched(
     server: Option<ServerClient>,
     handles: AdapterHandles,
@@ -2775,6 +2818,13 @@ pub fn fetch_trades_batched(
     let context = handles.quantity_context();
     let direct_binance =
         server.is_none() && ticker_info.exchange().venue() == exchange::adapter::Venue::Binance;
+    let read_history = move |cache: &MarketDataCache, from, to| {
+        if direct_binance {
+            cache.read_binance_raw_trades(ticker_info, from, to, context.preference())
+        } else {
+            cache.read_trades(ticker_info, from, to)
+        }
+    };
     let venue = format_venue(&ticker_info);
     let symbol = format_symbol(&ticker_info);
 
@@ -2784,9 +2834,9 @@ pub fn fetch_trades_batched(
         let mut request_count = 0usize;
         let mut last_progress_log = Instant::now();
         let to_exclusive = to_time.saturating_add(1);
-        let (cached_trades, gaps) = in_quantity_context(context, || {
+        let (cached_trades, mut gaps) = in_quantity_context(context, || {
             if let Some(cache) = market_cache() {
-                let cached = cache.read_trades(ticker_info, from_time, to_exclusive);
+                let cached = read_history(cache, from_time, to_exclusive);
                 (cached.records, cached.gaps)
             } else {
                 (Vec::new(), vec![(from_time, to_exclusive)])
@@ -2809,6 +2859,43 @@ pub fn fetch_trades_batched(
             total_trades = total_trades.saturating_add(chunk.len());
             let () = progress.send(chunk.to_vec()).await;
         }
+
+        // Publish the initial cache snapshot even if another pane owns the
+        // network lane. Only requests with gaps need to wait.
+        let _history_turn = if direct_binance && !gaps.is_empty() {
+            if let Some(cache) = market_cache() {
+                let lane = binance_history_lane(super::persistent_cache::binance_raw_trade_key(
+                    ticker_info,
+                ));
+                let turn = match lane.clone().try_lock_owned() {
+                    Ok(turn) => turn,
+                    Err(_) => {
+                        log::info!("TRADE Queue | {venue} {symbol} req={}", short_id(req_id));
+                        lane.lock_owned().await
+                    }
+                };
+                // A preceding worker may have filled any part of these gaps
+                // since the initial snapshot, even if acquiring the lane was immediate.
+                for (from, to) in std::mem::take(&mut gaps) {
+                    let refreshed = in_quantity_context(context, || read_history(cache, from, to))?;
+                    gaps.extend(refreshed.gaps);
+                    let mut records = refreshed.records;
+                    records.retain(|trade| !trade_in_cache_snapshot(&cached_trades, trade));
+                    if let Some(last) = records.last() {
+                        final_latest = final_latest.max(last.time.min(to_time));
+                    }
+                    for chunk in records.chunks(10_000) {
+                        total_trades = total_trades.saturating_add(chunk.len());
+                        let () = progress.send(chunk.to_vec()).await;
+                    }
+                }
+                Some(turn)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         let network_started = Instant::now();
         let network_gaps = coalesce_trade_fetch_gaps(&gaps, TRADE_GAP_COALESCE_BRIDGE_MS);
@@ -2841,17 +2928,14 @@ pub fn fetch_trades_batched(
                 // Old aggregates have minute precision and are not safe here.
                 let raw_cutoff =
                     UnixMs::now().saturating_sub(data::chart::kline::CACHE_AGGREGATE_AFTER_MS);
-                if server.is_none()
-                    && ticker_info.exchange().venue() == exchange::adapter::Venue::Binance
-                    && latest_trade_t >= raw_cutoff
-                {
+                if direct_binance && latest_trade_t >= raw_cutoff {
                     let probe_end = latest_trade_t
                         .saturating_add(TRADE_CACHE_RECHECK_MS)
                         .min(gap_to_exclusive);
                     let reused = in_quantity_context(context, || {
                         market_cache().and_then(|cache| {
                             reusable_trade_prefix(
-                                cache.read_trades(ticker_info, latest_trade_t, probe_end),
+                                read_history(cache, latest_trade_t, probe_end),
                                 latest_trade_t,
                                 probe_end,
                             )
@@ -2933,11 +3017,21 @@ pub fn fetch_trades_batched(
                         client
                             .fetch_trades_arrow(ticker_info, request_from, target_to, ARROW_LIMIT)
                             .await
-                            .map(|parsed| parsed.trades)
+                            .map(|parsed| (parsed.trades, None))
+                    } else if direct_binance {
+                        let raw = handles
+                            .fetch_binance_raw_trades(ticker_info, request_from, data_path.clone())
+                            .await?;
+                        let projected: Result<Vec<_>, _> = raw
+                            .iter()
+                            .map(|trade| trade.project(ticker_info, context.preference()))
+                            .collect();
+                        projected.map(|trades| (trades, Some(raw)))
                     } else {
                         handles
                             .fetch_trades(ticker_info, request_from, Some(data_path.clone()))
                             .await
+                            .map(|trades| (trades, None))
                     }
                 })
                 .await;
@@ -2964,7 +3058,7 @@ pub fn fetch_trades_batched(
                             ),
                         );
                     }
-                    Ok(Ok(raw_batch)) => {
+                    Ok(Ok((raw_batch, canonical))) => {
                         let elapsed = request_started.elapsed().as_millis() as u64;
                         let prev_latest_trade_t = latest_trade_t;
                         log::debug!(
@@ -3009,16 +3103,30 @@ pub fn fetch_trades_batched(
                             if let Some(cache) = market_cache()
                                 && request_from < covered_to_exclusive
                             {
-                                cache.store_trades(
-                                    ticker_info,
-                                    request_from,
-                                    covered_to_exclusive,
-                                    &cache_batch,
-                                );
+                                if let Some(mut raw) = canonical {
+                                    raw.retain(|trade| {
+                                        request_from <= trade.time
+                                            && trade.time < covered_to_exclusive
+                                    });
+                                    cache.store_binance_raw_trades(
+                                        ticker_info,
+                                        request_from,
+                                        covered_to_exclusive,
+                                        &raw,
+                                    );
+                                } else {
+                                    cache.store_trades(
+                                        ticker_info,
+                                        request_from,
+                                        covered_to_exclusive,
+                                        &cache_batch,
+                                    );
+                                }
                             }
                         })?;
 
                         if direct_binance {
+                            // The direct adapter returns the entire final millisecond.
                             latest_trade_t = covered_to_exclusive;
                             consecutive_no_progress = 0;
                         } else if latest_trade_t <= prev_latest_trade_t {
@@ -3921,6 +4029,28 @@ mod tests {
     }
 
     #[test]
+    fn trade_batches_keep_the_request_pending_until_idle() {
+        let mut handler = RequestHandler::default();
+        let id = handler
+            .add_request(FetchRange::Trades(UnixMs::new(1000), UnixMs::new(2000)))
+            .unwrap()
+            .unwrap();
+        let timeout = RequestHandler::PENDING_TIMEOUT_MS;
+        let original = handler.requests[&id].updated_at.saturating_sub(timeout);
+        handler.requests.get_mut(&id).unwrap().updated_at = original;
+
+        handler.mark_trade_progress(id);
+        handler.cleanup_stale_at(original + timeout);
+        assert!(handler.has_pending_trade_requests());
+
+        let updated = handler.requests[&id].updated_at;
+        handler.cleanup_stale_at(updated + timeout);
+        assert!(!handler.has_pending_trade_requests());
+        handler.mark_trade_progress(id);
+        assert!(!handler.has_pending_trade_requests());
+    }
+
+    #[test]
     fn test_timeout_watchdog() {
         let mut handler = RequestHandler::default();
 
@@ -4317,5 +4447,33 @@ mod ws03_tests {
             .await
             .is_err()
         );
+    }
+}
+
+#[cfg(test)]
+mod history_lane_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn binance_history_lane_shares_turn_and_releases_on_cancellation() {
+        let first = binance_history_lane("test-perp".into());
+        let second = binance_history_lane("test-perp".into());
+        let spot = binance_history_lane("test-spot".into());
+        let active = first.lock_owned().await;
+        assert!(second.try_lock().is_err());
+        assert!(spot.try_lock().is_ok());
+
+        let waiting = second.clone().lock_owned();
+        {
+            let mut waiting = std::pin::pin!(waiting);
+            assert!(
+                std::future::poll_fn(|cx| std::task::Poll::Ready(
+                    waiting.as_mut().poll(cx).is_pending()
+                ))
+                .await
+            );
+        }
+        drop(active);
+        assert!(second.try_lock().is_ok());
     }
 }

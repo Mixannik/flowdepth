@@ -45,6 +45,7 @@ pub enum Runtime {
 }
 #[derive(Debug, Clone, Copy)]
 pub enum Editor {
+    ClusterSearch(usize),
     None,
     PeriodLevels,
     NakedLevels,
@@ -253,6 +254,33 @@ pub const DEFINITIONS: &[Definition] = &[
         Delta,
         Runtime::SizeCvd,
         Editor::SizeCvd
+    ),
+    define!(
+        ClusterSearch1,
+        "Cluster Search 1",
+        "Anomalous Footprint cells: Volume, Bid, Ask or absolute Delta. Available trade history only.",
+        OrderFlow,
+        Volume,
+        Runtime::Overlay,
+        Editor::ClusterSearch(0)
+    ),
+    define!(
+        ClusterSearch2,
+        "Cluster Search 2",
+        "Independent Cluster Search instance.",
+        OrderFlow,
+        Volume,
+        Runtime::Overlay,
+        Editor::ClusterSearch(1)
+    ),
+    define!(
+        ClusterSearch3,
+        "Cluster Search 3",
+        "Independent Cluster Search instance.",
+        OrderFlow,
+        Volume,
+        Runtime::Overlay,
+        Editor::ClusterSearch(2)
     ),
 ];
 

@@ -107,18 +107,115 @@ struct DeOpenInterest {
     pub sum: f64,
 }
 
-#[derive(Deserialize, Debug)]
-struct DeTrade {
+/// Binance wire decimals are retained until projection into the application Trade.
+#[derive(Clone, serde::Serialize, Deserialize, Debug)]
+pub struct BinanceRawTradeV1 {
     #[serde(rename = "a")]
-    id: u64,
+    pub id: u64,
     #[serde(rename = "T")]
-    time: u64,
-    #[serde(rename = "p", deserialize_with = "de_string_to_number")]
-    price: f64,
-    #[serde(rename = "q", deserialize_with = "de_string_to_number")]
-    qty: f64,
+    pub time: UnixMs,
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "q")]
+    quantity: String,
     #[serde(rename = "m")]
     is_sell: bool,
+}
+
+impl BinanceRawTradeV1 {
+    pub fn project(&self, ticker: TickerInfo, preference: SizeUnit) -> Result<Trade, AdapterError> {
+        self.as_raw()
+            .project(ticker, trade_normalizer(ticker, preference))
+    }
+
+    fn as_raw(&self) -> RawTrade<'_> {
+        RawTrade {
+            id: self.id,
+            time: self.time.as_u64(),
+            price: &self.price,
+            quantity: &self.quantity,
+            is_sell: self.is_sell,
+        }
+    }
+}
+
+/// The three Binance transports retain decimal text up to this projection.
+pub(super) struct RawTrade<'a> {
+    pub id: u64,
+    pub time: u64,
+    pub price: &'a str,
+    pub quantity: &'a str,
+    pub is_sell: bool,
+}
+
+impl RawTrade<'_> {
+    pub(super) fn project(
+        self,
+        ticker: TickerInfo,
+        normalizer: QtyNormalization,
+    ) -> Result<Trade, AdapterError> {
+        let invalid = |field| {
+            AdapterError::ParseError(format!("Invalid Binance aggTrade {}: {field}", self.id))
+        };
+        let price = self.price.parse::<f64>().map_err(|_| invalid("price"))?;
+        if !price.is_finite() || price <= 0.0 || price >= Price::from_units(i64::MAX).to_f64() {
+            return Err(invalid("price"));
+        }
+        let raw_qty = if ticker.market_type() == MarketKind::InversePerps {
+            if !ticker
+                .contract_size
+                .is_some_and(|size| size.as_f64().is_finite() && size.as_f64() > 0.0)
+            {
+                return Err(invalid("contract size"));
+            }
+            self.quantity
+                .parse::<u64>()
+                .map_err(|_| invalid("contract count"))? as f64
+        } else {
+            self.quantity
+                .parse::<f64>()
+                .map_err(|_| invalid("quantity"))?
+        };
+        let qty = normalizer.normalize(raw_qty, price);
+        let qty_units = (qty * 10_f64.powi(Qty::QTY_SCALE)).round();
+        if !qty_units.is_finite()
+            || raw_qty <= 0.0
+            || qty_units <= 0.0
+            || qty_units >= i64::MAX as f64
+        {
+            return Err(invalid("quantity"));
+        }
+        let price = Price::from_f64(price).round_to_min_tick(ticker.min_ticksize);
+        if price.units <= 0 || price.units == i64::MAX {
+            return Err(invalid("rounded price"));
+        }
+        Ok(Trade {
+            id: Some(self.id),
+            time: self.time.into(),
+            is_sell: self.is_sell,
+            price,
+            qty: Qty::from_units(qty_units as i64),
+        })
+    }
+}
+
+fn project_raw_trade_page(
+    records: Vec<BinanceRawTradeV1>,
+    ticker: TickerInfo,
+    preference: SizeUnit,
+) -> Result<Vec<Trade>, AdapterError> {
+    let normalizer = trade_normalizer(ticker, preference);
+    records
+        .into_iter()
+        .map(|record| record.as_raw().project(ticker, normalizer))
+        .collect()
+}
+
+fn trade_normalizer(ticker: TickerInfo, preference: SizeUnit) -> QtyNormalization {
+    let market = ticker.market_type();
+    let raw_unit = raw_qty_unit_from_market_type(market);
+    let unit = QuantityUnit::for_market(market, preference);
+    QtyNormalization::with_raw_qty_unit(unit == QuantityUnit::Quote, ticker, raw_unit)
 }
 
 #[derive(Deserialize, Clone)]
@@ -608,12 +705,12 @@ async fn fetch_intraday_trades(
     hub: &mut HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from: UnixMs,
-) -> Result<Vec<Trade>, AdapterError> {
+) -> Result<Vec<BinanceRawTradeV1>, AdapterError> {
     complete_intraday_trade_page(
         hub,
         from,
-        |hub, cursor| Box::pin(fetch_recovery_trade_page(hub, ticker_info, cursor)),
-        |trade| (trade.id, trade.time),
+        |hub, cursor| Box::pin(fetch_raw_trade_page(hub, ticker_info, cursor)),
+        |trade| (Some(trade.id), trade.time),
     )
     .await
 }
@@ -681,6 +778,15 @@ pub(super) async fn fetch_recovery_trade_page(
     ticker_info: TickerInfo,
     cursor: crate::adapter::TradePageCursor,
 ) -> Result<Vec<Trade>, AdapterError> {
+    let records = fetch_raw_trade_page(hub, ticker_info, cursor).await?;
+    project_raw_trade_page(records, ticker_info, volume_size_unit())
+}
+
+async fn fetch_raw_trade_page(
+    hub: &mut HttpHub<BinanceLimiter>,
+    ticker_info: TickerInfo,
+    cursor: crate::adapter::TradePageCursor,
+) -> Result<Vec<BinanceRawTradeV1>, AdapterError> {
     let ticker = ticker_info.ticker;
     let (symbol_str, market_type) = ticker.to_full_symbol_and_type();
 
@@ -698,26 +804,7 @@ pub(super) async fn fetch_recovery_trade_page(
         crate::adapter::TradePageCursor::AggregateId(id) => url.push_str(&format!("&fromId={id}")),
     }
 
-    let de_trades: Vec<DeTrade> = hub.http_json_with_limiter(&url, weight, None, None).await?;
-
-    let qty_norm = QtyNormalization::with_raw_qty_unit(
-        volume_size_unit() == SizeUnit::Quote,
-        ticker_info,
-        raw_qty_unit_from_market_type(market_type),
-    );
-
-    let trades = de_trades
-        .into_iter()
-        .map(|de_trade| Trade {
-            id: Some(de_trade.id),
-            time: de_trade.time.into(),
-            is_sell: de_trade.is_sell,
-            price: Price::from_f64(de_trade.price).round_to_min_tick(ticker_info.min_ticksize),
-            qty: qty_norm.normalize_qty(de_trade.qty, de_trade.price),
-        })
-        .collect();
-
-    Ok(trades)
+    hub.http_json_with_limiter(&url, weight, None, None).await
 }
 
 /// Spot archives since 2025 store microseconds, futures archives milliseconds.
@@ -746,7 +833,7 @@ async fn get_hist_trades_with_client(
     ticker_info: TickerInfo,
     date: chrono::NaiveDate,
     base_path: PathBuf,
-) -> Result<Vec<Trade>, AdapterError> {
+) -> Result<Vec<BinanceRawTradeV1>, AdapterError> {
     let ticker = ticker_info.ticker;
     let (symbol, market_type) = ticker.to_full_symbol_and_type();
 
@@ -809,12 +896,6 @@ async fn get_hist_trades_with_client(
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| AdapterError::ParseError(format!("Failed to unzip file: {e}")))?;
 
-    let qty_norm = QtyNormalization::with_raw_qty_unit(
-        volume_size_unit() == SizeUnit::Quote,
-        ticker_info,
-        raw_qty_unit_from_market_type(market_type),
-    );
-
     let mut trades = Vec::new();
     for i in 0..archive.len() {
         let csv_file = archive
@@ -825,36 +906,44 @@ async fn get_hist_trades_with_client(
             .has_headers(false)
             .from_reader(BufReader::new(csv_file));
 
-        trades.extend(csv_reader.records().filter_map(|record| {
-            record.ok().and_then(|record| {
-                let id = record.get(0)?.parse::<u64>().ok()?;
-                let time = archive_time_ms(record.get(5)?.parse::<u64>().ok()?);
-                let is_sell = archive_bool(record.get(6)?)?;
-                let price_f64 = record.get(1)?.parse::<f64>().ok()?;
-
-                let price = Price::from_f64(price_f64).round_to_min_tick(ticker_info.min_ticksize);
-                let qty = qty_norm.normalize_qty(record.get(2)?.parse::<f64>().ok()?, price_f64);
-
-                Some(Trade {
-                    id: Some(id),
-                    time: time.into(),
-                    is_sell,
-                    price,
-                    qty,
-                })
-            })
-        }));
+        read_archive_trades(&mut csv_reader, &mut trades)?;
     }
 
     Ok(trades)
 }
 
-pub(super) async fn fetch_trades(
+fn read_archive_trades(
+    reader: &mut csv::Reader<impl std::io::Read>,
+    trades: &mut Vec<BinanceRawTradeV1>,
+) -> Result<(), AdapterError> {
+    for (index, record) in reader.records().enumerate() {
+        let record = record.map_err(|error| AdapterError::ParseError(error.to_string()))?;
+        if index == 0 && record.get(0) == Some("agg_trade_id") {
+            continue;
+        }
+        let raw = (|| {
+            Some(BinanceRawTradeV1 {
+                id: record.get(0)?.parse().ok()?,
+                time: UnixMs::new(archive_time_ms(record.get(5)?.parse().ok()?)),
+                price: record.get(1)?.into(),
+                quantity: record.get(2)?.into(),
+                is_sell: archive_bool(record.get(6)?)?,
+            })
+        })()
+        .ok_or_else(|| {
+            AdapterError::ParseError(format!("Invalid Binance archive row {}", index + 1))
+        })?;
+        trades.push(raw);
+    }
+    Ok(())
+}
+
+pub(super) async fn fetch_raw_trades(
     hub: &mut HttpHub<BinanceLimiter>,
     ticker_info: TickerInfo,
     from_time: UnixMs,
     data_path: Option<PathBuf>,
-) -> Result<Vec<Trade>, AdapterError> {
+) -> Result<Vec<BinanceRawTradeV1>, AdapterError> {
     let Some(data_path) = data_path else {
         return Err(AdapterError::InvalidRequest(
             "Binance trades fetch requires data_path".to_string(),
@@ -889,9 +978,9 @@ pub(super) async fn fetch_trades(
     loop {
         match get_hist_trades_with_client(&client, ticker_info, date, data_path.clone()).await {
             Ok(trades) => {
-                let mut trades: Vec<Trade> =
+                let mut trades: Vec<BinanceRawTradeV1> =
                     trades.into_iter().filter(|t| t.time >= from_time).collect();
-                let Some(latest_trade) = trades.last().copied() else {
+                let Some(latest_trade) = trades.last() else {
                     date = date.succ_opt().unwrap_or(today);
                     if date < today {
                         continue;
@@ -960,6 +1049,125 @@ fn intraday_window_covers(start_ms: u64, now_ms: u64) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::{
+        archive_bool, archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
+        oi_request_limit, remember_missing_historical_trade_archive,
+    };
+
+    #[test]
+    fn fd012_binance_raw_trade_projection_validates_entire_page() {
+        use super::{MarketKind, Qty, SizeUnit, Ticker, TickerInfo, UnixMs};
+        use super::{exchange_from_market_type, project_raw_trade_page};
+
+        let ticker = |market, contract_size| {
+            let symbol = if market == MarketKind::InversePerps {
+                "BTCUSD"
+            } else {
+                "BTCUSDT"
+            };
+            TickerInfo::new(
+                Ticker::new(symbol, exchange_from_market_type(market)),
+                0.01,
+                0.001,
+                contract_size,
+            )
+        };
+        let page = |price: &str, quantity: &str| {
+            serde_json::from_value(serde_json::json!([
+                {"a": 10, "T": 1000, "p": "100", "q": "1", "m": false},
+                {"a": 11, "T": 1000, "p": price, "q": quantity, "m": true},
+            ]))
+            .unwrap()
+        };
+        for market in [MarketKind::Spot, MarketKind::LinearPerps] {
+            let ticker = ticker(market, None);
+            for (preference, expected) in [(SizeUnit::Base, 0.5), (SizeUnit::Quote, 55.0)] {
+                let trades =
+                    project_raw_trade_page(page("110", "0.5"), ticker, preference).unwrap();
+                assert_eq!(trades[1].qty, Qty::from_f64(expected));
+                assert_eq!(trades[1].id, Some(11));
+                assert_eq!(trades[1].time, UnixMs::new(1000));
+                assert!(trades[1].is_sell);
+            }
+            for (price, qty) in [
+                ("0", "1"),
+                ("NaN", "1"),
+                ("1e20", "1"),
+                ("100", "1e20"),
+                ("100", "-1"),
+            ] {
+                assert!(project_raw_trade_page(page(price, qty), ticker, SizeUnit::Quote).is_err());
+            }
+        }
+        let ethbtc = TickerInfo::new(
+            Ticker::new("ETHBTC", exchange_from_market_type(MarketKind::Spot)),
+            0.00001,
+            0.001,
+            None,
+        );
+        let trades = project_raw_trade_page(page("0.05", "2"), ethbtc, SizeUnit::Quote).unwrap();
+        assert_eq!(trades[1].qty, Qty::from_f64(0.1));
+
+        for preference in [SizeUnit::Base, SizeUnit::Quote] {
+            let inverse = ticker(MarketKind::InversePerps, Some(100.0));
+            let trades = project_raw_trade_page(page("25000", "2"), inverse, preference).unwrap();
+            assert_eq!(trades[1].qty, Qty::from_f64(200.0));
+            assert!(project_raw_trade_page(page("25000", "2.5"), inverse, preference).is_err());
+            let missing = ticker(MarketKind::InversePerps, None);
+            assert!(project_raw_trade_page(page("25000", "2"), missing, preference).is_err());
+        }
+    }
+
+    #[test]
+    fn binance_archive_projection_matches_rest_and_rejects_bad_rows() {
+        use super::*;
+
+        let time = 1_793_059_200_482_u64;
+        for (market, symbol, quantity, archive_time, header) in [
+            (MarketKind::Spot, "BTCUSDT", "0.125", time * 1000 + 489, ""),
+            (
+                MarketKind::LinearPerps,
+                "BTCUSDT",
+                "0.125",
+                time,
+                "agg_trade_id,price,quantity,first_trade_id,last_trade_id,transact_time,is_buyer_maker\n",
+            ),
+            (MarketKind::InversePerps, "BTCUSD", "3", time, ""),
+        ] {
+            let contract_size = (market == MarketKind::InversePerps).then_some(100.0);
+            let ticker = TickerInfo::new(
+                Ticker::new(symbol, exchange_from_market_type(market)),
+                0.01,
+                0.001,
+                contract_size,
+            );
+            let csv = format!("{header}42,65000.10,{quantity},1,2,{archive_time},True\n");
+            for preference in [SizeUnit::Base, SizeUnit::Quote] {
+                let records = serde_json::from_value(serde_json::json!([
+                    {"a":42,"T":time,"p":"65000.10","q":quantity,"m":true}
+                ]))
+                .unwrap();
+                let rest = project_raw_trade_page(records, ticker, preference).unwrap();
+                let read = |input: &str| {
+                    let mut reader = ReaderBuilder::new()
+                        .has_headers(false)
+                        .from_reader(input.as_bytes());
+                    let mut trades = Vec::new();
+                    read_archive_trades(&mut reader, &mut trades)?;
+                    project_raw_trade_page(trades, ticker, preference)
+                };
+                let archived = read(&csv).unwrap();
+                assert_eq!(archived.len(), 1);
+                assert_eq!(archived[0].id, rest[0].id);
+                assert_eq!(archived[0].time, rest[0].time);
+                assert_eq!(archived[0].price, rest[0].price);
+                assert_eq!(archived[0].qty, rest[0].qty);
+                assert_eq!(archived[0].is_sell, rest[0].is_sell);
+                assert!(read(&format!("{csv}43,0,1,3,3,{archive_time},false\n")).is_err());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn intraday_saturated_millisecond_is_completed_by_id() {
         use super::{Price, Trade, UnixMs, complete_intraday_trade_page};
@@ -1017,11 +1225,6 @@ mod tests {
             );
         }
     }
-
-    use super::{
-        archive_bool, archive_time_ms, historical_trade_archive_is_missing, intraday_window_covers,
-        oi_request_limit, remember_missing_historical_trade_archive,
-    };
 
     #[test]
     fn missing_old_archive_never_falls_back_to_expired_futures_rest() {

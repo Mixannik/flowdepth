@@ -15,13 +15,28 @@ pub enum TpoAnchor {
     Daily,
     Weekly,
     Monthly,
+    FourHours,
+    EightHours,
+    TwelveHours,
 }
 
 impl TpoAnchor {
-    pub const ALL: [Self; 3] = [Self::Daily, Self::Weekly, Self::Monthly];
+    pub const PROFILE_PERIODS: [Self; 5] = [
+        Self::FourHours,
+        Self::EightHours,
+        Self::TwelveHours,
+        Self::Daily,
+        Self::Weekly,
+    ];
 
     pub fn floor(self, time: UnixMs) -> UnixMs {
         match self {
+            Self::FourHours => time.floor_to(Timeframe::H4),
+            Self::EightHours => {
+                let period = 2 * Timeframe::H4.to_milliseconds();
+                UnixMs::new(time.as_u64() / period * period)
+            }
+            Self::TwelveHours => time.floor_to(Timeframe::H12),
             Self::Daily => time.floor_to(Timeframe::D1),
             Self::Weekly => {
                 let Some(date_time) = time.as_datetime_utc() else {
@@ -47,6 +62,9 @@ impl TpoAnchor {
 
     pub fn offset(self, time: UnixMs, periods: i64) -> UnixMs {
         match self {
+            Self::FourHours => time.offset_by_timeframe(Timeframe::H4, periods),
+            Self::EightHours => time.offset_by_timeframe(Timeframe::H4, periods.saturating_mul(2)),
+            Self::TwelveHours => time.offset_by_timeframe(Timeframe::H12, periods),
             Self::Daily => time.offset_by_timeframe(Timeframe::D1, periods),
             Self::Weekly => time.offset_by_timeframe(Timeframe::D1, periods.saturating_mul(7)),
             Self::Monthly => {
@@ -80,8 +98,11 @@ impl TpoAnchor {
 impl std::fmt::Display for TpoAnchor {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(match self {
-            Self::Daily => "Daily",
-            Self::Weekly => "Weekly",
+            Self::FourHours => "4H",
+            Self::EightHours => "8H",
+            Self::TwelveHours => "12H",
+            Self::Daily => "1D",
+            Self::Weekly => "1W",
             Self::Monthly => "Monthly",
         })
     }
@@ -92,6 +113,52 @@ pub const DEFAULT_TPO_VALUE_AREA_PERCENT: u8 = 70;
 pub const MIN_TPO_VALUE_AREA_PERCENT: u8 = 5;
 pub const MAX_TPO_VALUE_AREA_PERCENT: u8 = 100;
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TpoHistory {
+    One,
+    Three,
+    Five,
+    Seven,
+    Fourteen,
+    Thirty,
+    #[default]
+    All,
+}
+
+impl TpoHistory {
+    pub const ALL: [Self; 7] = [
+        Self::One,
+        Self::Three,
+        Self::Five,
+        Self::Seven,
+        Self::Fourteen,
+        Self::Thirty,
+        Self::All,
+    ];
+
+    pub fn days(self) -> Option<i64> {
+        match self {
+            Self::One => Some(1),
+            Self::Three => Some(3),
+            Self::Five => Some(5),
+            Self::Seven => Some(7),
+            Self::Fourteen => Some(14),
+            Self::Thirty => Some(30),
+            Self::All => None,
+        }
+    }
+}
+
+impl std::fmt::Display for TpoHistory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.days() {
+            Some(1) => f.write_str("1 day"),
+            Some(days) => write!(f, "{days} days"),
+            None => f.write_str("All available"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct TpoConfig {
@@ -99,6 +166,25 @@ pub struct TpoConfig {
     pub letter_period: Timeframe,
     pub value_area_percent: u8,
     pub show_letters: bool,
+    pub width_percent: u8,
+    pub value_color: crate::chart::gex::GexLevelColor,
+    pub outside_color: crate::chart::gex::GexLevelColor,
+    pub poc_color: crate::chart::gex::GexLevelColor,
+    pub show_poc: bool,
+    pub show_vah: bool,
+    pub show_val: bool,
+    #[serde(alias = "extend_previous")]
+    pub extend_untested: bool,
+    pub history: TpoHistory,
+}
+
+impl TpoConfig {
+    pub fn profile_anchor(self) -> TpoAnchor {
+        match self.anchor {
+            TpoAnchor::Monthly => TpoAnchor::Daily,
+            anchor => anchor,
+        }
+    }
 }
 
 impl Default for TpoConfig {
@@ -108,6 +194,15 @@ impl Default for TpoConfig {
             letter_period: DEFAULT_TPO_LETTER_PERIOD,
             value_area_percent: DEFAULT_TPO_VALUE_AREA_PERCENT,
             show_letters: true,
+            width_percent: 36,
+            value_color: crate::chart::gex::GexLevelColor::Primary,
+            outside_color: crate::chart::gex::GexLevelColor::Secondary,
+            poc_color: crate::chart::gex::GexLevelColor::Warning,
+            show_poc: true,
+            show_vah: true,
+            show_val: true,
+            extend_untested: false,
+            history: TpoHistory::All,
         }
     }
 }

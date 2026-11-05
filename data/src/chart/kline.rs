@@ -83,9 +83,10 @@ pub mod drawing {
         pub show_value_area: bool,
         pub show_vwap: bool,
         pub show_range_high_low: bool,
-        /// POC, VAH and VAL continue from the range's end to the right edge, on this
-        /// chart and on every other chart of the same ticker.
+        /// POC, VAH and VAL continue to the right edge of the owner chart.
         pub extend_levels: bool,
+        /// Also show the extended levels on other charts of the same symbol.
+        pub share_levels: bool,
     }
 
     impl Default for FixedRangeVolumeProfileConfig {
@@ -101,6 +102,7 @@ pub mod drawing {
                 show_vwap: true,
                 show_range_high_low: true,
                 extend_levels: true,
+                share_levels: false,
             }
         }
     }
@@ -200,6 +202,33 @@ pub mod drawing {
         pub style: DrawingStyle,
         #[serde(default = "default_true")]
         pub visible: bool,
+        #[serde(default)]
+        pub visibility: crate::chart::indicator::ObjectVisibility,
+    }
+
+    impl Drawing {
+        pub fn is_visible(&self, basis: crate::chart::Basis) -> bool {
+            self.visible && self.visibility.is_visible(basis) && self.supports_basis(basis)
+        }
+
+        pub fn supports_basis(&self, basis: crate::chart::Basis) -> bool {
+            let time_based = matches!(basis, crate::chart::Basis::Time(_));
+            let compatible = |x| matches!(x, DrawingX::Time(_)) == time_based;
+            match &self.geometry {
+                DrawingGeometry::HorizontalLine { .. } => true,
+                DrawingGeometry::FixedRangeVolumeProfile { .. } => time_based,
+                DrawingGeometry::VerticalLine { x } => compatible(*x),
+                DrawingGeometry::Text { anchor, .. } => compatible(anchor.x),
+                DrawingGeometry::Freehand { points } => {
+                    points.iter().all(|point| compatible(point.x))
+                }
+                DrawingGeometry::Rectangle { first, second }
+                | DrawingGeometry::Fibonacci { first, second }
+                | DrawingGeometry::TrendLine { first, second } => {
+                    compatible(first.x) && compatible(second.x)
+                }
+            }
+        }
     }
 }
 
@@ -1173,7 +1202,11 @@ impl KlineChartKind {
                     || matches!(
                         indicator,
                         KlineIndicator::NakedLevels
+                            | KlineIndicator::ClusterSearch1
+                            | KlineIndicator::ClusterSearch2
+                            | KlineIndicator::ClusterSearch3
                             | KlineIndicator::PeriodLevels
+                            | KlineIndicator::Tpo
                             | KlineIndicator::Vwap
                     )
             }
@@ -1279,6 +1312,7 @@ impl std::fmt::Display for ClusterKind {
 #[derive(Debug, Copy, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    pub cluster_search: [FootprintStudy; 3],
     // Whether to show last value labels on top right/left when not hovering
     // e.g. OHLC/bar change values for the main chart, or last value of an indicator series
     pub data_labels_always_visible: bool,
@@ -1303,6 +1337,11 @@ pub struct Config {
     pub tpo: tpo::TpoConfig,
     /// Visual settings owned by configurable indicators.
     pub indicator_configs: IndicatorConfigs,
+    #[serde(deserialize_with = "crate::chart::indicator::deserialize_visibility")]
+    pub indicator_visibility: enum_map::EnumMap<
+        crate::chart::indicator::KlineIndicator,
+        crate::chart::indicator::ObjectVisibility,
+    >,
     /// Compatibility input for states saved before `indicator_configs`.
     #[serde(default, rename = "gex_levels", skip_serializing)]
     pub legacy_gex_levels: Option<crate::chart::gex::GexLevelsConfig>,
@@ -1312,6 +1351,11 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             data_labels_always_visible: false,
+            cluster_search: [
+                FootprintStudy::cluster_search(1),
+                FootprintStudy::cluster_search(2),
+                FootprintStudy::cluster_search(3),
+            ],
             show_footprint_summary: false,
             show_footprint_table_candle: true,
             auto_row_size: false,
@@ -1322,6 +1366,7 @@ impl Default for Config {
             scripted: scripted::ScriptedConfig::default(),
             tpo: tpo::TpoConfig::default(),
             indicator_configs: IndicatorConfigs::default(),
+            indicator_visibility: Default::default(),
             legacy_gex_levels: None,
         }
     }
@@ -2297,6 +2342,17 @@ impl std::cmp::Eq for ClusterScaling {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 pub enum FootprintStudy {
+    ClusterSearch {
+        slot: u8,
+        metric: ClusterMetric,
+        rule: ClusterRule,
+        bars: usize,
+        minimum: u64,
+        top: usize,
+        sigma_tenths: u32,
+        #[serde(default)]
+        style: ClusterSearchStyle,
+    },
     NPoC {
         lookback: usize,
     },
@@ -2331,13 +2387,146 @@ fn enabled_by_default() -> bool {
     true
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ClusterMetric {
+    Volume,
+    Delta,
+    Bid,
+    Ask,
+    PositiveDelta,
+    NegativeDelta,
+    Trades,
+    Imbalance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClusterSearchStyle {
+    pub options: ClusterSearchOptions,
+    pub visible_range: bool,
+    pub color: [u8; 3],
+    pub sell_color: [u8; 3],
+    pub radius: u8,
+}
+
+impl Default for ClusterSearchStyle {
+    fn default() -> Self {
+        Self {
+            options: ClusterSearchOptions::default(),
+            visible_range: true,
+            color: [65, 185, 255],
+            sell_color: [245, 85, 100],
+            radius: 5,
+        }
+    }
+}
+
+/// Cluster Search settings use fixed thousandths for quantities and tenths for ratios.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ClusterSearchOptions {
+    pub maximum: u64,
+    pub auto_floor: u64,
+    pub percentile_tenths: u16,
+    pub multiplier_tenths: u16,
+    pub merge_bars: u16,
+    pub merge_prices: u16,
+    /// 0 = both (even windows extend one extra row down), 1 = up, 2 = down.
+    pub merge_direction: u8,
+    pub min_value: u64,
+    pub min_delta: u64,
+    pub imbalance_percent: u8,
+    pub min_average: u64,
+    pub max_average: u64,
+    pub range_high: u16,
+    pub range_low: u16,
+    /// 0 = any, 1 = bullish (including doji), 2 = bearish.
+    pub bar_direction: u8,
+    /// Any, upper/middle/lower third, above/below open, above/below close.
+    pub price_location: u8,
+    pub time_filter: bool,
+    pub start_second: u32,
+    pub end_second: u32,
+    pub single_per_bar: bool,
+    pub display_only_lookback: bool,
+    /// Circle, rectangle, rhombus, triangle, line.
+    pub shape: u8,
+    pub max_radius: u8,
+    pub fill_percent: u8,
+    pub border: bool,
+    pub text: bool,
+    pub zones: bool,
+}
+
+impl Default for ClusterSearchOptions {
+    fn default() -> Self {
+        Self {
+            maximum: 0,
+            auto_floor: 0,
+            percentile_tenths: 950,
+            multiplier_tenths: 20,
+            merge_bars: 1,
+            merge_prices: 1,
+            merge_direction: 0,
+            min_value: 0,
+            min_delta: 0,
+            imbalance_percent: 0,
+            min_average: 0,
+            max_average: 0,
+            range_high: 0,
+            range_low: 0,
+            bar_direction: 0,
+            price_location: 0,
+            time_filter: false,
+            start_second: 0,
+            end_second: 86399,
+            single_per_bar: false,
+            display_only_lookback: true,
+            shape: 0,
+            max_radius: 14,
+            fill_percent: 70,
+            border: true,
+            text: false,
+            zones: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+pub enum ClusterRule {
+    Minimum,
+    Top,
+    Sigma,
+    Percentile,
+    Average,
+    Median,
+}
+
 impl FootprintStudy {
     pub fn is_same_type(&self, other: &Self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        match (self, other) {
+            (Self::ClusterSearch { slot, .. }, Self::ClusterSearch { slot: other, .. }) => {
+                slot == other
+            }
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
     }
 }
 
 impl FootprintStudy {
+    pub fn cluster_search(slot: u8) -> Self {
+        Self::ClusterSearch {
+            slot,
+            metric: ClusterMetric::Volume,
+            rule: ClusterRule::Top,
+            bars: 30,
+            minimum: 1,
+            top: 10,
+            sigma_tenths: 30,
+            style: ClusterSearchStyle::default(),
+        }
+    }
+
     pub const ALL: [FootprintStudy; 3] = [
         FootprintStudy::NPoC { lookback: 80 },
         FootprintStudy::Imbalance {
@@ -2360,6 +2549,7 @@ impl FootprintStudy {
 impl std::fmt::Display for FootprintStudy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ClusterSearch { slot, .. } => write!(f, "Cluster Search {slot}"),
             FootprintStudy::NPoC { .. } => write!(f, "Naked Point of Control"),
             FootprintStudy::Imbalance { .. } => write!(f, "Imbalance"),
             FootprintStudy::Signals { .. } => write!(f, "Signals"),

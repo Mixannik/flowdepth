@@ -36,6 +36,8 @@ pub struct Config {
     pub coalescing: Option<CoalesceKind>,
     #[serde(default)]
     pub iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig,
+    #[serde(default)]
+    pub volume_visibility: super::indicator::ObjectVisibility,
 }
 
 impl Default for Config {
@@ -47,6 +49,7 @@ impl Default for Config {
             trade_bubbles_3d: false,
             coalescing: Some(CoalesceKind::Average(0.15)),
             iceberg_detector: crate::orderflow::iceberg::IcebergDetectorConfig::default(),
+            volume_visibility: Default::default(),
         }
     }
 }

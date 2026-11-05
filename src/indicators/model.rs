@@ -22,6 +22,7 @@ pub enum Action {
         enabled: bool,
     },
     Advanced(bool),
+    Visibility(UiIndicator, data::chart::indicator::ObjectVisibility),
     ReorderPanels(DragEvent),
 }
 #[derive(Debug)]
@@ -79,7 +80,7 @@ impl State {
                 }
                 self.focused = Some(*indicator);
             }
-            Action::ReorderPanels(_) => {}
+            Action::ReorderPanels(_) | Action::Visibility(..) => {}
         }
     }
     pub fn selection(

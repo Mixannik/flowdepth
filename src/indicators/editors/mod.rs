@@ -30,6 +30,24 @@ pub(super) fn view<'a>(
     scale: crate::chart::kline::VolumeBubbleQtyScale,
 ) -> Element<'a, Message> {
     match editor {
+        Editor::ClusterSearch(index) => {
+            use crate::modal::pane::settings::study::{Message as StudyMessage, Study};
+            let basis = match &state.content {
+                pane::Content::Kline {
+                    chart: Some(chart), ..
+                } => chart.basis(),
+                _ => return text("Open a chart first").into(),
+            };
+            cfg.cluster_search[index]
+                .view_config(basis, StudyMessage::StudyValueChanged)
+                .map(move |message| {
+                    let mut cfg = cfg;
+                    if let StudyMessage::StudyValueChanged(study) = message {
+                        cfg.cluster_search[index] = study;
+                    }
+                    config_message(pane, cfg)
+                })
+        }
         Editor::None => text("This indicator has no additional settings.")
             .size(12)
             .into(),

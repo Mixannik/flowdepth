@@ -10,7 +10,7 @@ use crate::{
     widget::column_drag,
 };
 use data::chart::indicator::{
-    UiIndicator,
+    ObjectVisibility, UiIndicator,
     catalog::{Group, Icon},
 };
 use iced::{
@@ -26,6 +26,54 @@ use model::{Filter, active, available, definition, has_advanced, matching};
 fn message(pane: pane_grid::Pane, action: Action) -> Message {
     Message::PaneEvent(pane, pane::Event::IndicatorMenu(action))
 }
+pub(crate) fn visibility_settings<M: Clone + 'static>(
+    visibility: ObjectVisibility,
+    on_change: impl Fn(ObjectVisibility) -> M + Copy + 'static,
+) -> Element<'static, M> {
+    let mut rows = column![text("Видимость по таймфреймам").size(14)].spacing(5);
+    for (index, (name, max)) in ObjectVisibility::CATEGORIES.into_iter().enumerate() {
+        let range = visibility.ranges[index];
+        let update = move |new_range| {
+            let mut value = visibility;
+            value.ranges[index] = new_range;
+            on_change(value)
+        };
+        let from = iced::widget::slider(
+            1.0..=f32::from(range.to.clamp(1, max)),
+            f32::from(range.from),
+            move |value| {
+                update(data::chart::indicator::VisibilityRange {
+                    from: value as u16,
+                    ..range
+                })
+            },
+        );
+        let to = iced::widget::slider(
+            f32::from(range.from.clamp(1, max))..=f32::from(max),
+            f32::from(range.to),
+            move |value| {
+                update(data::chart::indicator::VisibilityRange {
+                    to: value as u16,
+                    ..range
+                })
+            },
+        );
+        rows = rows.push(
+            column![
+                checkbox(range.enabled)
+                    .label(name)
+                    .on_toggle(move |enabled| {
+                        update(data::chart::indicator::VisibilityRange { enabled, ..range })
+                    }),
+                row![text(format!("От {}", range.from)).size(11).width(52), from].spacing(6),
+                row![text(format!("До {}", range.to)).size(11).width(52), to].spacing(6),
+            ]
+            .spacing(3),
+        );
+    }
+    rows.width(240).into()
+}
+
 pub fn toolbar_icon() -> iced::widget::svg::Svg<'static> {
     icons::indicator(Icon::Levels, 14.0)
 }
@@ -73,7 +121,7 @@ fn browser<'a>(pane: pane_grid::Pane, state: &'a pane::State, size: Size) -> Ele
     let content: Element<_> = if narrow && menu.compact_detail {
         detail(pane, state, focused, &active, true)
     } else {
-        let list = listing(pane, menu, &available, &active, focused);
+        let list = listing(pane, state, &available, &active, focused);
         if narrow {
             list
         } else {
@@ -94,11 +142,12 @@ fn browser<'a>(pane: pane_grid::Pane, state: &'a pane::State, size: Size) -> Ele
 }
 fn listing<'a>(
     pane: pane_grid::Pane,
-    menu: &'a State,
+    state: &'a pane::State,
     available: &[UiIndicator],
     active: &[UiIndicator],
     focused: Option<UiIndicator>,
 ) -> Element<'a, Message> {
+    let menu = &state.indicator_menu;
     let search = row![
         icons::glyph(icons::SEARCH, 16.0),
         text_input("Search indicators", &menu.query)
@@ -162,6 +211,7 @@ fn listing<'a>(
                 for id in panels {
                     ordered = ordered.push(indicator_row(
                         pane,
+                        state,
                         id,
                         active.contains(&id),
                         focused == Some(id),
@@ -171,14 +221,28 @@ fn listing<'a>(
                 groups = groups.push(ordered);
             } else {
                 for id in panels {
-                    groups = groups.push(indicator_row(pane, id, true, focused == Some(id), false));
+                    groups = groups.push(indicator_row(
+                        pane,
+                        state,
+                        id,
+                        true,
+                        focused == Some(id),
+                        false,
+                    ));
                 }
             }
         }
         if !overlays.is_empty() {
             groups = groups.push(text("On price chart").size(11));
             for id in overlays {
-                groups = groups.push(indicator_row(pane, id, true, focused == Some(id), false));
+                groups = groups.push(indicator_row(
+                    pane,
+                    state,
+                    id,
+                    true,
+                    focused == Some(id),
+                    false,
+                ));
             }
         }
     } else {
@@ -197,6 +261,7 @@ fn listing<'a>(
             for id in entries {
                 groups = groups.push(indicator_row(
                     pane,
+                    state,
                     id,
                     active.contains(&id),
                     focused == Some(id),
@@ -223,6 +288,7 @@ fn listing<'a>(
 }
 fn indicator_row<'a>(
     pane: pane_grid::Pane,
+    state: &pane::State,
     indicator: UiIndicator,
     enabled: bool,
     focused: bool,
@@ -243,7 +309,7 @@ fn indicator_row<'a>(
     .style(move |theme, status| style::button::modifier(theme, status, focused));
     let enable = checkbox(enabled)
         .on_toggle(move |enabled| message(pane, Action::Enable { indicator, enabled }));
-    let controls = row![
+    let mut controls = row![
         container(select)
             .id(format!("indicator-select-{}", entry.name))
             .width(Length::Fill),
@@ -251,6 +317,31 @@ fn indicator_row<'a>(
     ]
     .spacing(8)
     .align_y(Alignment::Center);
+    if enabled
+        && state.indicator_menu.filter == Filter::Active
+        && let Some(visibility) = object_visibility(state, indicator)
+    {
+        controls = controls.push(
+            button(
+                text(if visibility.shown {
+                    "Скрыть"
+                } else {
+                    "Показать"
+                })
+                .size(11),
+            )
+            .on_press(message(
+                pane,
+                Action::Visibility(
+                    indicator,
+                    ObjectVisibility {
+                        shown: !visibility.shown,
+                        ..visibility
+                    },
+                ),
+            )),
+        );
+    }
     if draggable {
         row![
             container(icons::glyph(icons::DRAG, 12.0)).width(14),
@@ -262,6 +353,30 @@ fn indicator_row<'a>(
         controls.into()
     }
 }
+fn object_visibility(state: &pane::State, indicator: UiIndicator) -> Option<ObjectVisibility> {
+    match (indicator, &state.content) {
+        (
+            UiIndicator::Kline(kind),
+            pane::Content::Kline {
+                chart: Some(chart), ..
+            },
+        ) => Some(chart.indicator_visibility(kind)),
+        (
+            UiIndicator::Heatmap(_),
+            pane::Content::Heatmap {
+                chart: Some(chart), ..
+            },
+        ) => Some(chart.visual_config().volume_visibility),
+        (
+            UiIndicator::Heatmap(_),
+            pane::Content::ShaderHeatmap {
+                chart: Some(chart), ..
+            },
+        ) => Some(chart.visual_config().volume_visibility),
+        _ => None,
+    }
+}
+
 fn detail<'a>(
     pane: pane_grid::Pane,
     state: &'a pane::State,
@@ -332,6 +447,29 @@ fn detail<'a>(
             .into(),
     };
     contents = contents.push(rule::horizontal(1)).push(editor);
+    let visibility = object_visibility(state, indicator);
+    if let Some(visibility) = visibility.filter(|_| active.contains(&indicator)) {
+        contents = contents
+            .push(
+                checkbox(visibility.shown)
+                    .label("Показывать индикатор")
+                    .on_toggle(move |shown| {
+                        message(
+                            pane,
+                            Action::Visibility(
+                                indicator,
+                                ObjectVisibility {
+                                    shown,
+                                    ..visibility
+                                },
+                            ),
+                        )
+                    }),
+            )
+            .push(visibility_settings(visibility, move |value| {
+                message(pane, Action::Visibility(indicator, value))
+            }));
+    }
     container(
         scrollable(container(contents).padding(iced::padding::right(14)))
             .id(state.indicator_menu.settings_scroll_id.clone())

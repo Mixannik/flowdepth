@@ -12,6 +12,7 @@ use data::chart::{
     },
     kline::{BubbleCandidate, BubbleVolumeSummary},
 };
+use exchange::adapter::BinanceRawTradeV1;
 use exchange::unit::qty::{QuantityUnit, SizeUnit, volume_size_unit};
 use exchange::{
     Kline, OpenInterest, TickerInfo, Timeframe, Trade, UnixMs, Volume,
@@ -347,6 +348,24 @@ impl CacheRecord for Trade {
     }
 }
 
+impl CacheRecord for BinanceRawTradeV1 {
+    fn timestamp(&self) -> UnixMs {
+        self.time
+    }
+
+    fn is_semantically_valid(&self) -> bool {
+        // Projection below validates the decimal fields against the instrument.
+        true
+    }
+
+    fn normalize(mut records: Vec<Self>) -> Vec<Self> {
+        records.sort_by_key(|trade| (trade.time, trade.id));
+        let mut ids = BTreeSet::new();
+        records.retain(|trade| ids.insert(trade.id));
+        records
+    }
+}
+
 impl CacheRecord for OpenInterest {
     fn timestamp(&self) -> UnixMs {
         self.time
@@ -568,6 +587,54 @@ impl MarketDataCache {
     ) {
         let key = kline_dataset_key(ticker_info, timeframe);
         self.store_records(CacheKind::Kline, &key, from, to_exclusive, records);
+    }
+
+    pub fn read_binance_raw_trades(
+        &self,
+        ticker: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+        preference: SizeUnit,
+    ) -> CacheSlice<Trade> {
+        let key = binance_raw_trade_key(ticker);
+        let raw: CacheSlice<BinanceRawTradeV1> =
+            self.read_records(CacheKind::Trade, &key, from, to, from);
+        let projected: Result<Vec<_>, _> = raw
+            .records
+            .iter()
+            .map(|trade| trade.project(ticker, preference))
+            .collect();
+        match projected {
+            Ok(records) => checked_trade_slice(
+                CacheSlice {
+                    records,
+                    gaps: raw.gaps,
+                },
+                &key,
+                from,
+                to,
+            ),
+            Err(error) => {
+                log::warn!("CACHE BinanceRawProjectionFailed | key={key} error={error}");
+                CacheSlice::miss(from, to)
+            }
+        }
+    }
+
+    pub fn store_binance_raw_trades(
+        &self,
+        ticker: TickerInfo,
+        from: UnixMs,
+        to: UnixMs,
+        records: &[BinanceRawTradeV1],
+    ) {
+        self.store_records(
+            CacheKind::Trade,
+            &binance_raw_trade_key(ticker),
+            from,
+            to,
+            records,
+        );
     }
 
     pub fn read_trades(
@@ -1617,6 +1684,16 @@ fn dataset_key(ticker_info: TickerInfo, suffix: &str) -> String {
 
 // Untagged legacy quantities have unknown units. Keep their bytes, but never
 // reuse their records or coverage as a quantity-aware dataset.
+pub(super) fn binance_raw_trade_key(ticker: TickerInfo) -> String {
+    let contract = ticker
+        .contract_size
+        .map_or(0, |size| size.as_f64().to_bits());
+    dataset_key(
+        ticker,
+        &format!("trade_raw_binance_v1|contract={contract:x}"),
+    )
+}
+
 fn checked_trade_slice(
     mut slice: CacheSlice<Trade>,
     key: &str,
@@ -2212,6 +2289,63 @@ mod tests {
                 replay_binance_footprint(ticker, &[&compacted.records], false),
                 expected
             );
+        }
+    }
+
+    #[test]
+    fn binance_raw_cache_reuses_coverage_after_reopening_in_another_unit() {
+        use exchange::{Ticker, adapter::Exchange, unit::Qty};
+
+        let dir = TestCacheDir::new();
+        let path = dir.database_path();
+        let ticker = TickerInfo::new(
+            Ticker::new("ETHBTC", Exchange::BinanceSpot),
+            0.00001,
+            0.001,
+            None,
+        );
+        let from = UnixMs::new(60_000);
+        let mid = UnixMs::new(60_002);
+        let to = UnixMs::new(60_004);
+        let raw: Vec<BinanceRawTradeV1> = serde_json::from_value(serde_json::json!([
+            {"a":1,"T":60001,"p":"0.05","q":"2","m":false},
+            {"a":2,"T":60003,"p":"0.06","q":"3","m":true}
+        ]))
+        .unwrap();
+        {
+            let cache = MarketDataCache::open_at(path.clone()).unwrap();
+            let old = raw[0].project(ticker, SizeUnit::Base).unwrap();
+            cache.store_trades_in(ticker, from, to, &[old], QuantityUnit::Base);
+            assert_eq!(
+                cache
+                    .read_binance_raw_trades(ticker, from, to, SizeUnit::Quote)
+                    .gaps,
+                vec![(from, to)]
+            );
+            cache.store_binance_raw_trades(ticker, from, mid, &raw[..1]);
+        }
+        {
+            let cache = MarketDataCache::open_at(path.clone()).unwrap();
+            let partial = cache.read_binance_raw_trades(ticker, from, to, SizeUnit::Quote);
+            assert_eq!(partial.gaps, vec![(mid, to)]);
+            assert_eq!(partial.records[0].qty, Qty::from_f64(0.1));
+            cache.store_binance_raw_trades(ticker, mid, to, &raw[1..]);
+            cache.store_binance_raw_trades(ticker, from, to, &raw);
+        }
+        let cache = MarketDataCache::open_at(path).unwrap();
+        for (preference, quantities) in
+            [(SizeUnit::Base, [2.0, 3.0]), (SizeUnit::Quote, [0.1, 0.18])]
+        {
+            let history = cache.read_binance_raw_trades(ticker, from, to, preference);
+            assert!(history.is_complete());
+            assert_eq!(history.records.len(), 2);
+            for (trade, (source, quantity)) in
+                history.records.iter().zip(raw.iter().zip(quantities))
+            {
+                assert_eq!(trade.id, Some(source.id));
+                assert_eq!(trade.time, source.time);
+                assert_eq!(trade.qty, Qty::from_f64(quantity));
+            }
         }
     }
 

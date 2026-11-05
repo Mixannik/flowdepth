@@ -854,9 +854,33 @@ impl Dashboard {
                                     };
 
                                     if should_apply {
-                                        state.settings.visual_config = Some(cfg.clone());
+                                        use data::layout::pane::VisualConfig;
+                                        let mut local_config = cfg.clone();
+                                        match (&mut local_config, &state.settings.visual_config) {
+                                            (
+                                                VisualConfig::Kline(next),
+                                                Some(VisualConfig::Kline(current)),
+                                            ) => {
+                                                next.indicator_visibility =
+                                                    current.indicator_visibility;
+                                            }
+                                            (VisualConfig::Kline(next), _) => {
+                                                next.indicator_visibility = Default::default();
+                                            }
+                                            (
+                                                VisualConfig::Heatmap(next),
+                                                Some(VisualConfig::Heatmap(current)),
+                                            ) => {
+                                                next.volume_visibility = current.volume_visibility;
+                                            }
+                                            (VisualConfig::Heatmap(next), _) => {
+                                                next.volume_visibility = Default::default();
+                                            }
+                                            _ => {}
+                                        }
+                                        state.settings.visual_config = Some(local_config.clone());
                                         refresh_streams |=
-                                            state.content.change_visual_config(cfg.clone());
+                                            state.content.change_visual_config(local_config);
                                         state.reconcile_candlestick_trade_stream();
                                         state.reconcile_gex_liquidity_stream();
 
@@ -1286,54 +1310,49 @@ impl Dashboard {
             }))
     }
 
-    /// Levels of the fixed-range profiles drawn on this layout's charts, with the pane and
-    /// ticker they belong to.
-    pub fn range_levels(
+    pub fn shared_range_profile_exports(
         &self,
         main_window: window::Id,
-    ) -> Vec<(
-        uuid::Uuid,
-        exchange::Ticker,
-        Vec<chart::kline::range_levels::RangeLevels>,
-    )> {
+    ) -> Vec<chart::kline::range_levels::SharedRangeProfile> {
         self.iter_all_panes(main_window)
             .filter_map(|(_, _, state)| {
-                let pane::Content::Kline { chart: Some(c), .. } = &state.content else {
+                let pane::Content::Kline {
+                    chart: Some(chart), ..
+                } = &state.content
+                else {
                     return None;
                 };
-                let levels = c.range_levels();
-                let ticker = state.stream_pair()?.ticker;
-                (!levels.is_empty()).then_some((state.unique_id(), ticker, levels))
+                Some(chart.shared_range_profile_exports(state.unique_id()))
             })
+            .flatten()
             .collect()
     }
 
-    /// Hands every chart the profile levels drawn on other charts of its symbol. Markets are
-    /// not told apart: spot BTCUSDT shows the levels drawn on the perp, prices are close enough.
-    pub fn set_shared_range_levels(
+    pub fn sync_shared_range_profiles(
         &mut self,
         main_window: window::Id,
-        all: &[(
-            uuid::Uuid,
-            exchange::Ticker,
-            Vec<chart::kline::range_levels::RangeLevels>,
-        )],
+        profiles: &[chart::kline::range_levels::SharedRangeProfile],
     ) {
         for (_, _, state) in self.iter_all_panes_mut(main_window) {
-            let id = state.unique_id();
+            let pane_id = state.unique_id();
             let symbol = state
                 .stream_pair()
-                .map(|t| t.ticker.to_full_symbol_and_type().0);
-            if let pane::Content::Kline { chart: Some(c), .. } = &mut state.content {
-                let shared = all
-                    .iter()
-                    .filter(|(source, source_ticker, _)| {
-                        *source != id
-                            && symbol.as_ref() == Some(&source_ticker.to_full_symbol_and_type().0)
-                    })
-                    .flat_map(|(_, _, levels)| levels.iter().copied())
-                    .collect();
-                c.set_shared_range_levels(shared);
+                .map(|info| info.ticker.to_full_symbol_and_type().0);
+            if let pane::Content::Kline {
+                chart: Some(chart), ..
+            } = &mut state.content
+            {
+                chart.set_shared_range_profiles(
+                    profiles
+                        .iter()
+                        .filter(|profile| {
+                            profile.source_pane != pane_id
+                                && symbol.as_ref()
+                                    == Some(&profile.source_ticker.to_full_symbol_and_type().0)
+                        })
+                        .copied()
+                        .collect(),
+                );
             }
         }
     }
@@ -2518,7 +2537,7 @@ impl Dashboard {
         pane_id: uuid::Uuid,
         trades: &[Trade],
         is_batches_done: bool,
-        _req_id: Option<uuid::Uuid>,
+        req_id: Option<uuid::Uuid>,
     ) -> Result<(), DashboardError> {
         let pane_state = self
             .get_mut_pane_state_by_uuid(main_window, pane_id)
@@ -2547,6 +2566,11 @@ impl Dashboard {
                         }
                     }
 
+                    if !trades.is_empty()
+                        && let Some(req_id) = req_id
+                    {
+                        c.mark_trade_request_progress(req_id);
+                    }
                     c.insert_raw_trades(trades.to_owned(), is_batches_done);
 
                     if is_batches_done {
@@ -2639,7 +2663,7 @@ impl Dashboard {
         &mut self,
         stream: &StreamKind,
         update_t: UnixMs,
-        depth: &Depth,
+        depth: &Arc<Depth>,
         main_window: window::Id,
     ) -> Task<Message> {
         let mut found_match = false;
@@ -2871,6 +2895,33 @@ impl Dashboard {
             .for_each(|(_, _, state)| {
                 let _ = state.invalidate(Instant::now());
             });
+    }
+
+    pub fn reload_quantity_data(&mut self, main_window: window::Id) {
+        self.last_live_t.clear();
+        self.backfill_handles.clear();
+        self.pending_backfills.clear();
+        self.ws_integrity_revisions.clear();
+        self.pending_disconnect = None;
+
+        for (_, _, state) in self.iter_all_panes_mut(main_window) {
+            if matches!(
+                state.content,
+                pane::Content::Starter | pane::Content::News(_)
+            ) {
+                continue;
+            }
+            let config = data::Pane::from(&*state);
+            let pane_grid::Configuration::Pane(mut fresh) = crate::layout::configuration(config)
+            else {
+                unreachable!("single pane cannot serialize as a split");
+            };
+            // Keep resolved metadata and stream identities. A fresh pane UUID fences
+            // replies that were queued before the chart data was dropped.
+            fresh.streams = state.streams.clone();
+            *state = fresh;
+        }
+        let _ = self.refresh_streams(main_window);
     }
 
     pub fn park_for_inactive_layout(&mut self, main_window: window::Id) {
@@ -4043,6 +4094,37 @@ mod ws_integrity_tests {
                 .is_empty()
         );
         assert_eq!(dashboard.ws_integrity_revision(btc), 2);
+    }
+
+    #[test]
+    fn quantity_reload_preserves_grid_and_streams_and_replaces_request_owner() {
+        let window = window::Id::unique();
+        let btc = stream("BTCUSDT");
+        let mut dashboard = Dashboard::default();
+        let (&grid_pane, state) = dashboard.panes.iter_mut().next().unwrap();
+        let _ = state.set_content_and_streams(vec![btc.ticker_info()], ContentKind::TimeAndSales);
+        state.streams = ResolvedStream::Ready(vec![btc]);
+        state.link_group = Some(data::layout::pane::LinkGroup::A);
+        let old_id = state.unique_id();
+        let old_binding = state.backfill_binding();
+        dashboard.focus = Some((window, grid_pane));
+        dashboard.last_live_t.insert(btc, UnixMs::new(100));
+        dashboard
+            .pending_backfills
+            .insert((btc, 10, 20), Instant::now());
+
+        dashboard.reload_quantity_data(window);
+
+        assert_eq!(dashboard.focus, Some((window, grid_pane)));
+        let state = dashboard.panes.get(grid_pane).unwrap();
+        assert_eq!(state.content.kind(), ContentKind::TimeAndSales);
+        assert!(!state.content.initialized());
+        assert_eq!(state.link_group, Some(data::layout::pane::LinkGroup::A));
+        assert_ne!(state.unique_id(), old_id);
+        assert_ne!(state.backfill_binding(), old_binding);
+        assert_eq!(dashboard.configured_market_streams(), vec![btc]);
+        assert!(dashboard.last_live_t.is_empty());
+        assert!(dashboard.pending_backfills.is_empty());
     }
 
     #[test]

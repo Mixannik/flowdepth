@@ -636,7 +636,8 @@ impl canvas::Program<Message> for HeatmapChart {
 
             let size_in_quote_ccy = volume_size_unit() == SizeUnit::Quote;
 
-            let volume_indicator = self.indicators[HeatmapIndicator::Volume].is_some();
+            let volume_indicator = self.indicators[HeatmapIndicator::Volume].is_some()
+                && self.visual_config.volume_visibility.is_visible(chart.basis);
 
             if let Some(merge_strat) = self.visual_config().coalescing {
                 let coalesced_visual_runs = self.heatmap.coalesced_runs(

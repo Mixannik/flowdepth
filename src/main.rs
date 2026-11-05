@@ -198,8 +198,7 @@ struct Flowsurface {
     startup_loading: StartupLoading,
     startup_main_window_target: StartupMainWindowTarget,
     closing_startup_window: Option<window::Id>,
-    /// Last time fixed-range profile levels were shared between charts of a ticker.
-    range_levels_synced: Instant,
+    shared_profiles_synced: Instant,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -527,7 +526,7 @@ impl Flowsurface {
             startup_loading: StartupLoading::new(),
             startup_main_window_target,
             closing_startup_window: None,
-            range_levels_synced: Instant::now(),
+            shared_profiles_synced: Instant::now(),
         };
 
         if let Some(err) = audio_init_err {
@@ -647,6 +646,20 @@ impl Flowsurface {
         }
     }
 
+    fn sync_shared_range_profiles(&mut self) {
+        let window = self.main_window.id;
+        let layouts = &mut self.layout_manager.layouts;
+        let profiles = layouts
+            .iter()
+            .flat_map(|layout| layout.dashboard.shared_range_profile_exports(window))
+            .collect::<Vec<_>>();
+        for layout in layouts {
+            layout
+                .dashboard
+                .sync_shared_range_profiles(window, &profiles);
+        }
+    }
+
     fn sync_ws_integrity(&mut self) {
         let streams = self.all_market_streams();
         self.market_integrity.sync_subscriptions(&streams);
@@ -674,19 +687,7 @@ impl Flowsurface {
         for dashboard in self.layout_manager.iter_dashboards_mut() {
             dashboard.sync_ws_integrity(self.main_window.id, self.market_integrity.faults());
         }
-        // Remove previously shared derived levels immediately, before another
-        // healthy chart can use them as reference for a new signal.
-        let all = self
-            .layout_manager
-            .layouts
-            .iter()
-            .flat_map(|layout| layout.dashboard.range_levels(self.main_window.id))
-            .collect::<Vec<_>>();
-        for layout in &mut self.layout_manager.layouts {
-            layout
-                .dashboard
-                .set_shared_range_levels(self.main_window.id, &all);
-        }
+        self.sync_shared_range_profiles();
     }
 
     fn schedule_trade_recovery(&mut self, now: std::time::Instant) -> Task<Message> {
@@ -1171,20 +1172,9 @@ impl Flowsurface {
                 let main_window_id = self.main_window.id;
                 let data_sources = Arc::clone(&self.data_sources);
 
-                // A fixed-range profile drawn on one chart (usually 4h) shows its levels on
-                // every chart of the same ticker, in every layout.
-                if now.duration_since(self.range_levels_synced) >= Duration::from_secs(1) {
-                    self.range_levels_synced = now;
-                    let layouts = &mut self.layout_manager.layouts;
-                    let all = layouts
-                        .iter()
-                        .flat_map(|layout| layout.dashboard.range_levels(main_window_id))
-                        .collect::<Vec<_>>();
-                    for layout in layouts.iter_mut() {
-                        layout
-                            .dashboard
-                            .set_shared_range_levels(main_window_id, &all);
-                    }
+                if now.duration_since(self.shared_profiles_synced) >= Duration::from_secs(1) {
+                    self.shared_profiles_synced = now;
+                    self.sync_shared_range_profiles();
                 }
 
                 // Inactive layouts tick too: their panes resolve streams, roll candles and
@@ -1394,6 +1384,21 @@ impl Flowsurface {
 
                 let main_window = self.main_window;
                 let layout_id = id.unwrap_or(active_layout.unique);
+                use dashboard::pane::{Event as PaneEvent, Message as PaneMessage};
+                let refresh_shared_profiles = matches!(
+                    &msg,
+                    dashboard::Message::Pane(
+                        _,
+                        PaneMessage::ClosePane(_)
+                            | PaneMessage::PaneEvent(
+                                _,
+                                PaneEvent::ChartInteraction(chart::Message::Drawing(_))
+                                    | PaneEvent::ContentSelected(_)
+                                    | PaneEvent::StreamModifierChanged(_)
+                                    | PaneEvent::MiniTickersListInteraction(_),
+                            ),
+                    )
+                );
                 if let Some(dashboard) = self.layout_manager.mut_dashboard(layout_id) {
                     let (main_task, event) = dashboard.update(
                         msg,
@@ -1480,6 +1485,9 @@ impl Flowsurface {
                         None => Task::none(),
                     };
 
+                    if refresh_shared_profiles {
+                        self.sync_shared_range_profiles();
+                    }
                     return main_task
                         .map(move |msg| Message::Dashboard {
                             layout_id: Some(layout_id),
@@ -2032,16 +2040,32 @@ impl Flowsurface {
                 return task.map(Message::Sidebar);
             }
             Message::ApplyVolumeSizeUnit(pref) => {
-                self.volume_size_unit = pref;
                 self.confirm_dialog = None;
+                if self.volume_size_unit == pref {
+                    return Task::none();
+                }
+                self.volume_size_unit = pref;
+                exchange::unit::qty::set_preferred_currency(pref);
+                Arc::make_mut(&mut self.data_sources)
+                    .exchange
+                    .refresh_quantity_context();
 
-                let mut active_windows: Vec<window::Id> =
-                    self.active_dashboard().popout.keys().copied().collect();
-                active_windows.push(self.main_window.id);
+                self.recovery_jobs.clear();
+                self.recovery_attempts.clear();
+                self.market_integrity = market_service::MarketIntegrity::default();
+                self.market_connectivity = market_service::MarketConnectivity::new();
+                self.iceberg_detectors = connector::iceberg::IcebergDetectorRegistry::default();
 
-                return window::collect_window_specs(active_windows, |windows| {
-                    Message::RestartRequested(Some(windows))
-                });
+                let main_window = self.main_window.id;
+                for dashboard in self.layout_manager.iter_dashboards_mut() {
+                    dashboard.reload_quantity_data(main_window);
+                }
+                let streams = self.all_market_streams();
+                let _ = self
+                    .market_connectivity
+                    .sync_expected(&streams, Instant::now());
+                self.notifications
+                    .push(Toast::info("Reloading market data in the new volume unit"));
             }
         }
         Task::none()
@@ -2800,11 +2824,11 @@ impl Flowsurface {
                                 });
 
                                 let confirm_dialog = screen::ConfirmDialog::new(
-                                    "Changing size display currency requires application restart"
+                                    "Switch volume units? Market charts will reload in the current windows."
                                         .to_string(),
                                     Box::new(on_dialog_confirm.clone()),
                                 )
-                                .with_confirm_btn_text("Restart now".to_string());
+                                .with_confirm_btn_text("Switch and reload".to_string());
 
                                 Message::ToggleDialogModal(Some(confirm_dialog))
                             });
@@ -2812,7 +2836,7 @@ impl Flowsurface {
                         tooltip(
                             checkbox,
                             Some(
-                                "Display sizes/volumes in quote currency (USD).\n- Has no effect on inverse perps or open interest",
+                                "Display sizes and volumes in the instrument's quote currency.\n- Has no effect on inverse perps or open interest",
                             ),
                             TooltipPosition::Top,
                         )

@@ -18,15 +18,38 @@ const CHASE_MIN_VISIBLE_OPACITY: f32 = 0.15;
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     pub show_spread: bool,
+    #[serde(default = "default_width")]
+    pub width_px: u16,
+    #[serde(default)]
+    pub compact: bool,
+    #[serde(default = "default_intensity")]
+    pub liquidity_intensity: f32,
+    #[serde(default)]
+    pub show_depth_ruler: bool,
+    #[serde(default)]
+    pub show_cumulative_depth: bool,
     #[serde(deserialize_with = "ok_or_default", default)]
     pub show_chase_tracker: bool,
     pub trade_retention: Duration,
+}
+
+fn default_width() -> u16 {
+    380
+}
+
+fn default_intensity() -> f32 {
+    0.7
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             show_spread: false,
+            width_px: default_width(),
+            compact: false,
+            liquidity_intensity: default_intensity(),
+            show_depth_ruler: false,
+            show_cumulative_depth: false,
             show_chase_tracker: true,
             trade_retention: Duration::from_millis(TRADE_RETENTION_MS),
         }
@@ -73,11 +96,30 @@ impl GroupedDepth {
     }
 
     pub fn regroup_from_raw(&mut self, levels: &BTreeMap<Price, Qty>, side: Side, step: PriceStep) {
+        self.regroup_with(levels, side, step, |_, qty| qty);
+    }
+
+    pub fn regroup_with(
+        &mut self,
+        levels: &BTreeMap<Price, Qty>,
+        side: Side,
+        step: PriceStep,
+        convert: impl Fn(Price, Qty) -> Qty,
+    ) {
         self.orders.clear();
         for (price, qty) in levels.iter() {
             let grouped_price = price.round_to_side_step(side.is_bid(), step);
-            *self.orders.entry(grouped_price).or_default() += *qty;
+            *self.orders.entry(grouped_price).or_default() += convert(*price, *qty);
         }
+    }
+
+    pub fn quantity_in_range(&self, lower: Price, upper: Price) -> Qty {
+        if lower > upper {
+            return Qty::ZERO;
+        }
+        self.orders
+            .range(lower..=upper)
+            .fold(Qty::ZERO, |total, (_, qty)| total + *qty)
     }
 
     pub fn best_price(&self, side: Side) -> Option<Price> {
@@ -412,5 +454,76 @@ impl ChaseTracker {
             }
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod dom2_tests {
+    use super::*;
+    fn price(value: f64) -> Price {
+        Price::from_f64(value)
+    }
+    fn step(value: f64) -> PriceStep {
+        PriceStep {
+            units: price(value).units,
+        }
+    }
+
+    #[test]
+    fn dom2_regroup_preserves_totals_and_replaces_previous_book() {
+        let raw = [(99.0, 2.0), (100.0, 3.0), (101.0, 7.0)]
+            .map(|(p, q)| (price(p), Qty::from_f64(q)))
+            .into_iter()
+            .collect();
+        for side in [Side::Bid, Side::Ask] {
+            let mut book = GroupedDepth::new();
+            book.regroup_from_raw(&raw, side, step(1.0));
+            assert_eq!(
+                book.quantity_in_range(price(100.0), price(101.0)),
+                Qty::from_f64(10.0)
+            );
+            book.regroup_from_raw(&raw, side, step(2.0));
+            assert_eq!(
+                book.quantity_in_range(price(0.0), price(200.0)),
+                Qty::from_f64(12.0)
+            );
+            book.regroup_from_raw(&BTreeMap::new(), side, step(2.0));
+            assert!(book.orders.is_empty());
+        }
+    }
+
+    #[test]
+    fn dom2_range_boundaries_gaps_and_fractional_quantities() {
+        let raw = [(90.0, 0.125), (100.0, 0.25), (110.0, 0.5)]
+            .map(|(p, q)| (price(p), Qty::from_f64(q)))
+            .into_iter()
+            .collect();
+        let mut book = GroupedDepth::new();
+        book.regroup_from_raw(&raw, Side::Bid, step(1.0));
+        assert_eq!(
+            book.quantity_in_range(price(90.0), price(100.0)),
+            Qty::from_f64(0.375)
+        );
+        assert_eq!(book.quantity_in_range(price(91.0), price(99.0)), Qty::ZERO);
+        assert_eq!(book.quantity_in_range(price(110.0), price(90.0)), Qty::ZERO);
+    }
+
+    #[test]
+    fn dom2_old_saved_config_loads_with_layers_off() {
+        let old = r#"{"show_spread":true,"show_chase_tracker":false,"trade_retention":{"secs":480,"nanos":0}}"#;
+        let cfg: Config = serde_json::from_str(old).unwrap();
+        assert!(cfg.show_spread);
+        assert!(!cfg.compact && !cfg.show_depth_ruler && !cfg.show_cumulative_depth);
+        assert_eq!(cfg.liquidity_intensity, 0.7);
+        let updated = Config {
+            compact: true,
+            show_depth_ruler: true,
+            show_cumulative_depth: true,
+            ..cfg
+        };
+        assert_eq!(
+            serde_json::from_str::<Config>(&serde_json::to_string(&updated).unwrap()).unwrap(),
+            updated
+        );
     }
 }

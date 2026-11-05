@@ -1,6 +1,7 @@
 mod client;
 mod http;
 mod hub;
+pub use hub::binance::fetch::BinanceRawTradeV1;
 mod inflight;
 mod limiter;
 pub mod proxy;

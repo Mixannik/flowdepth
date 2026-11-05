@@ -87,7 +87,7 @@ impl KlineChart {
                 if !ready {
                     let date=|time:UnixMs| chrono::DateTime::from_timestamp_millis(time.as_u64() as i64)
                         .map(|t| t.format("%Y-%m-%d %H:%M").to_string()).unwrap_or_default();
-                    warnings.push(format!("Fixed profile {} to {} UTC: incomplete or developing {}; extended/shared levels and signals are withheld.",
+                    warnings.push(format!("Fixed profile {} to {} UTC: incomplete or developing {}; extended levels and signals are withheld.",
                         date(from),date(to),if approximate {"hourly history"} else {"trade history"}));
                 }
                 FixedSnapshot {from,to,config,profile,ready,approximate}
@@ -204,21 +204,31 @@ impl KlineChart {
             .clone()
     }
 
-    pub(super) fn prepared_range_levels(&self) -> Vec<range_levels::RangeLevels> {
-        self.profile_calculations
-            .fixed
-            .iter()
-            .filter(|s| s.ready && s.config.extend_levels)
-            .filter_map(|s| {
-                s.profile.as_ref().map(|p| range_levels::RangeLevels {
-                    to: s.to.as_u64(),
-                    poc: p.poc.to_f64(),
-                    vah: p.vah.to_f64(),
-                    val: p.val.to_f64(),
-                    approximate: s.approximate,
-                })
+    pub(super) fn owned_range_levels(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = (u64, range_levels::RangeLevels)> + '_ {
+        self.visible_fixed_profile_owners()
+            .filter_map(|(id, from, to, config)| {
+                if self.ws_integrity_revision.is_some() || !config.extend_levels {
+                    return None;
+                }
+                let snapshot = self
+                    .profile_calculations
+                    .fixed
+                    .iter()
+                    .find(|s| s.from == from && s.to == to && s.config == config && s.ready)?;
+                let profile = snapshot.profile.as_ref()?;
+                Some((
+                    id,
+                    range_levels::RangeLevels {
+                        to: to.as_u64(),
+                        poc: profile.poc.to_f64(),
+                        vah: profile.vah.to_f64(),
+                        val: profile.val.to_f64(),
+                        approximate: snapshot.approximate,
+                    },
+                ))
             })
-            .collect()
     }
 
     pub(super) fn profile_warnings(&self) -> impl Iterator<Item = String> + '_ {
@@ -235,8 +245,7 @@ impl KlineChart {
             .profile_calculations
             .fixed
             .iter()
-            .any(|s| s.approximate)
-            || self.shared_range_levels.iter().any(|s| s.approximate);
+            .any(|s| s.approximate);
         let naked = self
             .profile_calculations
             .naked

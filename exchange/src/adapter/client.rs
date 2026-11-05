@@ -33,6 +33,11 @@ impl AdapterHandles {
     pub fn quantity_context(&self) -> crate::unit::quantity_context::QuantityContext {
         self.quantity_context
     }
+    pub fn refresh_quantity_context(&mut self) {
+        self.quantity_context = crate::unit::quantity_context::QuantityContext::capture();
+        self.kline_requests = Arc::new(KlineRequests::default());
+    }
+
     pub fn spawn_venue(
         &mut self,
         client: &reqwest::Client,
@@ -631,6 +636,26 @@ impl AdapterHandles {
             })
             .await
             .map_err(|e| AdapterError::InvalidRequest(e.to_string()))?
+    }
+
+    pub async fn fetch_binance_raw_trades(
+        &self,
+        ticker: TickerInfo,
+        from_time: UnixMs,
+        data_path: PathBuf,
+    ) -> Result<Vec<crate::adapter::BinanceRawTradeV1>, AdapterError> {
+        self.quantity_context
+            .check_future(async {
+                let handle = self
+                    .binance
+                    .as_ref()
+                    .ok_or_else(|| Self::missing_venue_error(Venue::Binance))?;
+                handle
+                    .fetch_raw_trades(ticker, from_time, Some(data_path))
+                    .await
+            })
+            .await
+            .map_err(|error| AdapterError::InvalidRequest(error.to_string()))?
     }
 
     pub async fn fetch_trades(
